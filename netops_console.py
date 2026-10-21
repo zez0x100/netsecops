@@ -139,14 +139,21 @@ HEALTH_CHECKS = {
 # Transport
 # ----------------------------------------------------------------------------
 def http_full(sess, method, path, headers=None, data=None, timeout=20):
+    if not HOST_RE.match(str(sess["host"])) or not str(path).startswith("/"):
+        raise ValueError("invalid host or path")
     url = "https://%s:%d%s" % (sess["host"], sess["port"], path)
     ctx = ssl.create_default_context()
     if sess["insecure"]:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    # HTTPS-only opener: no file:// / ftp:// handlers, regardless of the URL.
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.HTTPSHandler(context=ctx))
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+        with opener.open(req, timeout=timeout) as r:
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
@@ -761,7 +768,9 @@ def f5_lookup(sess, ip):
         for g in d.get("items", []):
             if g.get("type") != "ip":
                 continue
-            recs = [r.get("name") for r in g.get("records", []) if ip_in_spec(ip, r.get("name"))]
+            recs = [r.get("name") for r in g.get("records", [])
+                    if ip_in_spec(ip, r.get("name"))
+                    and not (g.get("fullPath") == "/Common/private_net" and r.get("name") == "10.0.0.0/8")]
             if recs:
                 res["data_groups"].append({"data_group": g.get("fullPath"), "matching_records": recs})
     else:
