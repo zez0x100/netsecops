@@ -8,7 +8,8 @@ devices from one place. Python 3.8+, standard library only, no dependencies.
 - "Where does this IP appear?" lookup (F5 pools, nodes, virtuals, data groups, policies; PAN/Forti policy lookup)
 - F5 ASM/WAF request-log search, WAF and SSL posture checks
 - PAN-OS / FortiGate log search, admin-change audit
-- Optional F5 active tools (log search, tcpdump ( with the ability to extract the pms by utilizing tshark with f5 filters and save the output in .pms, both pcap and pms will downloaded to the project folder)
+- Optional F5 active tools (log search, tcpdump ( with the ability to extract the pms by utilizing tshark with f5 filters and save the output in .pms,
+  both pcap and pms will be downloaded to the project folder)
 - Configuration backup (explicit tick-box required)
 
 ## Run
