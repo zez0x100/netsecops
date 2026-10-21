@@ -16,6 +16,8 @@ Design notes
   operational command (PAN-OS; <test> limited to an allowlist). The raw box enforces the same rules.
 - EXCEPTION: the 'F5 active tools' (log search, tcpdump) run fixed shell-command templates
   through iControl REST util/bash. They need the Administrator role and an explicit tick-box.
+- EXCEPTION: 'Configuration backup' on F5 saves a UCS archive on the BIG-IP (same tick-box); on PAN-OS and
+  FortiGate it is a read-only export. Backups are saved in ./captures and downloaded by the browser.
 - The tool talks to device management APIs over HTTPS from THIS machine.
 - AppSec checks (WAF / profile coverage, SSL posture, ASM request log,
   PAN log search) are read-only.
@@ -24,6 +26,8 @@ import argparse
 import base64
 import calendar
 import collections
+import concurrent.futures
+import datetime
 import hashlib
 import ipaddress
 import json
@@ -78,6 +82,9 @@ CATALOG = {
         {"id": "vsall", "group": "LTM", "label": "All virtual server stats", "path": "/mgmt/tm/ltm/virtual/stats"},
         {"id": "vsone", "group": "LTM", "label": "One virtual server stats", "path": "/mgmt/tm/ltm/virtual/{vs}/stats",
          "params": [P("vs", "Virtual server", "~Common~my_vs")]},
+        {"id": "polsearch", "group": "LTM", "label": "Local traffic policy search (rules and conditions)",
+         "path": "/mgmt/tm/ltm/policy?expandSubcollections=true",
+         "params": [P("policy", "Policy name (or part of it)", "my_policy")]},
         {"id": "poolall", "group": "LTM", "label": "All pool stats", "path": "/mgmt/tm/ltm/pool/stats"},
         {"id": "poolmem", "group": "LTM", "label": "Pool member stats", "path": "/mgmt/tm/ltm/pool/{pool}/members/stats",
          "params": [P("pool", "Pool", "~Common~my_pool")]},
@@ -410,16 +417,141 @@ def do_run(b):
     if not spec:
         return {"ok": False, "error": "unknown check"}
     try:
+        if sess["vendor"] == "f5" and spec["id"] in ("vsone", "poolmem"):
+            # Accept /Common/name, ~Common~name or a bare name (assumed to be in /Common).
+            b = dict(b, params=dict(b.get("params") or {}))
+            for k in ("vs", "pool"):
+                raw = str(b["params"].get(k) or "").strip().replace("/", "~")
+                if raw:
+                    b["params"][k] = raw if raw.startswith("~") else "~Common~" + raw
         if "cmd" in spec:
             run = {"cmd": fill(spec["cmd"], b.get("params", {}), spec, sess["vendor"])}
         else:
             run = {"path": fill(spec["path"], b.get("params", {}), spec, sess["vendor"])}
         audit(sess, spec["label"])
-        return execute(sess, run)
+        result = execute(sess, run)
+        if sess["vendor"] == "f5" and spec["id"] in ("vsall", "vsone") and result.get("ok"):
+            rows = f5_vs_overview(sess, (b.get("params") or {}).get("vs") if spec["id"] == "vsone" else None,
+                                  result.get("data"))
+            if rows:
+                result["data"] = {"virtual_servers": rows}
+        if sess["vendor"] == "f5" and spec["id"] == "polsearch" and result.get("ok"):
+            rows = f5_policy_search(sess, str((b.get("params") or {}).get("policy") or "").strip())
+            result["data"] = {"policies": rows} if rows else {"policies": [], "note": "no local traffic policy matches that name"}
+        if sess["vendor"] == "f5" and spec["id"] in ("poolall", "poolmem") and result.get("ok"):
+            rows = f5_pool_overview(sess, (b.get("params") or {}).get("pool") if spec["id"] == "poolmem" else None)
+            if rows:
+                result["data"] = {"pool_members": rows}
+        return result
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     except (urllib.error.URLError, OSError) as e:
         return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+
+
+def f5_stat_status(stats):
+    """{tmName: 'available' | 'offline' | 'disabled' ...} from a /stats collection (availability + enabled state)."""
+    out = {}
+    for e in ((stats or {}).get("entries") or {}).values() if isinstance(stats, dict) else []:
+        ne = (e.get("nestedStats") or {}).get("entries") or {}
+
+        def val(k):
+            x = ne.get(k) or {}
+            return str(x.get("description") if "description" in x else x.get("value", ""))
+        name = val("tmName")
+        if name:
+            enabled = val("status.enabledState")
+            out[name] = enabled if enabled and enabled != "enabled" else (val("status.availabilityState") or "unknown")
+    return out
+
+
+def f5_vs_overview(sess, vs, vs_stats):
+    """One row per virtual server / pool member: names, member IPs and the VS, pool and member status."""
+    only = "/" + vs.strip("~").replace("~", "/") if vs else None
+    okv, dv = f5_get(sess, "/mgmt/tm/ltm/virtual?expandSubcollections=true")
+    okp, dp = f5_get(sess, "/mgmt/tm/ltm/pool?expandSubcollections=true")
+    if not okv:
+        return None
+    _, _, ps = rest_get(sess, "/mgmt/tm/ltm/pool/stats")
+    vstat = f5_stat_status((vs_stats or {}) if isinstance(vs_stats, dict) else {})
+    pstat = f5_stat_status(ps if isinstance(ps, dict) else {})
+    pools = {p.get("fullPath"): p for p in (dp.get("items", []) if okp else [])}
+    rows = []
+
+    cur = {}  # destination of the virtual server being written
+
+    def row(vname, pool, ip, vst, pst, mst, via=""):
+        rows.append({"vs_name": vname, "vip": cur.get("vip", ""), "port": cur.get("port", ""),
+                     "pool_name": pool, "pool_member_ip": ip,
+                     "vs_status": vst, "pool_status": pst, "member_status": mst, "local_traffic_policy": via})
+
+    def emit(vname, pool, vst, via=""):
+        pst = pstat.get(pool, "")
+        members = (pools.get(pool, {}).get("membersReference") or {}).get("items", [])
+        if not members:
+            row(vname, pool, "", vst, pst, "", via)
+        for i, m in enumerate(members):
+            sess_state = m.get("session") or ""
+            mstat = str(m.get("state") or "") + (" / " + sess_state if sess_state not in ("", "monitor-enabled") else "")
+            row(vname, pool, "%s:%s" % (strip_rd(m.get("address")), f5_member_port(m.get("name"))), vst, pst, mstat,
+                via if i == 0 else "")
+    for v in dv.get("items", []):
+        if only and v.get("fullPath") != only:
+            continue
+        vname, pool = v.get("fullPath"), v.get("pool") or ""
+        vst = vstat.get(vname, "")
+        dest = (v.get("destination") or "").rsplit("/", 1)[-1]
+        cur["vip"], cur["port"] = f5_dest_ip(v.get("destination")), f5_member_port(dest)
+        if pool:
+            emit(vname, pool, vst)
+            continue
+        # No default pool: one row naming the attached local traffic polic(ies), not one row per pooled member.
+        names = [pr.get("fullPath") or "/%s/%s" % (pr.get("partition", "Common"), pr.get("name"))
+                 for pr in (v.get("policiesReference") or {}).get("items", [])]
+        row(vname, "", "", vst, "", "", ", ".join(names))
+    return rows
+
+
+def f5_member_port(name):
+    name = str(name or "")
+    return name.rsplit(".", 1)[-1] if name.count(":") > 1 else name.rsplit(":", 1)[-1]
+
+
+def f5_pool_overview(sess, pool):
+    """One row per pool member: pool, member IP:port, status, load-balancing method, current connections."""
+    only = "/" + pool.strip("~").replace("~", "/") if pool else None
+    okp, dp = f5_get(sess, "/mgmt/tm/ltm/pool?expandSubcollections=true")
+    if not okp:
+        return None
+    pools = [p for p in dp.get("items", []) if not only or p.get("fullPath") == only]
+
+    def conns(p):
+        try:
+            _, ok, d = rest_get(sess, "/mgmt/tm/ltm/pool/%s/members/stats" % (p.get("fullPath") or "").replace("/", "~"))
+        except (urllib.error.URLError, OSError):
+            return {}
+        out = {}
+        for e in ((d or {}).get("entries") or {}).values() if ok and isinstance(d, dict) else []:
+            ne = (e.get("nestedStats") or {}).get("entries") or {}
+            addr = strip_rd((ne.get("addr") or {}).get("description", ""))
+            port = str((ne.get("port") or {}).get("value", ""))
+            out[(addr, port)] = (ne.get("serverside.curConns") or {}).get("value", "")
+        return out
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        stats = list(ex.map(conns, pools))
+    rows = []
+    for p, cs in zip(pools, stats):
+        base = {"pool_name": p.get("fullPath"), "lb_method": p.get("loadBalancingMode", "")}
+        members = (p.get("membersReference") or {}).get("items", [])
+        if not members:
+            rows.append(dict(base, pool_member_ip="", member_status="", current_connections=""))
+        for m in members:
+            addr, port, sess_state = strip_rd(m.get("address")), f5_member_port(m.get("name")), m.get("session") or ""
+            rows.append({"pool_name": base["pool_name"], "pool_member_ip": "%s:%s" % (addr, port),
+                         "member_status": str(m.get("state") or "") + (
+                             " / " + sess_state if sess_state not in ("", "monitor-enabled") else ""),
+                         "lb_method": base["lb_method"], "current_connections": cs.get((addr, port), "")})
+    return rows
 
 
 def do_raw(b):
@@ -465,8 +597,9 @@ def do_disconnect(b):
 CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
 F5_LOGS = ("ltm", "audit", "apm", "gtm", "tmm", "asm")
 IFACE_RE = re.compile(r'^[0-9A-Za-z_.:\-]{1,32}$')
-FILE_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,120}\.(pcap|pms)$')
+FILE_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,120}\.(pcap|pms|ucs|xml|conf)$')
 MAX_PCAP = 300 * 1024 * 1024
+MAX_BACKUP = 2 * 1024 * 1024 * 1024
 
 
 def hget(h, name):
@@ -498,6 +631,16 @@ def ip_in_spec(ip, spec):
         else:
             net = ipaddress.ip_network(spec, strict=False)
         return ip in net
+    except (ValueError, TypeError):
+        return False
+
+
+def ip_is_exact(ip, spec):
+    """True only if spec is this very address (a single-host /32 or /128 counts); never a wider CIDR or range."""
+    try:
+        return ipaddress.ip_address(ip) == ipaddress.ip_address(str(spec).strip()) if "/" not in str(spec) else \
+            ipaddress.ip_network(str(spec).strip(), strict=False).prefixlen == ip.max_prefixlen and \
+            ipaddress.ip_network(str(spec).strip(), strict=False).network_address == ip
     except (ValueError, TypeError):
         return False
 
@@ -560,11 +703,15 @@ def f5_get(sess, path):
 def f5_lookup(sess, ip):
     notes, pool_vs = [], {}
     res = {"pools": [], "nodes": [], "virtual_servers": [], "data_groups": []}
-    ok, d = f5_get(sess, "/mgmt/tm/ltm/virtual")
+    ok, d = f5_get(sess, "/mgmt/tm/ltm/virtual?expandSubcollections=true")
+    policy_vs = {}  # policy -> virtual servers it is attached to
     if ok:
         for v in d.get("items", []):
             if v.get("pool"):
                 pool_vs.setdefault(v["pool"], []).append(v.get("fullPath"))
+            for pr in (v.get("policiesReference") or {}).get("items", []):
+                policy_vs.setdefault(pr.get("fullPath") or "/%s/%s" % (pr.get("partition", "Common"), pr.get("name")),
+                                     []).append(v.get("fullPath"))
             hit = []
             if ip_in_spec(ip, f5_dest_ip(v.get("destination"))):
                 hit.append("destination")
@@ -578,14 +725,27 @@ def f5_lookup(sess, ip):
                                                "pool": v.get("pool")})
     else:
         notes.append("could not read virtual servers")
+    # Pools that local traffic policy rules forward to: pool -> [{policy, rule, virtual_servers}]
+    pool_pol = {}
+    okpol, dpol = f5_get(sess, "/mgmt/tm/ltm/policy?expandSubcollections=true")
+    for pol in (dpol.get("items", []) if okpol else []):
+        for r in (pol.get("rulesReference") or {}).get("items", []):
+            for a in (r.get("actionsReference") or {}).get("items", []):
+                if a.get("forward") and a.get("pool"):
+                    pool_pol.setdefault(a["pool"], []).append(
+                        {"policy": pol.get("fullPath"), "rule": r.get("name"),
+                         "virtual_servers": policy_vs.get(pol.get("fullPath"), [])})
     ok, d = f5_get(sess, "/mgmt/tm/ltm/pool?expandSubcollections=true")
     if ok:
         for p in d.get("items", []):
             for m in (p.get("membersReference") or {}).get("items", []):
                 if ip_in_spec(ip, strip_rd(m.get("address"))):
+                    via = pool_pol.get(p.get("fullPath"), [])
                     res["pools"].append({"pool": p.get("fullPath"), "member": m.get("name"),
                                          "state": m.get("state"), "session": m.get("session"),
-                                         "virtual_servers": pool_vs.get(p.get("fullPath"), [])})
+                                         "virtual_servers": pool_vs.get(p.get("fullPath"), []),
+                                         "local_traffic_policies": ["%s (rule: %s)" % (x["policy"], x["rule"]) for x in via],
+                                         "policy_virtual_servers": sorted({vs for x in via for vs in x["virtual_servers"]})})
     else:
         notes.append("could not read pools")
     ok, d = f5_get(sess, "/mgmt/tm/ltm/node")
@@ -610,26 +770,120 @@ def f5_lookup(sess, ip):
     if ok and d.get("items"):
         notes.append("%d external data group(s) exist and were NOT searched (file contents are not exposed here)"
                      % len(d["items"]))
+    ph = f5_policy_ip_hits(sess, ip)
+    if ph is None:
+        notes.append("could not read local traffic policies")
+    else:
+        res["local_traffic_policies"] = ph
+    notes.append("Local traffic policies: only rule conditions listing the IP (address, subnet or range) are matched; "
+                 "iRules are not searched.")
     notes.append("Configuration lookup only: FQDN nodes are not resolved, and this does not prove live traffic.")
     res["notes"] = notes
     summary = []
     for h in res["pools"]:
         summary.append("Pool member in %s (%s, state=%s, session=%s); used by virtual(s): %s" % (
             h["pool"], h["member"], h["state"], h["session"], ", ".join(h["virtual_servers"]) or "none"))
+        if h["local_traffic_policies"]:
+            summary.append("  Pool %s is a forward target of local traffic policy: %s; reached through virtual(s): %s" % (
+                h["pool"], ", ".join(h["local_traffic_policies"]), ", ".join(h["policy_virtual_servers"]) or
+                "none (policy not attached to a virtual server)"))
     for h in res["nodes"]:
         summary.append("Node %s (state=%s, session=%s)" % (h["node"], h["state"], h["session"]))
     for h in res["virtual_servers"]:
         summary.append("Virtual server %s matches on %s" % (h["virtual"], "/".join(h["matched"])))
     for h in res["data_groups"]:
         summary.append("Data group %s has record(s): %s" % (h["data_group"], ", ".join(h["matching_records"])))
+    for h in res.get("local_traffic_policies", []):
+        summary.append("Local traffic policy %s, rule %s: %s -> %s (virtual(s): %s)" % (
+            h["policy"], h["rule"], h["condition"], h["action"] or "no action", ", ".join(h["virtual_servers"])))
     if res["pools"]:
         verdict = {"label": "IN %d POOL MEMBERSHIP(S)" % len(res["pools"]), "kind": "ok"}
     elif summary:
         verdict = {"label": "FOUND (not as a pool member)", "kind": "ok"}
     else:
-        verdict = {"label": "NOT FOUND in pools, nodes, virtuals or internal data groups", "kind": "info"}
+        verdict = {"label": "NOT FOUND in pools, nodes, virtuals, data groups or local traffic policies", "kind": "info"}
         summary.append("No configuration object references this IP.")
     return res, summary, verdict
+
+
+def f5_rule_actions(r):
+    """(readable actions, forwarded-to pool) for one LTM policy rule."""
+    acts, pool = [], ""
+    for a in (r.get("actionsReference") or {}).get("items", []):
+        if a.get("forward") and a.get("pool"):
+            pool = a["pool"]
+            acts.append("forward to pool %s" % pool)
+        elif a.get("forward") and a.get("virtual"):
+            acts.append("forward to virtual %s" % a["virtual"])
+        elif a.get("reset"):
+            acts.append("reset")
+        elif a.get("redirect"):
+            acts.append("redirect %s" % (a.get("location") or ""))
+        else:
+            acts.append(next((k for k in a if a.get(k) is True and k not in ("request", "response")), "action"))
+    return acts, pool
+
+
+F5_COND_SKIP = {"caseInsensitive", "request", "response", "present", "not", "name", "index", "generation", "kind",
+                "fullPath", "selfLink", "values", "equals", "startsWith", "endsWith", "contains", "matches", "missing",
+                "ordinal"}
+
+
+def f5_cond_text(c):
+    """Readable text for one LTM policy rule condition, e.g. 'http host equals a.com, b.com'."""
+    what = " ".join([k for k in c if c.get(k) is True and k not in F5_COND_SKIP] +
+                    ([str(c["tmName"])] if c.get("tmName") else []))
+    op = next((o for o in ("equals", "startsWith", "endsWith", "contains", "matches") if c.get(o)), "")
+    return ("%s%s%s %s" % (what, " not" if c.get("not") else "", " " + op if op else "",
+                           ", ".join(str(x) for x in (c.get("values") or [])))).strip()
+
+
+def f5_policy_search(sess, term):
+    """One row per rule (policy, rule, condition, action) of every local traffic policy whose name contains `term`."""
+    ok, d = f5_get(sess, "/mgmt/tm/ltm/policy?expandSubcollections=true")
+    if not ok:
+        return None
+    rows = []
+    for p in d.get("items", []):
+        if term.lower() not in str(p.get("fullPath", "")).lower():
+            continue
+        rules = sorted((p.get("rulesReference") or {}).get("items", []), key=lambda r: r.get("ordinal", 0))
+        if not rules:
+            rows.append({"policy_name": p.get("fullPath"), "rule": "", "condition": "", "action": ""})
+        for r in rules:
+            conds = [f5_cond_text(c) for c in (r.get("conditionsReference") or {}).get("items", [])]
+            rows.append({"policy_name": p.get("fullPath"), "rule": r.get("name"),
+                         "condition": " AND ".join(conds) if conds else "(no condition: matches every request)",
+                         "action": "; ".join(f5_rule_actions(r)[0])})
+    return rows
+
+
+def f5_policy_ip_hits(sess, ip):
+    """Local traffic policy rules with a condition whose values include `ip` (address, CIDR or range)."""
+    okp, dp = f5_get(sess, "/mgmt/tm/ltm/policy?expandSubcollections=true")
+    okv, dv = f5_get(sess, "/mgmt/tm/ltm/virtual?expandSubcollections=true")
+    if not okp:
+        return None
+    by_policy = {}
+    for v in (dv.get("items", []) if okv else []):
+        for p in (v.get("policiesReference") or {}).get("items", []):
+            by_policy.setdefault(p.get("fullPath") or "/%s/%s" % (p.get("partition", "Common"), p.get("name")),
+                                 []).append(v.get("fullPath"))
+    hits = []
+    for p in dp.get("items", []):
+        pol = p.get("fullPath")
+        for r in (p.get("rulesReference") or {}).get("items", []):
+            acts, pool = f5_rule_actions(r)
+            for c in (r.get("conditionsReference") or {}).get("items", []):
+                vals = [str(x) for x in (c.get("values") or [])]
+                matched = [x for x in vals if ip_is_exact(ip, strip_rd(x))]
+                if not matched:
+                    continue
+                hits.append({"policy": pol, "policy_status": p.get("status", ""), "rule": r.get("name"),
+                             "condition": f5_cond_text(c),
+                             "matched_value": ", ".join(matched), "action": "; ".join(acts),
+                             "virtual_servers": by_policy.get(pol, []) or ["(policy not attached to any virtual server)"]})
+    return hits
 
 
 def f5_host_cond(c, host):
@@ -685,20 +939,7 @@ def do_f5_host(b):
             host_rules += 1
             if not all(m for h, m, _ in parsed if h):
                 continue
-            acts = []
-            pool = ""
-            for a in (r.get("actionsReference") or {}).get("items", []):
-                if a.get("forward") and a.get("pool"):
-                    pool = a["pool"]
-                    acts.append("forward to pool %s" % pool)
-                elif a.get("forward") and a.get("virtual"):
-                    acts.append("forward to virtual %s" % a["virtual"])
-                elif a.get("reset"):
-                    acts.append("reset")
-                elif a.get("redirect"):
-                    acts.append("redirect %s" % (a.get("location") or ""))
-                else:
-                    acts.append(next((k for k in a if a.get(k) is True and k not in ("request", "response")), "action"))
+            acts, pool = f5_rule_actions(r)
             vss = by_policy.get(pol, [])
             if not vss:
                 unattached += 1
@@ -1079,7 +1320,7 @@ def do_f5_logs(b):
                 n, log, " plus rotated files" if b.get("rotated") else "")]}
 
 
-def f5_fetch(sess, path, local):
+def f5_fetch(sess, path, local, limit=MAX_PCAP):
     """Copy a file from the BIG-IP to local through the shell (base64 in 256 KB blocks), so nothing has to be
     staged in /var/local/ucs. The MD5 is checked at the end. Returns bytes written."""
     q = shlex.quote(path)
@@ -1088,8 +1329,8 @@ def f5_fetch(sess, path, local):
     if not ok or len(lines) < 2 or not lines[0].isdigit():
         raise RuntimeError("cannot read %s on the BIG-IP: %s" % (path, out.strip()[:200]))
     size, md5 = int(lines[0]), lines[1]
-    if size > MAX_PCAP:
-        raise RuntimeError("%s is %d MB, over the %d MB limit" % (path, size >> 20, MAX_PCAP >> 20))
+    if size > limit:
+        raise RuntimeError("%s is %d MB, over the %d MB limit" % (path, size >> 20, limit >> 20))
     BLK, got, h = 256 * 1024, 0, hashlib.md5()
     with open(local, "wb") as f:
         for i in range((size + BLK - 1) // BLK):
@@ -1496,8 +1737,21 @@ def asm_reason(sess, it, cache):
     return "; ".join(out)
 
 
+def utc3(ts):
+    """ISO timestamp with a zone (e.g. 2026-10-20T12:02:57Z) -> 'YYYY-MM-DD HH:MM:SS' in UTC+3.
+    Anything without a zone (or not ISO) is returned unchanged."""
+    s = str(ts or "").strip()
+    try:
+        d = datetime.datetime.fromisoformat(re.sub(r"Z$", "+00:00", s))
+    except ValueError:
+        return ts
+    if d.tzinfo is None:
+        return ts
+    return d.astimezone(datetime.timezone(datetime.timedelta(hours=3))).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def asm_row(it):
-    return {"time": first(it, "requestDatetime", "occurrenceTime", "dateTime", "time"),
+    return {"time": utc3(first(it, "requestDatetime", "occurrenceTime", "dateTime", "time")),
             "support_id": asm_support_id(it), "hostname": asm_hostname(it),
             "status": first(it, "requestStatus", "enforcementState"),
             "client": it.get("clientIp", ""),
@@ -1765,7 +2019,7 @@ def do_f5_asm(b):
         if vs_name:
             vip = ("%s (%s)" % (vip, vs_name)) if vip else str(vs_name)
         data = {"support_id": sid,
-                "time": first(it, "requestDatetime", "occurrenceTime", "dateTime", "time") or "",
+                "time": utc3(first(it, "requestDatetime", "occurrenceTime", "dateTime", "time")) or "",
                 "hostname": asm_hostname(it) or hdrs.get("host", ""),
                 "uri": str(first(it, "url", "uri") or ""),
                 "source_ip": it.get("clientIp", ""),
@@ -1942,7 +2196,10 @@ def do_pan_logs(b):
     return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "log query " + query,
             "verdict": {"label": "%d %s LOG ENTRIES for %s" % (
                             len(entries), lt.upper(), "%s -> %s" % (ip, dest) if ip and dest else ip or dest),
-                        "kind": "ok" if entries else "info"},
+                        "kind": "bad" if any(re.match(r"(?i)(deny|denied|drop|dropped|block|blocked|block-.*|reset.*|"
+                                                      r"blackhole|sinkhole)$", str(e.get("action") or ""))
+                                             for e in entries_src)
+                        else "ok" if entries else "info"},
             "summary": summary, "data": {"lines": lines, "entries": entries}}
 
 
@@ -2615,6 +2872,114 @@ def do_appsec(b):
 # ----------------------------------------------------------------------------
 # HTTP server
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Configuration backup (all vendors) -> saved in ./captures, then downloaded by the browser
+# ----------------------------------------------------------------------------
+def device_hostname(sess):
+    """The device's own configured hostname, or the saved label / address if it cannot be read."""
+    try:
+        if sess["vendor"] == "f5":
+            _, ok, d = rest_get(sess, "/mgmt/tm/sys/global-settings?$select=hostname")
+            h = d.get("hostname") if ok and isinstance(d, dict) else ""
+        elif sess["vendor"] == "fortigate":
+            _, ok, d = rest_get(sess, "/api/v2/monitor/system/status")
+            h = (d.get("results") or {}).get("hostname") if ok and isinstance(d, dict) else ""
+        else:
+            _, ok, d = pan_op(sess, "<show><system><info/></system></show>")
+            h = (((d.get("response") or {}).get("result") or {}).get("system") or {}).get("hostname") if ok else ""
+    except (urllib.error.URLError, OSError, AttributeError, ValueError):
+        h = ""
+    return str(h or sess["name"])
+
+
+def do_backup(b):
+    sess = SESSIONS.get(b.get("id"))
+    if not sess:
+        return {"ok": False, "error": "connect a device first"}
+    v, t0 = sess["vendor"], time.time()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    ext = {"f5": "ucs", "paloalto": "xml", "fortigate": "conf"}[v]
+    devname = re.sub(r'[^A-Za-z0-9_.\-]', "_", device_hostname(sess))[:60]
+    local_name = "%s_backup_%s.%s" % (devname, stamp, ext)
+    summary = []
+    try:
+        os.makedirs(CAPTURE_DIR, exist_ok=True)
+        local = os.path.join(CAPTURE_DIR, local_name)
+        if v == "f5":
+            sess, err = _f5_gate(b)  # needs the tick-box: this creates a UCS file on the BIG-IP and uses bash
+            if err:
+                return err
+            remote_name = "%s_%s" % (devname, stamp)
+            # A UCS save can take minutes but iControl REST / util/bash time out after ~60 s, so start tmsh in the
+            # background on the BIG-IP and poll a status file until it finishes.
+            log, rc = "/var/tmp/%s.log" % remote_name, "/var/tmp/%s.rc" % remote_name
+            audit(sess, "backup: saving UCS " + remote_name)
+            st, ok, out, _ = f5_bash(sess, "nohup sh -c %s >/dev/null 2>&1 &" % shlex.quote(
+                "tmsh save /sys ucs %s.ucs > %s 2>&1; echo $? > %s" % (remote_name, log, rc)), 30)
+            if st in (401, 403):
+                raise ValueError("bash access denied (needs the Administrator role)")
+            if not ok:
+                raise ValueError("could not start the UCS save (HTTP %s)" % st)
+            deadline, status = time.time() + 1500, ""
+            while time.time() < deadline:
+                time.sleep(10)
+                st, ok, out, _ = f5_bash(sess, "cat %s 2>/dev/null; echo ---; cat %s 2>/dev/null" % (rc, log), 30)
+                if ok and "---" in out:
+                    code, _, status = out.partition("---")
+                    if code.strip():
+                        break
+            else:
+                raise ValueError("the UCS save did not finish within 25 minutes (it may still complete on the BIG-IP: "
+                                 "/var/local/ucs/%s.ucs)" % remote_name)
+            f5_bash(sess, "rm -f %s %s" % (log, rc), 30)
+            if code.strip() != "0":
+                raise ValueError("UCS save failed on the BIG-IP: %s" % (status.strip()[:300] or "exit " + code.strip()))
+            remote = "/var/local/ucs/%s.ucs" % remote_name
+            size = f5_fetch(sess, remote, local, MAX_BACKUP)
+            summary += ["UCS archive created on the BIG-IP at %s (left in place; delete it there when no longer needed)." % remote,
+                        "Copied through the shell and verified by MD5. Large archives take a while."]
+        elif v == "paloalto":
+            audit(sess, "backup: exporting configuration")
+            st, raw = http(sess, "GET", "/api/?" + urllib.parse.urlencode({"type": "export", "category": "configuration"}),
+                           {"X-PAN-KEY": sess["key"]}, None, 180)
+            if st != 200 or b"<config" not in raw[:4000]:
+                raise ValueError("configuration export failed (HTTP %s): %s" % (st, raw[:300].decode("utf-8", "replace")))
+            with open(local, "wb") as f:
+                f.write(raw)
+            size = len(raw)
+            summary.append("Exported the running configuration (XML). Import it on a firewall with Device > Setup > Operations.")
+        else:
+            q = {"scope": "global"}
+            vdom = str(b.get("vdom") or "").strip()
+            if vdom:
+                if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,31}", vdom):
+                    raise ValueError("invalid VDOM name")
+                q = {"scope": "vdom", "vdom": vdom}
+            audit(sess, "backup: system config backup (%s)" % q["scope"])
+            st, raw = http(sess, "GET", "/api/v2/monitor/system/config/backup?" + urllib.parse.urlencode(q),
+                           sess["hdr"], None, 180)
+            if st != 200 or b"#config-version" not in raw[:400]:
+                raise ValueError("config backup failed (HTTP %s). The API user needs the super_admin profile. %s" % (
+                    st, raw[:200].decode("utf-8", "replace")))
+            with open(local, "wb") as f:
+                f.write(raw)
+            size = len(raw)
+            summary.append("Backup scope: %s. Restore it from System > Config > Backup & Restore." %
+                           (("VDOM " + vdom) if vdom else "global (whole device)"))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except RuntimeError as e:
+        return {"ok": False, "error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+    audit(sess, "backup saved (%d bytes)" % size)
+    summary += ["Saved locally: " + local, "The file holds sensitive configuration (hashed passwords, keys, addresses): store it securely."]
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "backup " + v,
+            "download": "/api/capture/" + local_name, "downloads": ["/api/capture/" + local_name],
+            "verdict": {"label": "BACKUP SAVED (%d bytes)" % size, "kind": "ok"}, "summary": summary,
+            "data": {"saved_file": local, "size_bytes": size}}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ITSecOps"
 
@@ -2647,7 +3012,8 @@ class Handler(BaseHTTPRequestHandler):
         if not FILE_RE.match(name) or not os.path.isfile(path):
             return self._send(404, {"error": "not found"})
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain" if name.endswith(".pms") else "application/vnd.tcpdump.pcap")
+        self.send_header("Content-Type", "application/vnd.tcpdump.pcap" if name.endswith(".pcap") else
+                         "text/plain" if name.endswith((".pms", ".conf")) else "application/octet-stream")
         self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
         self.send_header("Content-Length", str(os.path.getsize(path)))
         self.send_header("Cache-Control", "no-store")
@@ -2705,7 +3071,8 @@ class Handler(BaseHTTPRequestHandler):
                   "/api/f5capture": do_f5_capture, "/api/profile/save": do_profile_save,
                   "/api/profile/delete": do_profile_delete, "/api/health": do_health,
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
-                  "/api/fglogs": do_fg_logs, "/api/adminaudit": do_admin_audit, "/api/f5sync": do_f5_sync, "/api/pancapture": do_pan_capture}
+                  "/api/fglogs": do_fg_logs, "/api/adminaudit": do_admin_audit, "/api/f5sync": do_f5_sync, "/api/pancapture": do_pan_capture,
+                  "/api/backup": do_backup}
         fn = routes.get(self.path)
         if not fn:
             return self._send(404, {"error": "not found"})
@@ -2791,6 +3158,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty tr:hover td{background:#7C6CFF14}
 #pretty .pill{display:inline-block;padding:1px 10px;border-radius:99px;font-size:12px;border:1px solid currentColor;white-space:nowrap}
 #pretty .pill.info{color:#b3a9ff}
+#pretty tr.deny td{background:#FF7A5920!important;color:var(--coral)}#pretty .logln.deny,#pretty .kvr.deny .v{color:var(--coral);font-weight:600}
 #pretty .chip{display:inline-block;margin:2px 4px 2px 0;padding:1px 8px;border-radius:6px;background:var(--panel2);white-space:nowrap}
 #pretty td:has(.chip){min-width:180px}#pretty .sev-high{color:var(--coral);font-weight:700}#pretty .sev-medium{color:#ffc857;font-weight:700}#pretty .sev-low{color:var(--dim)}
 #pretty .sec{color:var(--dim);font-size:12px;letter-spacing:.1em;text-transform:uppercase;margin:0 0 6px}
@@ -2841,6 +3209,8 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
   <div class="card"><h3>Output</h3>
     <div class="meta"><span id="ometa">nothing run yet</span>
     <span id="fcount" class="muted" style="margin-left:auto"></span>
+    <select id="stscope" style="display:none;max-width:150px" onchange="renderOut()" title="Which status column to test"><option value="">any status column</option><option value="vs">VS status</option><option value="pool">Pool status</option><option value="member">Member status</option></select>
+    <select id="stval" style="display:none;max-width:150px" onchange="renderOut()" title="Show only rows in this state"><option value="">all states</option><option value="up">up / available</option><option value="down">down / offline</option><option value="unknown">unknown</option><option value="disabled">disabled</option></select>
     <input id="filter" placeholder="filter: word word -exclude" title="Words are ANDed; prefix a word with - to exclude it" style="max-width:240px" oninput="renderOut()">
     <button onclick="copyOut()">Copy</button>
     <button onclick="exportCsv()">Findings CSV</button><button onclick="exportHtml()">HTML report</button></div>
@@ -2937,7 +3307,7 @@ const ACR={ip:"IP",ipv4:"IPv4",ipv6:"IPv6",cpu:"CPU",id:"ID",url:"URL",uri:"URI"
  dns:"DNS",vpn:"VPN",nat:"NAT",fqdn:"FQDN",vdom:"VDOM",vsys:"vSys",xff:"XFF",http:"HTTP",https:"HTTPS",mac:"MAC",vlan:"VLAN",
  asm:"ASM",waf:"WAF",tcp:"TCP",udp:"UDP",icmp:"ICMP",snmp:"SNMP",ntp:"NTP",os:"OS",uuid:"UUID",pid:"PID",hw:"HW",sw:"SW",
  san:"SAN",cn:"CN",pcap:"PCAP",ms:"ms",sip:"SIP"};
-const LABEL={t:"Time",fullPath:"Name"};
+const LABEL={t:"Time",fullPath:"Name",vip:"VS",body:"Request body",request_headers:"Request headers"};
 function hum(k){if(LABEL[k])return LABEL[k];k=String(k).replace(/^[@#]/,"");
  const w=k.replace(/([a-z0-9])([A-Z])/g,"$1 $2").replace(/[_\-.:\/]+/g," ").trim().split(/\s+/).filter(Boolean);
  return w.map(x=>ACR[x.toLowerCase()]||x[0].toUpperCase()+x.slice(1)).join(" ")||k}
@@ -2964,6 +3334,7 @@ function tableSec(title,rows){
  if(cols.includes("fullPath"))cols=cols.filter(c=>!["name","partition","subPath"].includes(c));
  const data=rows.map(r=>{const o={};cols.forEach(c=>o[c]=cellv(r[c]));return o});
  cols=cols.filter(c=>data.some(r=>r[c]!==""));
+ if(cols.includes("vs_name")||cols.includes("pool_member_ip")||cols.includes("policy_name"))return {t:"table",title,cols,data};  // F5 VS overview: keep the column order given
  const lead=/^(name|fullPath|@name|label|object|rule|policy|id|policyid|time|t|severity|support_id|hostname|block_reason)$/i;
  const head=cols.filter(c=>lead.test(c)),rest=cols.filter(c=>!lead.test(c));
  const pr=/(status|state|avail|enabled|conn|bits|pkts|cpu|usage|used|total|address|ip|action|port|type)/i;
@@ -2986,7 +3357,7 @@ function toSections(v,title,out,depth){
  const skipLines=Array.isArray(v.lines)&&!!(v.requests||v.entries||v.findings);
  ks.forEach(k=>{const x=v[k];if(noisy(k,x)||(k==="lines"&&skipLines))return;
   const u=unwrap(x);if(blank(u))return;
-  if(typeof u!=="object"){if(isLong(u))kids.push([k,u]);else rows.push([hum(k),u])}
+  if(typeof u!=="object"){if(isLong(u)||k==="body"||k==="request_headers")kids.push([k,u]);else rows.push([hum(k),u])}
   else if(Array.isArray(u)&&k!=="lines"&&u.every(y=>y===null||typeof y!=="object")&&u.join(", ").length<=120)rows.push([hum(k),u]);
   else kids.push([k,u])});
  if(rows.length)out.push({t:"kv",title:title||"Details",rows});
@@ -3013,24 +3384,38 @@ function secNode(s){const w=mk("div","rsec");
   box.appendChild(t);w.appendChild(box)}
  else if(s.t==="list"){const u=mk("ul","sum");s.items.forEach(i=>u.appendChild(mk("li",null,i)));w.appendChild(u)}
  else if(s.lines){const b=mk("div","tx");s.lines.forEach(l=>b.appendChild(mk("div","logln",l)));w.appendChild(b)}
- else w.appendChild(mk("div","tx",s.text));
+ else{const b=mk("div","tx");String(s.text).split("\n").forEach(l=>b.appendChild(mk("div","logln",l||" ")));w.appendChild(b)}
  return w}
 function renderOut(){const box=$("#pretty");box.textContent="";if(!last)return;
  if(last.error){box.appendChild(mk("div","bad",last.error));return}
  buildSections(last.data).forEach(s=>box.appendChild(secNode(s)));
  if(!box.childNodes.length)box.appendChild(mk("div","nv","Nothing to show for this check."));
+ // Blocked / denied traffic in red: table rows with a deny-type cell, and log lines whose action precedes " -> ".
+ const DENY=/^(deny|denied|drop|dropped|block|blocked|block-\w+|reset|reset-\w+|blackhole|sinkhole)$/i,DENYW=/\b(deny|denied|drop|dropped|block|blocked|block-\w+|reset-\w+)\b/i;
+ box.querySelectorAll("tr:not(:first-child)").forEach(tr=>{if([...tr.children].some(td=>DENY.test(td.textContent.trim())))tr.classList.add("deny")});
+ box.querySelectorAll(".logln").forEach(l=>{if(DENYW.test(l.textContent.split(" -> ")[0]))l.classList.add("deny")});
+ box.querySelectorAll(".kvr").forEach(r=>{const v=r.querySelector(".v");if(v&&DENY.test(v.textContent.trim()))r.classList.add("deny")});
  // Filter: words are ANDed, a leading "-" excludes a word (e.g.  certificate -expired). Applies to log lines,
  // table rows, key/value rows and list items.
  const terms=$("#filter").value.toLowerCase().split(/\s+/).filter(Boolean),fc=$("#fcount");
  const inc=terms.filter(t=>t[0]!=="-"||t.length===1),exc=terms.filter(t=>t[0]==="-"&&t.length>1).map(t=>t.slice(1));
+ // Status filter (only for tables that have *status columns, e.g. the F5 virtual server / pool tables).
+ const hasSt=[...box.querySelectorAll("th")].some(t=>/status/i.test(t.textContent));
+ $("#stscope").style.display=$("#stval").style.display=hasSt?"":"none";
+ const stScope=$("#stscope").value,stVal=hasSt?$("#stval").value:"";
+ const SV={up:/^(available|up)\b/i,down:/^(offline|down|unavailable|forced|disconnected)/i,unknown:/^unknown/i,disabled:/disabled/i};
+ const stCols=new Map();
+ function stOk(tr){if(!stVal||tr.tagName!=="TR")return true;const t=tr.closest("table");
+  if(!stCols.has(t))stCols.set(t,[...t.rows[0].cells].map((c,i)=>[c.textContent.toLowerCase(),i]).filter(([h])=>/status/.test(h)&&(!stScope||h.startsWith(stScope))).map(x=>x[1]));
+  const idx=stCols.get(t);return !idx.length||idx.some(i=>tr.cells[i]&&SV[stVal].test(tr.cells[i].textContent.trim()))}
  const rows=box.querySelectorAll(".logln,.kvr,tr:not(:first-child),li");let shown=0;
  rows.forEach(x=>{const s=x.textContent.toLowerCase();
-  const ok=inc.every(t=>s.includes(t))&&!exc.some(t=>s.includes(t));x.style.display=ok?"":"none";if(ok)shown++});
- if(fc)fc.textContent=terms.length&&rows.length?shown+" of "+rows.length+" shown":""}
+  const ok=inc.every(t=>s.includes(t))&&!exc.some(t=>s.includes(t))&&stOk(x);x.style.display=ok?"":"none";if(ok)shown++});
+ if(fc)fc.textContent=(terms.length||stVal)&&rows.length?shown+" of "+rows.length+" shown":""}
 function isObj(v){return v!==null&&typeof v==="object"&&!Array.isArray(v)}
 function mk(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
 const GOOD=/^(up|active|enabled|enable|available|online|success|accept|allow|ok|green|true|established|established\(.*\)|in-sync|synchronized|standalone|passed?)$/i;
-const BAD=/^(down|disabled|disable|offline|failed|fail|deny|drop|error|red|false|unavailable|forced-offline|disconnected|blocked)$/i;
+const BAD=/^(down|disabled|disable|offline|failed|fail|deny|denied|drop|dropped|error|red|false|unavailable|forced-offline|disconnected|block|blocked|block-\w+|reset-\w+)$/i;
 function scalarNode(v){
  if(v===null||v===undefined||v==="")return mk("span","nv","—");
  if(typeof v==="boolean")return mk("span","pill "+(v?"ok":"bad"),v?"yes":"no");
@@ -3044,7 +3429,7 @@ async function showAudit(){const r=await api("/api/audit");last={ok:true,status:
 function fld(id,l,ph,v){return '<div><label>'+l+'</label><input id="'+id+'" placeholder="'+ph+'" value="'+(v||'')+'"></div>'}
 function g(i){const e=$("#"+i);return e?e.value:""}
 function renderIp(){const box=$("#iplookup");box.innerHTML="";const d=dev();if(!d)return;const v=d.vendor;
- let h='<div class="card"><h3>IP lookup · '+(v==="f5"?"pools, nodes, virtual servers, data groups":"policy references")+'</h3><div class="row3">'+fld("ip_ip","IP address","203.0.113.7");
+ let h='<div class="card"><h3>IP lookup · '+(v==="f5"?"pools, nodes, virtual servers, data groups, local traffic policies":"policy references")+'</h3><div class="row3">'+fld("ip_ip","IP address","203.0.113.7");
  if(v!=="f5"){
   h+=v==="paloalto"?fld("ip_vsys","vsys","vsys1","vsys1"):fld("ip_vdom","VDOM (optional)","root");
  }
@@ -3122,6 +3507,10 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   sel("pc_proto","Protocol",["any","tcp","udp","icmp"],"tcp")+
   fld("pc_dur","Seconds (5-60)","20","20")+fld("pc_cnt","Max packets","10000","10000")+sel("pc_stage","Stage",["receive","firewall","transmit","drop"],"receive")+
   '</div><p class="muted" style="margin:6px 0 0">At least one IP or port is required.</p><div style="margin-top:8px"><button class="primary" onclick="capture()">Capture &amp; download</button></div>'}
+ h+='<div class="grp">Configuration backup (saved, then downloaded to this PC)</div>'+
+  (v==="f5"?'<div class="chk"><input type="checkbox" id="bk_ack"><span>I understand this creates a UCS archive on the BIG-IP and copies it through the shell (Administrator role); approved for this device</span></div>':'')+
+  (v==="fortigate"?'<div class="row3">'+fld("bk_vdom","VDOM (optional, blank = whole device)","root")+'</div>':'')+
+  '<div style="margin-top:8px"><button class="primary" onclick="backup()">Back up &amp; download</button></div>';
  h+='<div class="grp">Admin audit · who logged in and what they did</div><div class="row3">'+fld("au_user","Admin user name","admin")+
   fld("au_act","Action contains (optional)","delete, commit, edit")+fld("au_n","Max rows","100","100")+
   (v==="paloalto"?sel("au_period","Time range",["last-15-minutes","last-hour","last-6-hrs","last-12-hrs","last-24-hrs","last-7-days","last-30-days"],"last-24-hrs"):"")+
@@ -3131,6 +3520,9 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
 async function capture(){setBusy("packet capture (up to "+g("pc_dur")+"s, then download)");
  const r=await api("/api/pancapture",{id:cur,ack:$("#pc_ack").checked,src:g("pc_src"),dst:g("pc_dst"),port:g("pc_port"),proto:g("pc_proto"),
   duration:g("pc_dur"),count:g("pc_cnt"),stage:g("pc_stage")});show(r,"packet capture")}
+async function backup(){setBusy("configuration backup (F5 archives can take several minutes)");
+ const r=await api("/api/backup",{id:cur,ack:!!($("#bk_ack")&&$("#bk_ack").checked),vdom:g("bk_vdom")});show(r,"configuration backup");
+ if(r&&r.ok&&r.download){const a=document.createElement("a");a.href=r.download+"?t="+T;a.click()}}
 async function f5Sync(){setBusy("config sync review");
  const r=await api("/api/f5sync",{id:cur,hours:g("sy_h"),count:g("sy_n")});show(r,"config sync review")}
 async function adminAudit(){setBusy("admin audit (can take up to a minute)");
@@ -3151,21 +3543,38 @@ function findingsOf(){if(last&&last.data&&Array.isArray(last.data.findings))retu
 function dlText(name,type,text){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;a.click()}
 function fname(ext){return "itsecops-"+(lastCtx.label||"report").replace(/[^a-z0-9]+/gi,"-").toLowerCase()+"-"+lastCtx.time.slice(0,10)+"."+ext}
 function csvCell(v){let s=cell(v);if(/^[=+\-@\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'}
-function exportCsv(){const f=findingsOf();if(!f)return;
- const rows=[["severity","object","issue","detail"]].concat(f.map(x=>[x.severity,x.object,x.issue,x.detail]));
- dlText(fname("csv"),"text/csv",rows.map(r=>r.map(csvCell).join(",")).join("\r\n"))}
+function hasFindings(){return !!(last&&last.data&&Array.isArray(last.data.findings))}
+function plain(v){return Array.isArray(v)?v.join(", "):cell(cellv(v))}
+const NL=String.fromCharCode(10),CRLF=String.fromCharCode(13,10);
+function exportCsv(){if(!last||last.error||!last.data){alert("Run a check first.");return}
+ let rows;
+ if(hasFindings())rows=[["severity","object","issue","detail"]].concat(last.data.findings.map(x=>[x.severity,x.object,x.issue,x.detail]));
+ else{rows=[];buildSections(last.data).forEach(s=>{if(rows.length)rows.push([]);if(s.title)rows.push([s.title]);
+  if(s.t==="kv")s.rows.forEach(([k,v])=>rows.push([k,plain(v)]));
+  else if(s.t==="table"){rows.push(s.cols.map(hum));s.data.forEach(r=>rows.push(s.cols.map(c=>plain(r[c]))))}
+  else if(s.t==="list")s.items.forEach(i=>rows.push([i]));
+  else String(s.text||"").split(NL).forEach(l=>rows.push([l]))})}
+ dlText(fname("csv"),"text/csv",rows.map(r=>r.map(csvCell).join(",")).join(CRLF))}
+function sectionsHtml(){return buildSections(last.data).map(s=>{let h=s.title?"<h2>"+esc(s.title)+"</h2>":"";
+ if(s.t==="kv")h+="<table>"+s.rows.map(([k,v])=>"<tr><th>"+esc(k)+"</th><td>"+esc(plain(v))+"</td></tr>").join("")+"</table>";
+ else if(s.t==="table")h+="<table><tr>"+s.cols.map(c=>"<th>"+esc(hum(c))+"</th>").join("")+"</tr>"+s.data.map(r=>
+   "<tr>"+s.cols.map(c=>"<td>"+esc(plain(r[c]))+"</td>").join("")+"</tr>").join("")+"</table>";
+ else if(s.t==="list")h+="<ul>"+s.items.map(i=>"<li>"+esc(i)+"</li>").join("")+"</ul>";
+ else h+="<pre>"+esc(s.text)+"</pre>";return h}).join("")}
 function table(rows){if(!rows||!rows.length)return "<p>None.</p>";const cols=[...new Set(rows.flatMap(r=>Object.keys(r)))];
  return "<table><tr>"+cols.map(c=>"<th>"+esc(c)+"</th>").join("")+"</tr>"+rows.map(r=>"<tr>"+cols.map(c=>
   "<td"+(c==="severity"?' class="'+esc(r[c])+'"':"")+">"+esc(cell(r[c]))+"</td>").join("")+"</tr>").join("")+"</table>"}
-function exportHtml(){const f=findingsOf();if(!f)return;const d=last.data,v=last.verdict||{};
+function exportHtml(){if(!last||last.error||!last.data){alert("Run a check first.");return}
+ const f=hasFindings()?last.data.findings:null,d=last.data,v=last.verdict||{};
  const html='<!doctype html><html><head><meta charset="utf-8"><title>'+esc(lastCtx.label)+' report</title><style>'+
  'body{font:14px system-ui,sans-serif;margin:24px;color:#111}table{border-collapse:collapse;width:100%;margin:8px 0 20px}'+
  'th,td{border:1px solid #ccc;padding:5px 8px;text-align:left;vertical-align:top;font-size:13px;word-break:break-word}th{background:#f2f2f2}'+
- 'td.high{color:#b00020;font-weight:700}td.medium{color:#a35200;font-weight:700}td.low{color:#555}</style></head><body>'+
+ 'pre{white-space:pre-wrap;background:#f7f7f7;padding:8px;border:1px solid #ddd}td.high{color:#b00020;font-weight:700}td.medium{color:#a35200;font-weight:700}td.low{color:#555}</style></head><body>'+
  '<h1>'+esc(lastCtx.label)+'</h1><p>Device: '+esc(lastCtx.device||"n/a")+' · Generated: '+esc(lastCtx.time)+' · ITSec Ops</p>'+
  '<h2>Result: '+esc(v.label||"")+'</h2>'+(last.request?'<p>Scope: '+esc(last.request)+'</p>':'')+
- '<h2>Findings</h2>'+table(f)+'<h2>Inventory</h2>'+table(d.inventory)+
- '<h2>Notes</h2>'+(d.notes||[]).map(n=>"<p>"+esc(n)+"</p>").join("")+'</body></html>';
+ (last.summary&&last.summary.length?"<ul>"+last.summary.map(x=>"<li>"+esc(x)+"</li>").join("")+"</ul>":"")+
+ (f?'<h2>Findings</h2>'+table(f)+'<h2>Inventory</h2>'+table(d.inventory)+
+ '<h2>Notes</h2>'+(d.notes||[]).map(n=>"<p>"+esc(n)+"</p>").join(""):sectionsHtml())+'</body></html>';
  dlText(fname("html"),"text/html",html)}
 api("/api/catalog").then(c=>catalog=c);loadProfiles();
 </script></body></html>
