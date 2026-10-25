@@ -34,3 +34,6 @@ Open the URL printed in the terminal.
 ## Disclaimer
 Use only on devices you are authorised to administer. Provided as-is, without warranty; review the code
 before pointing it at production. Use a least-privilege account where possible.
+
+## License
+MIT. See [LICENSE](LICENSE).
