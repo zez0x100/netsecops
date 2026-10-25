@@ -656,8 +656,13 @@ def do_disconnect(b):
 # ----------------------------------------------------------------------------
 CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
 F5_LOGS = ("ltm", "audit", "apm", "gtm", "tmm", "asm")
-IFACE_RE = re.compile(r'^[0-9A-Za-z_.:\-]{1,32}$')
+IFACE_RE = re.compile(r'^(?!-)[0-9A-Za-z_.:\-]{1,32}$')   # no leading '-': it would be read as a tcpdump option
 FILE_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,120}\.(pcap|pms|ucs|xml|conf)$')
+
+
+def tok_ok(value):
+    """Constant-time token check on bytes, so odd (non-ASCII) input is a plain mismatch, never an exception."""
+    return secrets.compare_digest(str(value or "").encode("utf-8", "replace"), TOKEN.encode())
 MAX_PCAP = 300 * 1024 * 1024
 MAX_BACKUP = 2 * 1024 * 1024 * 1024
 
@@ -3557,8 +3562,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype + "; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy",
-                         "default-src 'self' 'unsafe-inline'; connect-src 'self'")
+                         "default-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -3567,12 +3574,12 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("Host", "") in self.server.allowed_hosts
 
     def _tok_ok(self):
-        return secrets.compare_digest(self.headers.get("X-Token", ""), TOKEN)
+        return tok_ok(self.headers.get("X-Token", ""))
 
     def _serve_capture(self, name):
         name = urllib.parse.unquote(name)
         path = os.path.join(CAPTURE_DIR, name)
-        if not FILE_RE.match(name) or not os.path.isfile(path):
+        if not FILE_RE.fullmatch(name) or not os.path.isfile(path):
             return self._send(404, {"error": "not found"})
         self.send_response(200)
         self.send_header("Content-Type", "application/vnd.tcpdump.pcap" if name.endswith(".pcap") else
@@ -3594,12 +3601,12 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         if u.path == "/":
             t = urllib.parse.parse_qs(u.query).get("t", [""])[0]
-            if not secrets.compare_digest(t, TOKEN):
+            if not tok_ok(t):
                 return self._send(403, "Open the URL printed in the terminal.", "text/plain")
             return self._send(200, PAGE.replace("__TOKEN__", TOKEN), "text/html")
         if u.path.startswith("/api/capture/"):
             t = urllib.parse.parse_qs(u.query).get("t", [""])[0]
-            if not secrets.compare_digest(t, TOKEN):
+            if not tok_ok(t):
                 return self._send(403, {"error": "bad token"})
             return self._serve_capture(u.path[len("/api/capture/"):])
         if not self._tok_ok():
@@ -3753,7 +3760,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
     <div id="f-user"><label>Username</label><input id="username" autocomplete="off"></div>
     <div id="f-pass"><label>Password</label><input id="password" type="password" autocomplete="off"></div>
     <div id="f-key"><label id="keylbl">API key</label><input id="apikey" type="password" autocomplete="off"></div>
-    <div class="chk"><input type="checkbox" id="insecure"><span>Skip TLS verification (self-signed mgmt cert)</span></div>
+    <div class="chk"><input type="checkbox" id="insecure"><span>Skip TLS verification (self-signed mgmt cert). Credentials are then sent to whatever answers at that address: use only on a trusted network.</span></div>
     <div style="margin-top:12px"><button class="primary" onclick="connect()">Connect</button></div>
     <div id="cerr" class="err"></div>
   </div>
