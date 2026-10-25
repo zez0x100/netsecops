@@ -6,8 +6,12 @@ devices from one place. Python 3.8+, standard library only, no dependencies.
 ## Features
 - Health checks and curated read-only status queries per vendor
 - "Where does this IP appear?" lookup (F5 pools, nodes, virtuals, data groups, policies; PAN/Forti policy lookup)
-- F5 ASM/WAF request-log search, WAF and SSL posture checks
-- PAN-OS / FortiGate log search, admin-change audit
+- F5 ASM/WAF request-log search, top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
+- FortiGate lookups: Virtual IPs (name / external / mapped IP filter), static routes (IP, gateway, interface filter)
+- PAN-OS lookups: destination / static NAT rules (the Virtual IP equivalent), configured static routes, session list
+  with source / destination filter (URL category lookup was already available)
+- PAN-OS / FortiGate log search, admin-change audit; log searches take a time range (up to 1 day back) on F5,
+  FortiGate and the F5/FortiGate admin audit (PAN-OS has its own time-range selector)
 - Optional F5 active tools (log search, tcpdump ( with the ability to extract the pms by utilizing tshark with f5 filters and save the output in .pms,
   both pcap and pms will be downloaded to the project folder)
 - Configuration backup (explicit tick-box required)

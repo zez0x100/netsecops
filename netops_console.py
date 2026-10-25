@@ -96,12 +96,23 @@ CATALOG = {
         {"id": "ha", "group": "HA", "label": "HA state", "cmd": "<show><high-availability><state/></high-availability></show>"},
         {"id": "ifaces", "group": "Network", "label": "Interfaces (all)", "cmd": "<show><interface>all</interface></show>"},
         {"id": "routes", "group": "Network", "label": "Routing table", "cmd": "<show><routing><route/></routing></show>"},
+        {"id": "staticroutes", "group": "Network", "label": "Static routes (configured; optional filter)",
+         "handler": "pan_static_routes",
+         "params": [P("filter", "Destination IP/subnet, next hop, interface or name", "10.2.0.0/16", required=False)]},
         {"id": "fib", "group": "Network", "label": "FIB lookup", "cmd": "<test><routing><fib-lookup><virtual-router>{vr}</virtual-router><ip>{ip}</ip></fib-lookup></routing></test>",
          "params": [P("vr", "Virtual router", "default", "default"), P("ip", "Destination IP", "10.0.0.1")]},
+        {"id": "sessions", "group": "Sessions", "label": "Session list (optional source / destination filter)",
+         "handler": "pan_sessions",
+         "params": [P("src", "Source IP", "10.1.1.10", required=False), P("dst", "Destination IP", "10.2.2.20", required=False),
+                    P("count", "Max rows", "50", "50")]},
         {"id": "sessinfo", "group": "Sessions", "label": "Session info (counts, rates)", "cmd": "<show><session><info/></session></show>"},
         {"id": "sessbysrc", "group": "Sessions", "label": "Sessions by source IP", "cmd": "<show><session><all><filter><source>{src}</source></filter></all></session></show>",
          "params": [P("src", "Source IP", "10.1.1.10")]},
         {"id": "drops", "group": "Sessions", "label": "Global drop counters (delta)", "cmd": "<show><counter><global><filter><delta>yes</delta><severity>drop</severity></filter></global></counter></show>"},
+        {"id": "nat", "group": "Policy", "label": "Destination / static NAT rules (Virtual IP equivalent; optional filter)",
+         "handler": "pan_nat_rules",
+         "params": [P("filter", "Name, public IP or translated IP", "203.0.113.10", required=False),
+                    P("vsys", "vsys", "vsys1", "vsys1")]},
         {"id": "polmatch", "group": "Policy", "label": "Security policy match (test)", "cmd": "<test><security-policy-match><source>{src}</source><destination>{dst}</destination><destination-port>{port}</destination-port><protocol>{proto}</protocol></security-policy-match></test>",
          "params": [P("src", "Source IP", "10.1.1.10"), P("dst", "Destination IP", "10.2.2.20"),
                     P("port", "Dest port", "443", "443"), P("proto", "Protocol #", "6 = TCP", "6")]},
@@ -116,6 +127,11 @@ CATALOG = {
         {"id": "hachk", "group": "HA", "label": "HA checksums", "path": "/api/v2/monitor/system/ha-checksums"},
         {"id": "ifaces", "group": "Network", "label": "Interfaces", "path": "/api/v2/monitor/system/interface"},
         {"id": "routes", "group": "Network", "label": "IPv4 routing table", "path": "/api/v2/monitor/router/ipv4"},
+        {"id": "staticroutes", "group": "Network", "label": "Static routes (configured; optional filter)",
+         "path": "/api/v2/cmdb/router/static",
+         "params": [P("filter", "Destination IP/subnet, gateway, interface or comment", "10.2.0.0/16", required=False)]},
+        {"id": "vips", "group": "Policy", "label": "Virtual IPs (optional filter)", "path": "/api/v2/cmdb/firewall/vip",
+         "params": [P("filter", "Name, external IP or mapped IP", "203.0.113.10", required=False)]},
         {"id": "ipsec", "group": "VPN", "label": "IPsec tunnels", "path": "/api/v2/monitor/vpn/ipsec"},
         {"id": "polstats", "group": "Policy", "label": "Firewall policy hit counts", "path": "/api/v2/monitor/firewall/policy"},
         {"id": "sessions", "group": "Sessions", "label": "Session list (IPv4)", "path": "/api/v2/monitor/firewall/session?count={count}&ip_version=ipv4",
@@ -407,6 +423,9 @@ def do_connect(b):
 def fill(template, params, spec, vendor):
     for p in spec.get("params", []):
         v = (params.get(p["name"]) or p["default"]).strip()
+        if not v and not p.get("required", True):
+            template = template.replace("{" + p["name"] + "}", "")
+            continue
         if not v:
             raise ValueError("missing: " + p["label"])
         if not PARAM_RE.match(v):
@@ -431,6 +450,17 @@ def do_run(b):
                 raw = str(b["params"].get(k) or "").strip().replace("/", "~")
                 if raw:
                     b["params"][k] = raw if raw.startswith("~") else "~Common~" + raw
+        if spec.get("handler"):
+            vals = {}
+            for p_ in spec.get("params", []):
+                v = (str((b.get("params") or {}).get(p_["name"]) or "") or p_["default"]).strip()
+                if v and not PARAM_RE.match(v):
+                    raise ValueError("invalid characters in: " + p_["label"])
+                if not v and p_.get("required", True):
+                    raise ValueError("missing: " + p_["label"])
+                vals[p_["name"]] = v
+            audit(sess, spec["label"])
+            return PAN_HANDLERS[spec["handler"]](sess, vals)
         if "cmd" in spec:
             run = {"cmd": fill(spec["cmd"], b.get("params", {}), spec, sess["vendor"])}
         else:
@@ -449,6 +479,29 @@ def do_run(b):
             rows = f5_pool_overview(sess, (b.get("params") or {}).get("pool") if spec["id"] == "poolmem" else None)
             if rows:
                 result["data"] = {"pool_members": rows}
+        if sess["vendor"] == "fortigate" and spec["id"] in ("vips", "staticroutes") and result.get("ok"):
+            term = str((b.get("params") or {}).get("filter") or "").strip()
+            fn = fg_vip_rows if spec["id"] == "vips" else fg_static_route_rows
+            result["data"] = fn(result.get("data"), term)
+        if sess["vendor"] == "fortigate" and spec["id"] == "sessions" and result.get("status") == 404:
+            # Newer FortiOS (7.4+/7.6) renamed the session monitor endpoint; try the variants read-only.
+            tried = [result["request"] + " -> HTTP 404"]
+            for alt in ("/api/v2/monitor/firewall/sessions?count=%s&ip_version=ipv4",
+                        "/api/v2/monitor/firewall/sessions?count=%s",
+                        "/api/v2/monitor/firewall/session?count=%s"):
+                n = urllib.parse.quote((b.get("params") or {}).get("count") or "20", safe="")
+                alt_res = execute(sess, {"path": alt % n})
+                if alt_res.get("ok"):
+                    result = alt_res
+                    break
+                tried.append("%s -> HTTP %s" % (alt_res["request"], alt_res["status"]))
+            else:
+                result["data"] = {"note": "No session-list endpoint answered on this FortiOS version.", "attempts": tried}
+        if spec["id"] == "ifaces" and sess["vendor"] in ("fortigate", "paloalto") and result.get("ok"):
+            result["data"] = (fg_iface_rows(sess, result.get("data")) if sess["vendor"] == "fortigate"
+                              else pan_iface_rows(result.get("data")))
+        if sess["vendor"] == "fortigate" and spec["id"] == "sessions" and result.get("ok"):
+            result["data"] = fg_session_rows(result.get("data"))
         return result
     except ValueError as e:
         return {"ok": False, "error": str(e)}
@@ -1219,6 +1272,278 @@ def fg_lookup(sess, ip, vdom, flow, refs=True):
     return res, summary, verdict
 
 
+def fg_names(x):
+    return [i.get("name") if isinstance(i, dict) else str(i) for i in as_list(x)]
+
+
+def fg_term_match(term, texts, specs=()):
+    """Case-insensitive substring match on texts; if term is an IP/subnet, also containment in any of specs."""
+    t = term.lower()
+    if any(t in str(x).lower() for x in texts):
+        return True
+    try:
+        net = ipaddress.ip_network(term, strict=False)
+    except ValueError:
+        return False
+    for s in specs:
+        s = str(s or "")
+        try:
+            if net.num_addresses == 1:
+                if ip_in_spec(net.network_address, s):
+                    return True
+            elif "/" not in s and " " not in s and "-" not in s:
+                if ipaddress.ip_address(s) in net:
+                    return True
+            elif ipaddress.ip_network(s.replace(" ", "/") if " " in s else s, strict=False).overlaps(net):
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+FG_SESS_KEYS = (  # output column <- candidate FortiOS field names (they differ between versions)
+    ("source_ip", ("saddr", "srcip", "src", "source", "sourceip", "src_ip")),
+    ("source_port", ("sport", "srcport", "src_port")),
+    ("destination_ip", ("daddr", "dstip", "dst", "destination", "dest", "dst_ip")),
+    ("destination_port", ("dport", "dstport", "dst_port")),
+    ("protocol", ("proto", "protocol", "proto_number")),
+    ("policy_id", ("policyid", "policy_id", "policy")),
+    ("nat_source_ip", ("snat_addr", "tran_sip", "snat-ip", "nat_saddr")),
+    ("nat_destination_ip", ("dnat_addr", "tran_dip", "dnat-ip", "nat_daddr")),
+    ("ingress_interface", ("srcintf", "src_intf", "in_intf", "incoming_interface")),
+    ("egress_interface", ("dstintf", "dst_intf", "out_intf", "outgoing_interface")),
+    ("expires_s", ("expiry", "expire", "timeout")),
+    ("bytes_sent", ("tx_bytes", "sentbyte", "bytes_sent")),
+    ("bytes_received", ("rx_bytes", "rcvdbyte", "bytes_received")),
+)
+
+
+def fg_session_rows(data):
+    """FortiGate firewall/session(s) -> rows with source/destination first; keeps unmapped fields too."""
+    def find_rows(x, depth=0):
+        if isinstance(x, list) and x and all(isinstance(i, dict) for i in x):
+            return x
+        if isinstance(x, dict) and depth < 4:
+            for k in ("details", "sessions", "session", "results", "entries", "result", "entry"):
+                if k in x:
+                    r = find_rows(x[k], depth + 1)
+                    if r:
+                        return r
+        return None
+    items = find_rows(data) or []
+    rows, seen = [], set()
+    for it in items:
+        row, used = {}, set()
+        for out, cands in FG_SESS_KEYS:
+            k = next((c for c in cands if c in it), None)
+            if k is not None:
+                row[out] = it[k]
+                used.add(k)
+        for k, v in it.items():
+            if k not in used and not isinstance(v, (dict, list)):
+                row[k] = v
+        seen.update(it.keys())
+        rows.append(row)
+    summary = data.get("results", {}).get("summary") if isinstance(data, dict) and isinstance(data.get("results"), dict) else None
+    out = {"sessions": rows, "count": len(rows)}
+    if summary:
+        out["summary"] = summary
+    if not rows:
+        out["note"] = "No session rows found in the response."
+        out["raw"] = data
+    elif not any(k in rows[0] for k in ("source_ip", "destination_ip")):
+        out["note"] = "No recognised source/destination fields; raw field names: " + ", ".join(sorted(seen))
+    return out
+
+
+def fg_vip_rows(data, term):
+    """FortiGate firewall/vip -> one readable row per Virtual IP, optionally filtered."""
+    items = as_list(data.get("results")) if isinstance(data, dict) else []
+    rows = []
+    for v in items:
+        ext = v.get("extip", "")
+        mapped = ", ".join(m.get("range", "") for m in as_list(v.get("mappedip")))
+        if term and not fg_term_match(term, [v.get("name"), ext, mapped, v.get("comment")],
+                                      [ext] + [m.get("range") for m in as_list(v.get("mappedip"))]):
+            continue
+        fwd = v.get("portforward") == "enable"
+        rows.append({"name": v.get("name"), "type": v.get("type"), "external_ip": ext,
+                     "external_interface": v.get("extintf"), "mapped_ip": mapped,
+                     "port_forward": "enable" if fwd else "disable",
+                     "protocol": v.get("protocol") if fwd else "",
+                     "external_port": v.get("extport") if fwd else "",
+                     "mapped_port": v.get("mappedport") if fwd else "",
+                     "nat_source_ip_pool": v.get("nat-source-vip"), "arp_reply": v.get("arp-reply"),
+                     "src_filter": ", ".join(s.get("range", "") for s in as_list(v.get("src-filter"))),
+                     "comment": v.get("comment")})
+    return {"virtual_ips": rows, "count": len(rows), "total_configured": len(items),
+            "note": "Policies using a VIP are found via 'Where does this IP appear' (policy references)."}
+
+
+def fg_static_route_rows(data, term):
+    """FortiGate router/static -> one readable row per static route, optionally filtered."""
+    items = as_list(data.get("results")) if isinstance(data, dict) else []
+    rows = []
+    for r in items:
+        dst = r.get("dst", "")
+        if dst == "0.0.0.0 0.0.0.0":
+            dst_txt = "0.0.0.0/0 (default)"
+        else:
+            try:
+                dst_txt = str(ipaddress.ip_network(dst.replace(" ", "/"), strict=False)) if dst else (
+                    r.get("internet-service") and "internet-service %s" % r.get("internet-service") or
+                    r.get("sdwan-zone") and "sdwan" or r.get("dstaddr") and "addr " + str(r.get("dstaddr")) or "")
+            except ValueError:
+                dst_txt = dst
+        if term and not fg_term_match(term, [dst_txt, r.get("gateway"), r.get("device"), r.get("comment"), r.get("dstaddr")],
+                                      [dst] if dst else []):
+            continue
+        rows.append({"seq": r.get("seq-num"), "destination": dst_txt, "gateway": r.get("gateway"),
+                     "interface": r.get("device"), "distance": r.get("distance"), "priority": r.get("priority"),
+                     "weight": r.get("weight"), "status": r.get("status"), "blackhole": r.get("blackhole"),
+                     "vrf": r.get("vrf"), "comment": r.get("comment")})
+    return {"static_routes": rows, "count": len(rows), "total_configured": len(items),
+            "note": "Configured routes. Whether a route is active (best path) is shown in 'IPv4 routing table'."}
+
+
+def iface_out(rows, note=""):
+    out = {"interfaces": rows, "count": len(rows)}
+    if note:
+        out["note"] = note
+    return out
+
+
+def fg_iface_rows(sess, data):
+    """FortiGate monitor/system/interface -> name, number (SNMP ifIndex from the config) and IP."""
+    res = data.get("results") if isinstance(data, dict) else None
+    items = list(res.values()) if isinstance(res, dict) else as_list(res)
+    idx = {}
+    st, ok, cfg = rest_get(sess, "/api/v2/cmdb/system/interface")
+    for c in as_list(cfg.get("results")) if ok and isinstance(cfg, dict) else []:
+        if isinstance(c, dict):
+            idx[c.get("name")] = c.get("snmp-index")
+    rows = []
+    for i in items:
+        if not isinstance(i, dict):
+            continue
+        name = i.get("name") or i.get("id")
+        ip = i.get("ip") or ""
+        mask = i.get("mask")
+        rows.append({"name": name, "number": idx.get(name, ""),
+                     "ip": ("%s/%s" % (ip, mask) if ip and mask not in (None, "") else ip)})
+    return iface_out(rows, "" if idx else "interface numbers (SNMP index) unavailable: could not read /cmdb/system/interface")
+
+
+def pan_iface_rows(data):
+    """PAN-OS show interface all -> name, number (interface id) and IP, from the logical (ifnet) list."""
+    def entries(x):
+        if isinstance(x, dict):
+            e = x.get("entry")
+            if e is not None:
+                return [i for i in as_list(e) if isinstance(i, dict)]
+            for v in x.values():
+                r = entries(v)
+                if r:
+                    return r
+        return []
+    res = data.get("result") if isinstance(data, dict) else None
+    ifnet = res.get("ifnet") if isinstance(res, dict) else None
+    hw = res.get("hw") if isinstance(res, dict) else None
+    ids = {e.get("name"): e.get("id") for e in entries(hw)}
+    rows = []
+    for e in entries(ifnet):
+        name = e.get("name")
+        ip = e.get("ip") or e.get("addr") or e.get("dyn-addr") or ""
+        rows.append({"name": name, "number": e.get("id") or ids.get(name, ""),
+                     "ip": "" if ip in ("N/A", "n/a") else ip})
+    return iface_out(rows)
+
+
+def pan_result(request, data, t0, ok=True, status=200):
+    return {"ok": ok, "status": status, "data": data, "request": request, "ms": int((time.time() - t0) * 1000)}
+
+
+def pan_nat_rules(sess, v):
+    """Destination NAT and static (bi-directional) NAT rules: what PAN-OS has in place of FortiGate Virtual IPs."""
+    t0, vsys, term = time.time(), v["vsys"], v["filter"]
+    rows, total = [], 0
+    for label, xp in [("local", pan_base(vsys) + "/rulebase/nat"),
+                      ("shared-pre", "/config/shared/pre-rulebase/nat"),
+                      ("shared-post", "/config/shared/post-rulebase/nat")]:
+        node = pan_section(sess, xp, "rules")
+        for e in (node.findall("entry") if node is not None else []):
+            total += 1
+            dt = e.find("destination-translation")
+            st = e.find("source-translation/static-ip")
+            if dt is None and (st is None or (st.findtext("bi-directional") or "") != "yes"):
+                continue   # plain source NAT / no NAT: not a Virtual IP equivalent
+            dest = pan_members(e.find("destination"))
+            tr_ip = (dt.findtext("translated-address") if dt is not None else None) or \
+                    (st.findtext("translated-address") if st is not None else "") or ""
+            tr_port = (dt.findtext("translated-port") if dt is not None else "") or ""
+            name = e.get("name")
+            if term and not fg_term_match(term, [name, tr_ip, e.findtext("description"), ", ".join(dest)], dest + [tr_ip]):
+                continue
+            rows.append({"name": name, "scope": label, "type": "destination NAT" if dt is not None else "static NAT",
+                         "from_zone": ", ".join(pan_members(e.find("from"))), "to_zone": ", ".join(pan_members(e.find("to"))),
+                         "public_destination": ", ".join(dest), "service": e.findtext("service") or "",
+                         "translated_ip": tr_ip, "translated_port": tr_port,
+                         "source": ", ".join(pan_members(e.find("source"))),
+                         "disabled": e.findtext("disabled") or "no", "description": e.findtext("description") or ""})
+    return pan_result("config show %s/rulebase/nat (+ shared pre/post)" % pan_base(vsys),
+                      {"virtual_ip_equivalents": rows, "count": len(rows), "nat_rules_scanned": total,
+                       "note": "Address objects in 'public destination' are shown by name; use 'Where does this IP appear' to resolve them. "
+                               "Panorama-pushed rules appear only if present in this device's running config."}, t0)
+
+
+def pan_static_routes(sess, v):
+    t0, term, rows = time.time(), v["filter"], []
+    xp = "/config/devices/entry[@name='localhost.localdomain']/network"
+    node = pan_section(sess, xp, "virtual-router")
+    if node is None:
+        return pan_result("config show " + xp + "/virtual-router",
+                          {"note": "could not read virtual-router config (check key permissions)"}, t0, False, 200)
+    for vr in node.findall("entry"):
+        for r in vr.findall("routing-table/ip/static-route/entry"):
+            nh = r.find("nexthop")
+            nh_txt = ""
+            if nh is not None and len(nh):
+                kind, val = nh[0].tag, (nh[0].text or "").strip()
+                nh_txt = val if kind == "ip-address" else ("%s (%s)" % (val, kind) if val else kind)
+            dst = r.findtext("destination") or ""
+            if term and not fg_term_match(term, [r.get("name"), dst, nh_txt, r.findtext("interface")], [dst]):
+                continue
+            rt = r.find("route-table")
+            rows.append({"virtual_router": vr.get("name"), "name": r.get("name"), "destination": dst,
+                         "next_hop": nh_txt, "interface": r.findtext("interface") or "",
+                         "metric": r.findtext("metric") or "", "admin_distance": r.findtext("admin-dist") or "",
+                         "route_table": rt[0].tag if rt is not None and len(rt) else "unicast",
+                         "bfd": "yes" if r.find("bfd") is not None else "", "disabled": r.findtext("disabled") or "no"})
+    return pan_result("config show " + xp + "/virtual-router",
+                      {"static_routes": rows, "count": len(rows),
+                       "note": "Configured routes. Active best paths are in 'Routing table'. Panorama template routes appear if pushed."}, t0)
+
+
+def pan_sessions(sess, v):
+    t0 = time.time()
+    flt = ""
+    for key, tag, label in (("src", "source", "Source IP"), ("dst", "destination", "Destination IP")):
+        if v[key]:
+            flt += "<%s>%s</%s>" % (tag, parse_ip(v[key], label), tag)
+    n = num(v["count"], 1, 500, 50, "Max rows")
+    cmd = "<show><session><all>%s</all></session></show>" % ("<filter>%s</filter>" % flt if flt else "")
+    status, ok, data = pan_op(sess, cmd)
+    if ok:
+        out = fg_session_rows(data)   # generic row finder / field mapper (also understands PAN-OS entry lists)
+        out["sessions"] = out["sessions"][:n]
+        out["count"] = len(out["sessions"])
+        data = out
+    return pan_result(cmd, data, t0, ok, status)
+
+
+PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_routes, "pan_sessions": pan_sessions}
+
+
 def do_ipcheck(b):
     sess = SESSIONS.get(b.get("id"))
     if not sess:
@@ -1305,14 +1630,16 @@ def do_f5_logs(b):
         if log not in F5_LOGS:
             raise ValueError("log file not allowed")
         n = num(b.get("lines"), 1, 500, 200, "lines")
+        cutoff = cutoff_epoch(b)
+        nfetch = 20000 if cutoff else n   # with a time range, read more lines and cut by time afterwards
         # Exact address only: not inside a longer one (10.1.1.1 must not match 10.1.1.10, 110.1.1.1 or 10.1.1.1.5).
         ch = "0-9A-Fa-f:." if ip.version == 6 else "0-9."
         pat = shlex.quote("(^|[^%s])%s($|[^%s]|\\.($|[^0-9]))" % (ch, re.escape(str(ip)), ch))
         if b.get("rotated"):
             script = ("zgrep -hE -- %s /var/log/%s /var/log/%s.*.gz 2>/dev/null | "
-                      "sort -s -k1,1M -k2,2n -k3,3 | tail -n %d" % (pat, log, log, n))
+                      "sort -s -k1,1M -k2,2n -k3,3 | tail -n %d" % (pat, log, log, nfetch))
         else:
-            script = "grep -hE -- %s /var/log/%s 2>&1 | tail -n %d" % (pat, log, n)
+            script = "grep -hE -- %s /var/log/%s 2>&1 | tail -n %d" % (pat, log, nfetch)
         audit(sess, "log search %s in /var/log/%s" % (ip, log))
         st, ok, out, data = f5_bash(sess, script, 60)
     except ValueError as e:
@@ -1322,11 +1649,14 @@ def do_f5_logs(b):
     if st in (401, 403):
         return {"ok": False, "error": "bash access denied (needs the Administrator role)"}
     lines = [l for l in out.splitlines() if l.strip()]
+    if cutoff:
+        lines = [l for l in lines if (log_epoch(l[:15]) or 0) >= cutoff][-n:]
     verdict = {"label": "%d LOG LINE(S) FOR %s" % (len(lines), ip), "kind": "ok" if lines else "info"}
     return {"ok": ok, "status": st, "ms": int((time.time() - t0) * 1000), "request": "bash: " + script,
             "data": {"lines": lines}, "verdict": verdict,
-            "summary": ["Showing up to the last %d matching lines from /var/log/%s%s." % (
-                n, log, " plus rotated files" if b.get("rotated") else "")]}
+            "summary": ["Showing up to the last %d matching lines from /var/log/%s%s%s." % (
+                n, log, " plus rotated files" if b.get("rotated") else "",
+                ", time range: " + str(b.get("within")) if cutoff else "")]}
 
 
 def f5_fetch(sess, path, local, limit=MAX_PCAP):
@@ -1533,6 +1863,36 @@ def to_epoch(v):
         return ssl.cert_time_to_seconds(s)  # "Jan  1 00:00:00 2030 GMT"
     except ValueError:
         return None
+
+
+LOOKBACK = {"any time": None, "last 15 minutes": 900, "last hour": 3600, "last 6 hours": 21600,
+            "last 12 hours": 43200, "last 24 hours": 86400}
+
+
+def cutoff_epoch(b):
+    """Epoch of the oldest log entry wanted, from the 'within' field (at most one day back); None = any time."""
+    v = str(b.get("within") or "any time").strip().lower()
+    if v not in LOOKBACK:
+        raise ValueError("invalid time range")
+    return time.time() - LOOKBACK[v] if LOOKBACK[v] else None
+
+
+def asm_recent(it, cutoff):
+    if cutoff is None:
+        return True
+    e = to_epoch(first(it, "requestDatetime", "occurrenceTime", "dateTime", "time"))
+    return e is None or e >= cutoff
+
+
+def fg_event_epoch(e):
+    """FortiGate log entry time as epoch (from eventtime, which is absolute); None if the device did not send it."""
+    v = str(e.get("eventtime") or "").strip()
+    if v.isdigit():
+        n = float(v)
+        while n > 1e11:
+            n /= 1000.0
+        return n
+    return None
 
 
 def days_from_now(epoch):
@@ -1769,12 +2129,178 @@ def asm_row(it):
             "response_code": it.get("responseCode"), "rating": it.get("violationRating")}
 
 
+def asm_enrich(sess, it):
+    """Merge the full request record (violations, raw request, support ID) into a list entry. True if fetched."""
+    path = urllib.parse.urlparse(str(it.get("selfLink") or "")).path
+    if not path.startswith("/mgmt/tm/asm/events/requests/") and re.match(r"^[A-Za-z0-9_\-]{6,64}$", str(it.get("id") or "")):
+        path = "/mgmt/tm/asm/events/requests/" + str(it["id"])
+    if not path.startswith("/mgmt/tm/asm/events/requests/"):
+        return False
+    ok, d = f5_get(sess, path)
+    if not ok or not isinstance(d, dict):
+        return False
+    for k, v in d.items():
+        if not it.get(k):
+            it[k] = v
+    return True
+
+
+def f5_asm_top_hosts(sess, b, t0):
+    """Top 10 hostnames by violating requests, each with violations, source IPs, True-Client-IPs and URLs."""
+    status = (b.get("status") or "").strip()
+    if status not in ("", "blocked", "alerted"):
+        raise ValueError("status must be blocked, alerted or empty (both) for the top-hostnames report")
+    scan = num(b.get("scan"), 100, 5000, 1000, "entries to scan")
+    cutoff = cutoff_epoch(b)
+    statuses = [status] if status else ["blocked", "alerted"]
+    audit(sess, "ASM top hostnames by violations (%s, scan %d)" % (status or "blocked+alerted", scan))
+    items, notes, last_path = [], [], ""
+    for stx in statuses:
+        flt = urllib.parse.quote("requestStatus eq '%s'" % stx)
+        use_f, use_o = True, True
+        prev, got, tried = None, 0, []
+        for skip in range(0, scan, 200):
+            if time.time() - t0 > 60:
+                notes.append("Scan of '%s' stopped at the 60 s time limit." % stx)
+                break
+            top = min(200, scan - skip)
+
+            def build(uf, uo):
+                q = (["$filter=" + flt] if uf else []) + (["$orderby=requestDatetime%20desc"] if uo else []) + \
+                    ["$top=%d" % top] + (["$skip=%d" % skip] if skip else [])
+                return "/mgmt/tm/asm/events/requests?" + "&".join(q)
+            if skip == 0:   # find a query form this TMOS version accepts, simplest-last
+                for uf, uo in ((True, True), (True, False), (False, True), (False, False)):
+                    last_path = build(uf, uo)
+                    st, ok, data = rest_get(sess, last_path)
+                    if ok and isinstance(data, dict):
+                        use_f, use_o = uf, uo
+                        break
+                    tried.append("HTTP %s for %s%s" % (st, last_path, (": " + str(first(data, "message"))[:160])
+                                                      if isinstance(data, dict) and first(data, "message") else ""))
+            else:
+                last_path = build(use_f, use_o)
+                st, ok, data = rest_get(sess, last_path)
+            if not ok or not isinstance(data, dict):
+                return {"ok": False, "status": st, "error": "request log query failed (HTTP %s). Is ASM / Advanced WAF "
+                        "provisioned and does the account have access? Tried: %s" % (st, " | ".join(tried))}
+            page = data.get("items", [])
+            raw_n = len(page)
+            fid = json.dumps(page[0], sort_keys=True) if page else None
+            if skip and fid == prev:
+                break          # device ignores $skip and repeats the first page
+            prev = fid
+            reached_old = False
+            if cutoff:
+                kept = [i for i in page if asm_recent(i, cutoff)]
+                reached_old = use_o and len(kept) < len(page)   # newest first: everything after this is older
+                page = kept
+            if not use_f:
+                page = [i for i in page if str(i.get("requestStatus") or "").lower() == stx]
+            items += page
+            got += len(page)
+            if raw_n < top or reached_old:
+                break
+        if not use_f:
+            notes.append("Device rejected the status filter, so '%s' was filtered locally over the newest %d entries "
+                         "(narrower than a device-side filter)." % (stx, scan))
+        if not use_o:
+            notes.append("Device rejected $orderby, so 'newest first' is not guaranteed for '%s'." % stx)
+            if cutoff:
+                notes.append("Time range applied to the %d entries scanned only (device could not sort newest first)." % scan)
+    if not items:
+        return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "GET " + last_path,
+                "verdict": {"label": "NO %s REQUESTS FOUND" % "/".join(statuses).upper(), "kind": "info"},
+                "summary": ["The request log has no entries with that status (or logging does not store them)."], "data": {}}
+    # Resolve missing hostnames from the full record (the list view may omit the raw request).
+    fetched, unresolved = 0, 0
+    for it in items:
+        if asm_hostname(it):
+            continue
+        if fetched < 300 and time.time() - t0 < 80 and asm_enrich(sess, it):
+            fetched += 1
+        if not asm_hostname(it):
+            unresolved += 1
+    by_host = collections.defaultdict(list)
+    for it in items:
+        by_host[(asm_hostname(it) or "(unknown)").lower()].append(it)
+    ranked = sorted(by_host.items(), key=lambda kv: -len(kv[1]))[:10]
+    vcache, rows, sampled = {}, [], 0
+    for rank, (host, lst) in enumerate(ranked, 1):
+        sample = lst[:30]
+        for it in sample:
+            if (not it.get("violations") or not it.get("rawRequest")) and fetched < 700 and time.time() - t0 < 100:
+                if asm_enrich(sess, it):
+                    fetched += 1
+        viol, ips, tcis, urls = (collections.Counter() for _ in range(4))
+        for it in sample:
+            reason = asm_reason(sess, it, vcache) if time.time() - t0 < 115 else ""
+            for v in [x for x in reason.split("; ") if x]:
+                viol[v] += 1
+            ips[str(it.get("clientIp") or "")] += 1
+            tcis[asm_header_ip(it)] += 1
+            urls[str(first(it, "url", "uri") or "")] += 1
+        sampled += len(sample)
+        fmt = lambda c: "; ".join("%s (%d)" % (k, n) for k, n in c.most_common(5) if k) or "-"
+        rows.append({"rank": rank, "hostname": host, "requests": len(lst), "violations": fmt(viol),
+                     "source_ips": fmt(ips), "true_client_ips": fmt(tcis), "urls": fmt(urls),
+                     "sampled": len(sample)})
+    # Overall top source IPs and True-Client-IPs across every scanned request (each with its main hostnames).
+    ip_c, tci_c = collections.Counter(), collections.Counter()
+    ip_h, tci_h = collections.defaultdict(collections.Counter), collections.defaultdict(collections.Counter)
+    tci_seen = 0
+    for it in items:
+        host = (asm_hostname(it) or "(unknown)").lower()
+        ip = str(it.get("clientIp") or "").strip()
+        if ip:
+            ip_c[ip] += 1
+            ip_h[ip][host] += 1
+        if not asm_header_ip(it) and not it.get("rawRequest") and fetched < 1000 and time.time() - t0 < 105:
+            if asm_enrich(sess, it):
+                fetched += 1
+        tci = asm_header_ip(it)
+        if tci or it.get("rawRequest"):
+            tci_seen += 1
+        if tci:
+            tci_c[tci] += 1
+            tci_h[tci][host] += 1
+
+    def top_rows(c, hosts, key):
+        return [{"rank": n_, key: k, "requests": v,
+                 "hostnames": "; ".join("%s (%d)" % hv for hv in hosts[k].most_common(3))}
+                for n_, (k, v) in enumerate(c.most_common(10), 1)]
+    top_ips, top_tcis = top_rows(ip_c, ip_h, "source_ip"), top_rows(tci_c, tci_h, "true_client_ip")
+    if tci_seen < len(items):
+        notes.append("True-Client-IP could be read for %d of %d scanned requests (the rest were not fetched in time or "
+                     "have no raw request)." % (tci_seen, len(items)))
+    if cutoff:
+        notes.insert(0, "Time range: %s." % (b.get("within") or "any time"))
+    notes.insert(0 if not cutoff else 1, "Scanned %d %s request(s). 'requests' counts all of them per hostname; violations, IPs and URLs "
+                    "are from the newest %d per hostname (counts in brackets are within that sample)." %
+                 (len(items), "/".join(statuses), 30))
+    if unresolved:
+        notes.append("%d request(s) have no hostname in the log and are grouped as '(unknown)'." % unresolved)
+    if not any(r["true_client_ips"] != "-" for r in rows):
+        notes.append("No True-Client-IP header found in these requests: the logging profile may not store request headers.")
+    if not any(r["violations"] != "-" for r in rows):
+        notes.append("No violation names could be read; the device may not return violation details for these entries.")
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "GET " + last_path,
+            "verdict": {"label": "TOP %d HOSTNAME(S), %d SOURCE IP(S), %d TRUE-CLIENT-IP(S) BY VIOLATING REQUESTS" % (len(rows), len(top_ips), len(top_tcis)), "kind": "warn"},
+            "summary": notes,
+            "data": {"top_hostnames": rows, "top_source_ips": top_ips, "top_true_client_ips": top_tcis}}
+
+
 def do_f5_asm(b):
     sess = SESSIONS.get(b.get("id"))
     if not sess or sess["vendor"] != "f5":
         return {"ok": False, "error": "connect an F5 device first"}
     t0 = time.time()
+    cutoff = None
     try:
+        if b.get("mode") == "tophosts":
+            return f5_asm_top_hosts(sess, b, t0)
+        if b.get("mode") != "supportid":
+            cutoff = cutoff_epoch(b)
         if b.get("mode") == "supportid":
             sid = str(b.get("support_id") or "").strip()
             if not SUPPORT_ID_RE.match(sid):
@@ -1806,9 +2332,12 @@ def do_f5_asm(b):
             def hostok(i):
                 return not hostq or hostq in asm_hostname(i).lower()
 
-            def hit(i):  # local match, used to verify device-side filters and to filter while paging
+            def hit0(i):  # local match (no time test), used to verify device-side filters
                 u = str(first(i, "url", "uri") or "")
                 return (not urlq or urlq.lower() in u.lower()) and (not hip or asm_header_ip(i) == hip) and hostok(i)
+
+            def hit(i):  # local match while paging
+                return hit0(i) and asm_recent(i, cutoff)
         if b.get("mode") != "supportid" and (hip or urlq or hostq):
             # The device's clientIp is Cloudflare's edge; True-Client-IP lives in the request headers and is not
             # reliably filterable server-side, so page through the log (other filters applied) and match locally.
@@ -1830,7 +2359,7 @@ def do_f5_asm(b):
                 cs, cok, cd = rest_get(sess, "/mgmt/tm/asm/events/requests?$filter=%s&$top=20"
                                        % urllib.parse.quote(cflt))
                 cit = cd.get("items", []) if cok and isinstance(cd, dict) else []
-                if cit and all(hit(i) for i in cit):
+                if cit and all(hit0(i) for i in cit):
                     server_filter = cflt
                     break
             if server_filter:
@@ -1861,6 +2390,8 @@ def do_f5_asm(b):
                               str(first(page[-1], "requestDatetime", "occurrenceTime", "dateTime", "time") or "")]
                 scanned += len(page)
                 for i in page:
+                    if not asm_recent(i, cutoff):
+                        continue
                     v = asm_header_ip(i)
                     has_raw += 1 if i.get("rawRequest") else 0
                     if v:
@@ -1878,6 +2409,9 @@ def do_f5_asm(b):
                         loose_hits += 1
                 if len(page) < 200 or len(items) >= top:
                     capped = False
+                    break
+                if cutoff and newest_first and page and not asm_recent(page[-1], cutoff):
+                    capped = False   # reached entries older than the time range
                     break
             items = items[:top]
             diag = ["Diagnostics: scanned %d entries, %d include raw request data, %d distinct True-Client-IP "
@@ -1910,7 +2444,7 @@ def do_f5_asm(b):
             if not ok or not isinstance(data, dict):
                 return {"ok": False, "status": st, "error": "request log query failed (HTTP %s). Is ASM / Advanced "
                         "WAF provisioned and does the account have access?" % st}
-            items = data.get("items", [])
+            items = [i for i in data.get("items", []) if asm_recent(i, cutoff)]
         if b.get("mode") == "supportid":
             # Some TMOS versions ignore $filter on this collection; never trust position, match the ID.
             def has_id(i):
@@ -1955,7 +2489,8 @@ def do_f5_asm(b):
                      "rating %(rating)s, HTTP %(response_code)s)  reason: %(block_reason)s" % r for r in rows]
             return {"ok": True, "status": st, "ms": int((time.time() - t0) * 1000), "request": "GET " + path,
                     "verdict": {"label": "%d REQUEST(S)" % len(rows), "kind": "warn" if rows else "info"},
-                    "summary": (diag if hip and not rows else [])
+                    "summary": (["Time range: %s (applied to the request time of each entry)." % (b.get("within") or "any time")]
+                                if cutoff else []) + (diag if hip and not rows else [])
                     + (["No support ID found in these entries. Fields the device returned: "
                         + ", ".join(sorted(items[0].keys()))[:500]] if items and not any(r["support_id"] for r in rows)
                        else []),
@@ -2234,6 +2769,8 @@ def do_fg_logs(b):
         if src not in FG_LOG_SOURCES:
             raise ValueError("invalid log source")
         n = num(b.get("count"), 1, 1000, 500, "max rows")
+        cutoff = cutoff_epoch(b)
+        no_time = 0
         vdom = pstr(b.get("vdom"), "VDOM")
         blocked_only = b.get("blocked") is True
         allowed_only = b.get("allowed") is True
@@ -2270,6 +2807,12 @@ def do_fg_logs(b):
                 errors.append("%s query failed (HTTP %s), response: %s" % (field, st, str(data)[:300]))
                 continue
             for e in res:
+                if cutoff:
+                    ep = fg_event_epoch(e)
+                    if ep is None:
+                        no_time += 1
+                    elif ep < cutoff:
+                        continue
                 if all(ip_matches(e.get(f), v) for f, v in conds):
                     entries[(e.get("logid"), e.get("sessionid"), e.get("date"), e.get("time"),
                              e.get("srcip"), e.get("dstip"), e.get("dstport"))] = e
@@ -2305,6 +2848,9 @@ def do_fg_logs(b):
     summary.append("Searched the newest %d entries per direction (source and destination); older entries are "
                    "not covered. Forward-traffic log only." % n)
     summary.extend(notes)
+    if cutoff:
+        summary.append("Time range: %s (within the newest %d entries read per direction)%s." % (
+            b.get("within"), n, "; %d entr(ies) had no event time and were not filtered" % no_time if no_time else ""))
     summary.extend(errors)
     ip = ip or dest
     return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
@@ -2411,6 +2957,7 @@ def do_admin_audit(b):
         if kw and not ADMIN_NAME_RE.match(kw):
             raise ValueError("invalid characters in the action filter")
         n = num(b.get("count"), 1, 500, 100, "max rows")
+        cutoff = cutoff_epoch(b) if sess["vendor"] != "paloalto" else None
         audit(sess, "admin audit search user=%s action=%s" % (user, kw or "*"))
         v = sess["vendor"]
         if v == "paloalto":
@@ -2447,6 +2994,9 @@ def do_admin_audit(b):
                                  "token profile has Log & Report read access. %s" % (st, src, str(data)[:300]))
             for e in res:
                 if not isinstance(e, dict):
+                    continue
+                ep = fg_event_epoch(e)
+                if cutoff and ep is not None and ep < cutoff:
                     continue
                 desc = e.get("logdesc", "")
                 kind = "login" if re.search(r"login|logout|auth", desc, re.I) else "config"
@@ -2486,6 +3036,8 @@ def do_admin_audit(b):
                 if pat.search(line):
                     rows.append(f5_audit_row(line, user))
             rows.reverse()  # the log is oldest first
+            if cutoff:
+                rows = [r for r in rows if (log_epoch(r["time"]) or 0) >= cutoff]
             seen_login, uniq = set(), []
             for r in rows:  # one GUI login writes several PAM lines in the same second; keep one
                 if r["type"] == "login":
@@ -2508,6 +3060,8 @@ def do_admin_audit(b):
     if kw:
         rows = [r for r in rows if kw.lower() in json.dumps(r).lower()]
     rows = rows[:n]
+    if cutoff:
+        notes.append("Time range: %s." % b.get("within"))
     lines = [fmt_adm_row(r) for r in rows]
     kinds = collections.Counter(r["type"] for r in rows)
     summary = ["Events: " + (", ".join("%s=%d" % kv for kv in kinds.most_common()) or "none")]
@@ -3456,7 +4010,7 @@ function renderF5(){const box=$("#f5tools");box.innerHTML="";const d=dev();if(!d
  '<div class="chk"><input type="checkbox" id="f5ack"><span>I understand, and this is approved for this device</span></div>'+
  '<div class="grp">Search a log for an IP</div><div class="row3">'+fld("lg_ip","IP address","203.0.113.7")+
  '<div><label>Log file (/var/log/…)</label><select id="lg_log"><option>ltm</option><option>audit</option><option>apm</option><option>gtm</option><option>tmm</option><option>asm</option></select></div>'+
- fld("lg_n","Max lines","200","200")+'</div>'+
+ fld("lg_n","Max lines","200","200")+wsel("lg_w")+'</div>'+
  '<div class="chk"><input type="checkbox" id="lg_rot"><span>Include rotated logs (.gz)</span></div>'+
  '<div style="margin-top:8px"><button onclick="f5Logs()">Search log</button></div>'+
  '<div class="grp">Packet capture (tcpdump), then download</div><div class="row3">'+
@@ -3467,7 +4021,7 @@ function renderF5(){const box=$("#f5tools");box.innerHTML="";const d=dev();if(!d
  '<div class="chk"><input type="checkbox" id="tc_ssl"><span>Include TLS session keys (--f5 ssl) so Wireshark can decrypt. The saved file can expose decrypted traffic; handle it as sensitive.</span></div>'+
  '<div style="margin-top:8px"><button class="primary" onclick="f5Capture()">Capture &amp; download</button></div></div>'}
 async function f5Logs(){setBusy("log search");
- const r=await api("/api/f5logs",{id:cur,ack:$("#f5ack").checked,ip:g("lg_ip"),log:g("lg_log"),lines:g("lg_n"),rotated:$("#lg_rot").checked});show(r,"log search")}
+ const r=await api("/api/f5logs",{id:cur,ack:$("#f5ack").checked,ip:g("lg_ip"),log:g("lg_log"),lines:g("lg_n"),within:g("lg_w"),rotated:$("#lg_rot").checked});show(r,"log search")}
 async function f5Capture(){setBusy("packet capture (up to "+g("tc_dur")+"s, then download)");
  const r=await api("/api/f5capture",{id:cur,ack:$("#f5ack").checked,ip:g("tc_ip"),port:g("tc_port"),iface:g("tc_if"),duration:g("tc_dur"),count:g("tc_cnt"),snaplen:g("tc_snap"),ssl:$("#tc_ssl").checked,pms:$("#tc_pms").checked});show(r,"packet capture")}
 function renderVerdict(r){const v=$("#verdict");v.innerHTML="";
@@ -3475,6 +4029,8 @@ function renderVerdict(r){const v=$("#verdict");v.innerHTML="";
  if(r.summary&&r.summary.length){const u=document.createElement("ul");u.className="sum";
   r.summary.forEach(x=>{const li=document.createElement("li");li.textContent=x;u.appendChild(li)});v.appendChild(u)}
  (r.downloads||(r.download?[r.download]:[])).forEach(d=>{const a=document.createElement("a");a.className="dl";a.href=d+"?t="+T;a.textContent="⬇ Download "+d.split("/").pop();v.appendChild(a)})}
+const WITHIN=["any time","last 15 minutes","last hour","last 6 hours","last 12 hours","last 24 hours"];
+function wsel(id){return sel(id,"Time range (up to 1 day)",WITHIN,"any time")}
 function sel(id,label,opts,def){return '<div><label>'+label+'</label><select id="'+id+'">'+
  opts.map(o=>'<option'+(o===def?' selected':'')+'>'+o+'</option>').join("")+'</select></div>'}
 function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if(!d)return;const v=d.vendor;
@@ -3490,8 +4046,12 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   '</div><div style="margin-top:8px"><button class="primary" onclick="asmLookup(\'supportid\')">Look up support ID</button></div>'+
   '<div class="row3" style="margin-top:8px">'+fld("asm_ip","Client IP (device-seen)","203.0.113.7")+
   fld("asm_tci","True-Client-IP (behind Cloudflare)","198.51.100.9")+fld("asm_host","Hostname contains","app.example.com")+fld("asm_url","URL path contains","/login")+
-  sel("asm_st","Status",["","blocked","alerted","passed"],"")+fld("asm_top","Max rows","50","50")+
-  '</div><div style="margin-top:8px"><button onclick="asmLookup(\'search\')">Search requests</button></div>'}
+  sel("asm_st","Status",["","blocked","alerted","passed"],"")+fld("asm_top","Max rows","50","50")+wsel("asm_w")+
+  '</div><div style="margin-top:8px"><button onclick="asmLookup(\'search\')">Search requests</button></div>'+
+  '<div class="grp" style="margin-top:14px">Top 10 hostnames by violations</div><div class="row3">'+
+  sel("asm_tst","Status",["","blocked","alerted"],"")+fld("asm_scan","Entries to scan","1000","1000")+wsel("asm_tw")+
+  '</div><div style="margin-top:8px"><button onclick="asmLookup(\'tophosts\')">Top 10 hostnames by violations</button> '+
+  '<span class="muted">(Status blank = blocked + alerted)</span></div>'}
  if(v==="paloalto"){
   h+='<div class="grp">Log search (threat / URL / traffic)</div><div class="row3">'+fld("pl_ip","IP or subnet (src or dst)","203.0.113.7 or 10.2.64.0/24")+fld("pl_dst","Destination IP or subnet (optional)","198.51.100.0/24")+sel("pl_dtype","Destination is",["either","normal destination","DNAT (translated) destination"],"either")+
   sel("pl_type","Log type",["threat","url","traffic"],"threat")+
@@ -3503,7 +4063,7 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   h+='<div class="grp">Traffic log search (is this IP being blocked?)</div><div class="row3">'+fld("fl_ip","IP or subnet (src or dst)","203.0.113.7 or 10.2.64.0/24")+
   fld("fl_dst","Destination IP or subnet (optional)","198.51.100.0/24")+
   sel("fl_dtype","Destination is",["either","normal destination","DNAT (translated) destination"],"either")+
-  sel("fl_src","Log source",["disk","memory","fortianalyzer"],"disk")+fld("fl_n","Max rows per direction","500","500")+
+  sel("fl_src","Log source",["disk","memory","fortianalyzer"],"disk")+fld("fl_n","Max rows per direction","500","500")+wsel("fl_w")+
   sel("fl_blocked","Show",["all entries","blocked only","allowed only"],"blocked only")+fld("fl_vdom","VDOM (optional)","root")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="fgLogs()">Search traffic logs</button></div>'}
  if(v==="f5")h+='<div class="grp">Config sync · changes made here and whether the peer has them</div><div class="row3">'+
@@ -3524,6 +4084,7 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   fld("au_act","Action contains (optional)","delete, commit, edit")+fld("au_n","Max rows","100","100")+
   (v==="paloalto"?sel("au_period","Time range",["last-15-minutes","last-hour","last-6-hrs","last-12-hrs","last-24-hrs","last-7-days","last-30-days"],"last-24-hrs"):"")+
   (v==="fortigate"?sel("au_src","Log source",["disk","memory","fortianalyzer"],"disk")+fld("au_vdom","VDOM (optional)","root"):"")+
+  (v!=="paloalto"?wsel("au_w"):"")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="adminAudit()">Search admin activity</button></div>';
  box.innerHTML=h+'</div>'}
 async function capture(){setBusy("packet capture (up to "+g("pc_dur")+"s, then download)");
@@ -3535,16 +4096,16 @@ async function backup(){setBusy("configuration backup (F5 archives can take seve
 async function f5Sync(){setBusy("config sync review");
  const r=await api("/api/f5sync",{id:cur,hours:g("sy_h"),count:g("sy_n")});show(r,"config sync review")}
 async function adminAudit(){setBusy("admin audit (can take up to a minute)");
- const r=await api("/api/adminaudit",{id:cur,user:g("au_user"),action:g("au_act"),count:g("au_n"),period:g("au_period"),log_source:g("au_src"),vdom:g("au_vdom")});show(r,"admin audit")}
+ const r=await api("/api/adminaudit",{id:cur,user:g("au_user"),action:g("au_act"),count:g("au_n"),period:g("au_period"),within:g("au_w"),log_source:g("au_src"),vdom:g("au_vdom")});show(r,"admin audit")}
 async function appsec(c){const names={waf:"coverage",ssl:"SSL posture"};setBusy(names[c]);
  const r=await api("/api/appsec",{id:cur,check:c,vsys:g("as_vsys"),vdom:g("as_vdom"),days:g("as_days")});show(r,names[c])}
 async function asmLookup(m){setBusy("ASM request log");
- const r=await api("/api/f5asm",{id:cur,mode:m,support_id:g("asm_sid"),ip:g("asm_ip"),header_ip:g("asm_tci"),hostname:g("asm_host"),url:g("asm_url"),status:g("asm_st"),top:g("asm_top")});
- show(r,m==="supportid"?"support ID lookup":"ASM request search")}
+ const r=await api("/api/f5asm",{id:cur,mode:m,support_id:g("asm_sid"),ip:g("asm_ip"),header_ip:g("asm_tci"),hostname:g("asm_host"),url:g("asm_url"),status:m==="tophosts"?g("asm_tst"):g("asm_st"),top:g("asm_top"),scan:g("asm_scan"),within:m==="tophosts"?g("asm_tw"):g("asm_w")});
+ show(r,m==="supportid"?"support ID lookup":m==="tophosts"?"top hostnames by violations":"ASM request search")}
 async function panLogs(){setBusy("log search (can take up to a minute)");
  const r=await api("/api/panlogs",{id:cur,ip:g("pl_ip"),dest_ip:g("pl_dst"),dest_type:{"normal destination":"normal","DNAT (translated) destination":"dnat"}[g("pl_dtype")]||"either",log_type:g("pl_type"),period:g("pl_period"),count:g("pl_n"),blocked:g("pl_blocked")==="blocked only",allowed:g("pl_blocked")==="allowed only"});show(r,"log search")}
 async function fgLogs(){setBusy("traffic log search");
- const r=await api("/api/fglogs",{id:cur,ip:g("fl_ip"),dest_ip:g("fl_dst"),dest_type:{"normal destination":"normal","DNAT (translated) destination":"dnat"}[g("fl_dtype")]||"either",log_source:g("fl_src"),count:g("fl_n"),vdom:g("fl_vdom"),blocked:g("fl_blocked")==="blocked only",allowed:g("fl_blocked")==="allowed only"});show(r,"traffic log search")}
+ const r=await api("/api/fglogs",{id:cur,ip:g("fl_ip"),dest_ip:g("fl_dst"),dest_type:{"normal destination":"normal","DNAT (translated) destination":"dnat"}[g("fl_dtype")]||"either",log_source:g("fl_src"),count:g("fl_n"),within:g("fl_w"),vdom:g("fl_vdom"),blocked:g("fl_blocked")==="blocked only",allowed:g("fl_blocked")==="allowed only"});show(r,"traffic log search")}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function cell(v){return v!==null&&typeof v==="object"?JSON.stringify(v):String(v==null?"":v)}
 function findingsOf(){if(last&&last.data&&Array.isArray(last.data.findings))return last.data.findings;
