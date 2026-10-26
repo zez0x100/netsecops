@@ -2304,8 +2304,8 @@ def do_f5_asm(b):
     try:
         if b.get("mode") == "tophosts":
             return f5_asm_top_hosts(sess, b, t0)
-        if b.get("mode") != "supportid":
-            cutoff = cutoff_epoch(b)
+        cutoff = cutoff_epoch(b)
+        outside = []
         if b.get("mode") == "supportid":
             sid = str(b.get("support_id") or "").strip()
             if not SUPPORT_ID_RE.match(sid):
@@ -2465,7 +2465,8 @@ def do_f5_asm(b):
                     same = [i for i in page if has_id(i)]
                     if same or len(page) < 200:
                         break
-            items = same
+            outside = [i for i in same if not asm_recent(i, cutoff)]
+            items = [i for i in same if asm_recent(i, cutoff)]
         if b.get("mode") != "supportid":
             # The list view may omit the support ID; the full record of each request has it.
             filled = 0
@@ -2500,12 +2501,20 @@ def do_f5_asm(b):
                         + ", ".join(sorted(items[0].keys()))[:500]] if items and not any(r["support_id"] for r in rows)
                        else []),
                     "data": {"lines": lines, "requests": rows}}
+        if not items and outside:
+            when = utc3(first(outside[0], "requestDatetime", "occurrenceTime", "dateTime", "time"))
+            return {"ok": True, "status": st, "ms": int((time.time() - t0) * 1000), "request": "GET " + path,
+                    "verdict": {"label": "SUPPORT ID %s FOUND, BUT OUTSIDE THE TIME RANGE" % sid, "kind": "info"},
+                    "summary": ["The request was logged at %s, which is older than the selected range (%s). "
+                                "Choose a longer range or 'any time' to see it." % (when, b.get("within") or "any time")],
+                    "data": {}}
         if not items:
             return {"ok": True, "status": st, "ms": int((time.time() - t0) * 1000), "request": "GET " + path,
                     "verdict": {"label": "NO REQUEST FOUND for support ID %s" % sid, "kind": "info"},
                     "summary": ["The request may have been purged from the local log, logged on the other HA unit "
-                                "or another BIG-IP, or excluded by the logging profile.",
-                                "Support IDs the device returned (first few): " + (", ".join(seen) or "none")],
+                                "or another BIG-IP, or excluded by the logging profile."]
+                    + (["Time range applied: %s." % b.get("within")] if cutoff else [])
+                    + ["Support IDs the device returned (first few): " + (", ".join(seen) or "none")],
                     "data": {}}
         it, cache = items[0], {}
         raw = it.get("rawRequest") or {}
@@ -4049,7 +4058,7 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   '<button onclick="appsec(\'waf\')">'+(v==="f5"?"WAF posture":"Security-profile coverage")+'</button>'+
   (v==="f5"?'<button onclick="appsec(\'ssl\')">SSL / cert posture</button>':'')+'</div>';
  if(v==="f5"){
-  h+='<div class="grp">ASM / Advanced WAF request log</div><div class="row3">'+fld("asm_sid","Support ID (from block page)","1234567890123456789")+
+  h+='<div class="grp">ASM / Advanced WAF request log</div><div class="row3">'+fld("asm_sid","Support ID (from block page)","1234567890123456789")+wsel("asm_sw")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="asmLookup(\'supportid\')">Look up support ID</button></div>'+
   '<div class="row3" style="margin-top:8px">'+fld("asm_ip","Client IP (device-seen)","203.0.113.7")+
   fld("asm_tci","True-Client-IP (behind Cloudflare)","198.51.100.9")+fld("asm_host","Hostname contains","app.example.com")+fld("asm_url","URL path contains","/login")+
@@ -4107,7 +4116,7 @@ async function adminAudit(){setBusy("admin audit (can take up to a minute)");
 async function appsec(c){const names={waf:"coverage",ssl:"SSL posture"};setBusy(names[c]);
  const r=await api("/api/appsec",{id:cur,check:c,vsys:g("as_vsys"),vdom:g("as_vdom"),days:g("as_days")});show(r,names[c])}
 async function asmLookup(m){setBusy("ASM request log");
- const r=await api("/api/f5asm",{id:cur,mode:m,support_id:g("asm_sid"),ip:g("asm_ip"),header_ip:g("asm_tci"),hostname:g("asm_host"),url:g("asm_url"),status:m==="tophosts"?g("asm_tst"):g("asm_st"),top:g("asm_top"),scan:g("asm_scan"),within:m==="tophosts"?g("asm_tw"):g("asm_w")});
+ const r=await api("/api/f5asm",{id:cur,mode:m,support_id:g("asm_sid"),ip:g("asm_ip"),header_ip:g("asm_tci"),hostname:g("asm_host"),url:g("asm_url"),status:m==="tophosts"?g("asm_tst"):g("asm_st"),top:g("asm_top"),scan:g("asm_scan"),within:m==="tophosts"?g("asm_tw"):m==="supportid"?g("asm_sw"):g("asm_w")});
  show(r,m==="supportid"?"support ID lookup":m==="tophosts"?"top hostnames by violations":"ASM request search")}
 async function panLogs(){setBusy("log search (can take up to a minute)");
  const r=await api("/api/panlogs",{id:cur,ip:g("pl_ip"),dest_ip:g("pl_dst"),dest_type:{"normal destination":"normal","DNAT (translated) destination":"dnat"}[g("pl_dtype")]||"either",log_type:g("pl_type"),period:g("pl_period"),count:g("pl_n"),blocked:g("pl_blocked")==="blocked only",allowed:g("pl_blocked")==="allowed only"});show(r,"log search")}
