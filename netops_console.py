@@ -1618,6 +1618,15 @@ def f5_bash(sess, script, timeout=30):
     return st, 200 <= st < 300, out or "", data
 
 
+def f5_bash_error(st, data, what="bash call"):
+    """Error text for a failed util/bash call. A non-Administrator role (e.g. Auditor) gets HTTP 400, not 401/403."""
+    msg = str(data.get("message") or "")[:200] if isinstance(data, dict) else ""
+    detail = "HTTP %s%s" % (st, ": " + msg if msg else "")
+    if st in (400, 401, 403):
+        return "%s rejected (%s). util/bash needs the Administrator role." % (what, detail)
+    return "%s failed (%s)" % (what, detail)
+
+
 def _f5_gate(b):
     sess = SESSIONS.get(b.get("id"))
     if not sess or sess["vendor"] != "f5":
@@ -1654,8 +1663,8 @@ def do_f5_logs(b):
         return {"ok": False, "error": str(e)}
     except (urllib.error.URLError, OSError) as e:
         return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
-    if st in (401, 403):
-        return {"ok": False, "error": "bash access denied (needs the Administrator role)"}
+    if not ok:
+        return {"ok": False, "status": st, "error": f5_bash_error(st, data, "log search")}
     lines = [l for l in out.splitlines() if l.strip()]
     if cutoff:
         lines = [l for l in lines if (log_epoch(l[:15]) or 0) >= cutoff][-n:]
@@ -1733,10 +1742,8 @@ def do_f5_capture(b):
         inner += "; touch %s" % tdone
         script = "setsid nohup sh -c %s > /dev/null 2>&1 < /dev/null &" % shlex.quote(inner)
         st, ok, out, data = f5_bash(sess, script, 20)
-        if st in (401, 403):
-            raise ValueError("bash access denied (needs the Administrator role)")
         if not ok:
-            raise ValueError("bash call failed (HTTP %d)" % st)
+            raise ValueError(f5_bash_error(st, data, "tcpdump start"))
         poll = ("if [ -e %s ]; then echo FINISHED; cat %s; ls -l %s 2>&1; "
                 "echo PMS_BYTES=$(wc -c < %s 2>/dev/null); fi") % (tdone, tlog, keep, keep_pms)
         deadline = time.time() + dur + 45
@@ -3494,12 +3501,10 @@ def do_backup(b):
             # background on the BIG-IP and poll a status file until it finishes.
             log, rc = "/var/tmp/%s.log" % remote_name, "/var/tmp/%s.rc" % remote_name
             audit(sess, "backup: saving UCS " + remote_name)
-            st, ok, out, _ = f5_bash(sess, "nohup sh -c %s >/dev/null 2>&1 &" % shlex.quote(
+            st, ok, out, res = f5_bash(sess, "nohup sh -c %s >/dev/null 2>&1 &" % shlex.quote(
                 "tmsh save /sys ucs %s.ucs > %s 2>&1; echo $? > %s" % (remote_name, log, rc)), 30)
-            if st in (401, 403):
-                raise ValueError("bash access denied (needs the Administrator role)")
             if not ok:
-                raise ValueError("could not start the UCS save (HTTP %s)" % st)
+                raise ValueError(f5_bash_error(st, res, "UCS save"))
             deadline, status = time.time() + 1500, ""
             while time.time() < deadline:
                 time.sleep(10)
