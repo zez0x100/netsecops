@@ -16,8 +16,11 @@ Design notes
   operational command (PAN-OS; <test> limited to an allowlist). The raw box enforces the same rules.
 - EXCEPTION: the 'F5 active tools' (log search, tcpdump) run fixed shell-command templates
   through iControl REST util/bash. They need the Administrator role and an explicit tick-box.
+  The capture (and .pms key file) is kept in /var/tmp on the BIG-IP, readable by root only.
 - EXCEPTION: 'Configuration backup' on F5 saves a UCS archive on the BIG-IP (same tick-box); on PAN-OS and
-  FortiGate it is a read-only export. Backups are saved in ./captures and downloaded by the browser.
+  FortiGate it is a read-only export with no tick-box. Backups are saved in ./captures and downloaded by the browser.
+- EXCEPTION: the PAN-OS packet capture runs <debug><dataplane><packet-diag> commands (needs a tick-box). It
+  clears all packet-diag settings before and after, which also ends any capture another admin has running.
 - The tool talks to device management APIs over HTTPS from THIS machine.
 - AppSec checks (WAF / profile coverage, SSL posture, ASM request log,
   PAN log search) are read-only.
@@ -1720,12 +1723,12 @@ def do_f5_capture(b):
         audit(sess, "tcpdump %s on %s (%ds)%s%s" % (flt, iface, dur, ssl_opt, " + tshark keylog" if want_pms else ""))
         # Run detached and poll, so no single REST call has to stay open for the whole capture.
         tlog, tdone = keep + ".log", keep + ".done"
-        inner = "timeout -k 5 %d tcpdump -ni %s -s %d -c %d%s -w %s %s > %s 2>&1; chmod 644 %s 2>&1" % (
+        inner = "timeout -k 5 %d tcpdump -ni %s -s %d -c %d%s -w %s %s > %s 2>&1; chmod 600 %s 2>&1" % (
             dur, iface, snap, cnt, ssl_opt, keep, flt, tlog, keep)
         if want_pms:
             # One keylog line per entry (tshark joins several per frame with commas), duplicates dropped.
             inner += ("; tshark -r %s -Y f5ethtrailer.tls.keylog -T fields -e f5ethtrailer.tls.keylog 2>> %s "
-                      "| tr ',' '\\n' | sed '/^$/d' | sort -u > %s; chmod 644 %s 2>&1") % (
+                      "| tr ',' '\\n' | sed '/^$/d' | sort -u > %s; chmod 600 %s 2>&1") % (
                 keep, tlog, keep_pms, keep_pms)
         inner += "; touch %s" % tdone
         script = "setsid nohup sh -c %s > /dev/null 2>&1 < /dev/null &" % shlex.quote(inner)
@@ -4087,7 +4090,7 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   '</div><div style="margin-top:8px"><button class="primary" onclick="f5Sync()">Review config sync</button></div>';
  if(v==="paloalto"){
   h+='<div class="grp">Packet capture (live, then download .pcap)</div>'+
-  '<div class="chk"><input type="checkbox" id="pc_ack"><span>I understand this turns on packet-diag capture on the firewall for a short time and may expose traffic; approved for this device</span></div>'+
+  '<div class="chk"><input type="checkbox" id="pc_ack"><span>I understand this turns on packet-diag capture on the firewall for a short time, clears all packet-diag settings (ending any capture another admin has running) and may expose traffic; approved for this device</span></div>'+
   '<div class="row3">'+fld("pc_src","Source IP","203.0.113.7")+fld("pc_dst","Destination IP","198.51.100.9")+fld("pc_port","Port","443")+
   sel("pc_proto","Protocol",["any","tcp","udp","icmp"],"tcp")+
   fld("pc_dur","Seconds (5-60)","20","20")+fld("pc_cnt","Max packets","10000","10000")+sel("pc_stage","Stage",["receive","firewall","transmit","drop"],"receive")+
