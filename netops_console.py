@@ -24,6 +24,8 @@ Design notes
 - The tool talks to device management APIs over HTTPS from THIS machine.
 - AppSec checks (WAF / profile coverage, SSL posture, ASM request log,
   PAN log search) are read-only.
+- Cloudflare: an API token (give it read permissions only). Configuration is read with REST GETs; analytics
+  are POSTed to the GraphQL Analytics API, which only answers queries (the raw box refuses mutations).
 """
 import argparse
 import base64
@@ -134,8 +136,7 @@ CATALOG = {
          "path": "/api/v2/cmdb/router/static",
          "params": [P("filter", "Destination IP/subnet, gateway, interface or comment", "10.2.0.0/16", required=False)]},
         {"id": "vips", "group": "Policy", "label": "Virtual IPs (optional filter)", "path": "/api/v2/cmdb/firewall/vip",
-         "params": [P("filter", "Name, external IP or mapped IP", "203.0.113.10", required=False)]},
-        {"id": "ipsec", "group": "VPN", "label": "IPsec tunnels", "path": "/api/v2/monitor/vpn/ipsec"},
+         "params": [P("filter", "Name, external IP or mapped IP", "203.0.113.10", required=False)]},        {"id": "ipsec", "group": "VPN", "label": "IPsec tunnels", "path": "/api/v2/monitor/vpn/ipsec"},
         {"id": "polstats", "group": "Policy", "label": "Firewall policy hit counts", "path": "/api/v2/monitor/firewall/policy"},
         {"id": "sessions", "group": "Sessions", "label": "Session list (IPv4)", "path": "/api/v2/monitor/firewall/session?count={count}&ip_version=ipv4",
          "params": [P("count", "Max rows", "20", "20")]},
@@ -144,6 +145,22 @@ CATALOG = {
                     P("dst", "Destination IP", "10.2.2.20"), P("proto", "Protocol", "tcp", "tcp"),
                     P("port", "Dest port", "443", "443")]},
     ],
+    "cloudflare": [
+        {"id": "verify", "group": "Account", "label": "API token status (user-owned tokens)", "path": "/client/v4/user/tokens/verify"},
+        {"id": "accounts", "group": "Account", "label": "Accounts visible to the token", "path": "/client/v4/accounts?per_page=50"},
+        {"id": "zones", "group": "Zones", "label": "Zones (first 50)", "path": "/client/v4/zones?per_page=50"},
+        {"id": "zone", "group": "Zones", "label": "Zone details", "path": "/client/v4/zones/{zone}",
+         "params": [P("zone", "Zone name or ID", "example.com")]},
+        {"id": "settings", "group": "Zones", "label": "All zone settings", "path": "/client/v4/zones/{zone}/settings",
+         "params": [P("zone", "Zone name or ID", "example.com")]},
+        {"id": "dns", "group": "DNS", "label": "DNS records (first 100)", "path": "/client/v4/zones/{zone}/dns_records?per_page=100",
+         "params": [P("zone", "Zone name or ID", "example.com")]},
+        {"id": "rulesets", "group": "Security", "label": "Rulesets of a zone", "path": "/client/v4/zones/{zone}/rulesets",
+         "params": [P("zone", "Zone name or ID", "example.com")]},
+        {"id": "certs", "group": "SSL/TLS", "label": "Edge certificate packs",
+         "path": "/client/v4/zones/{zone}/ssl/certificate_packs?status=all", "params": [P("zone", "Zone name or ID", "example.com")]},
+        {"id": "ips", "group": "Reference", "label": "Cloudflare edge IP ranges", "path": "/client/v4/ips"},
+    ],
 }
 CATALOG_PUBLIC = CATALOG  # contains no secrets
 PROFILE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_profiles.json")
@@ -151,6 +168,7 @@ HEALTH_CHECKS = {
     "f5": ("version", "failover", "cpu", "mem"),
     "paloalto": ("sysinfo", "resources", "ha"),
     "fortigate": ("status", "resources", "ha"),
+    "cloudflare": ("zones", "ips"),
 }
 
 
@@ -368,11 +386,11 @@ def do_connect(b):
     vendor = b.get("vendor")
     if vendor not in CATALOG:
         return {"ok": False, "error": "unknown vendor"}
-    host = (b.get("host") or "").strip()
+    host = CF_HOST if vendor == "cloudflare" else (b.get("host") or "").strip()
     if not HOST_RE.match(host):
         return {"ok": False, "error": "invalid host"}
     try:
-        port = int(b.get("port") or 443)
+        port = 443 if vendor == "cloudflare" else int(b.get("port") or 443)
     except (TypeError, ValueError):
         return {"ok": False, "error": "invalid port"}
     if not 1 <= port <= 65535:
@@ -380,7 +398,8 @@ def do_connect(b):
     name = b.get("name")
     name = name.strip() if isinstance(name, str) else ""
     sess = {"vendor": vendor, "host": host, "port": port,
-            "insecure": bool(b.get("insecure")), "name": (name or host)[:40]}
+            "insecure": bool(b.get("insecure")) and vendor != "cloudflare",
+            "name": (name or ("Cloudflare" if vendor == "cloudflare" else host))[:40]}
     user, pw, key = b.get("username", ""), b.get("password", ""), b.get("apikey", "")
     try:
         if vendor == "f5":
@@ -400,6 +419,23 @@ def do_connect(b):
             if ok and not isinstance(data, dict):
                 return {"ok": False, "error": "this address did not answer like a FortiGate (got a non-JSON "
                                               "page). Check the host/port and the selected vendor."}
+        elif vendor == "cloudflare":
+            if not key:
+                return {"ok": False, "error": "Cloudflare API token required"}
+            acct = str(b.get("account") or "").strip().lower()
+            if acct and not CF_ID_RE.match(acct):
+                return {"ok": False, "error": "Account ID must be 32 hex characters (or leave it blank)"}
+            sess["hdr"], sess["account"] = {"Authorization": "Bearer " + key}, acct
+            status, ok, data = cf_get(sess, "/user/tokens/verify")
+            if not ok and acct:
+                status, ok, data = cf_get(sess, "/accounts/%s/tokens/verify" % acct)
+            if ok and str((data.get("result") or {}).get("status")) != "active":
+                return {"ok": False, "error": "the token is not active (status: %s)" % (data.get("result") or {}).get("status")}
+            if not ok:   # account-owned token without an Account ID: listing zones still proves it works
+                status, ok, data = cf_get(sess, "/zones?per_page=5")
+            if not ok:
+                return {"ok": False, "error": "Cloudflare rejected the token (%s)" % cf_errtext(status, data)}
+            note = cf_load(sess)
         else:
             if not key:
                 if not user or not pw:
@@ -420,7 +456,11 @@ def do_connect(b):
     with LOCK:
         SESSIONS[sid] = sess
     audit(sess, "connected")
-    return {"ok": True, "id": sid, "name": sess["name"], "vendor": vendor, "host": host}
+    out = {"ok": True, "id": sid, "name": sess["name"], "vendor": vendor, "host": host}
+    if vendor == "cloudflare":
+        out.update(zones=[z["name"] for z in sess["zones"]], note=note,
+                   accounts=len(sess.get("accounts") or {}))
+    return out
 
 
 def fill(template, params, spec, vendor):
@@ -453,6 +493,8 @@ def do_run(b):
                 raw = str(b["params"].get(k) or "").strip().replace("/", "~")
                 if raw:
                     b["params"][k] = raw if raw.startswith("~") else "~Common~" + raw
+        if sess["vendor"] == "cloudflare" and str((b.get("params") or {}).get("zone") or "").strip():
+            b = dict(b, params=dict(b["params"], zone=cf_zones(sess, b["params"]["zone"], allow_all=False)[0]["id"]))
         if spec.get("handler"):
             vals = {}
             for p_ in spec.get("params", []):
@@ -634,8 +676,20 @@ def do_raw(b):
             return {"ok": False, "error": "only these <test> commands are allowed: " +
                     ", ".join(sorted(PAN_SAFE_TESTS))}
         run = {"cmd": q}
+    elif v == "cloudflare" and q.startswith(("{", "query")):
+        if re.search(r"\b(mutation|subscription)\b", q):
+            return {"ok": False, "error": "only GraphQL queries are allowed"}
+        audit(sess, "raw GraphQL: " + q[:120])
+        t0 = time.time()
+        try:
+            ok, data, errs = cf_gql(sess, q)
+        except (urllib.error.URLError, OSError) as e:
+            return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+        return {"ok": ok, "status": 200, "data": data if ok else {"errors": errs, "data": data},
+                "request": "POST /client/v4/graphql", "ms": int((time.time() - t0) * 1000)}
     else:
-        prefixes = ("/mgmt/tm/",) if v == "f5" else ("/api/v2/monitor/", "/api/v2/cmdb/")
+        prefixes = ("/mgmt/tm/",) if v == "f5" else ("/client/v4/",) if v == "cloudflare" else \
+            ("/api/v2/monitor/", "/api/v2/cmdb/")
         if not q.startswith(prefixes) or ".." in q or "\n" in q or "\r" in q:
             return {"ok": False, "error": "path must start with " + " or ".join(prefixes)}
         run = {"path": q}
@@ -2144,6 +2198,126 @@ def asm_row(it):
             "response_code": it.get("responseCode"), "rating": it.get("violationRating")}
 
 
+def asm_http(it):
+    """Raw request of a logged entry -> (header lines incl. request line, [(name_lower, value)], body); empty if absent."""
+    raw = it.get("rawRequest") or {}
+    text = raw.get("httpRequest") if isinstance(raw, dict) else raw
+    text = text if isinstance(text, str) else ""
+    head, _, body = text.replace("\r\n", "\n").partition("\n\n")
+    hlines = head.split("\n") if text else []
+    pairs = []
+    for ln in hlines[1:]:
+        k, _, val = ln.partition(":")
+        if val:
+            pairs.append((k.strip().lower(), val.strip()))
+    return hlines, pairs, body
+
+
+def f5_asm_by_header(sess, b, t0):
+    """Requests carrying an HTTP header (optionally whose value contains a string), newest first, matched locally
+    on the raw request since arbitrary headers cannot be filtered on the device."""
+    hname = (b.get("header_name") or "").strip()
+    if not re.match(r"^[A-Za-z0-9!#$%&'*+.^_`|~\-]{1,100}$", hname):
+        raise ValueError("enter a valid HTTP header name, e.g. User-Agent or X-Request-ID")
+    hval = (b.get("header_value") or "").strip()
+    if len(hval) > 500:
+        raise ValueError("header value is too long (max 500 characters)")
+    status = (b.get("status") or "").strip()
+    if status not in ("", "blocked", "alerted", "passed"):
+        raise ValueError("invalid status")
+    hostq = (b.get("hostname") or "").strip().lower().replace("*", "")
+    top = num(b.get("top"), 1, 200, 50, "max rows")
+    scan = num(b.get("scan"), 100, 5000, 1000, "entries to scan")
+    cutoff = cutoff_epoch(b)
+    hkey, vq = hname.lower(), hval.lower()
+    audit(sess, "ASM request log by header: %s %s %s" % (hname, ("contains '%s'" % hval) if hval else "present",
+                                                           status or "any status"))
+    flt = "requestStatus eq '%s'" % status if status else ""
+    base = "/mgmt/tm/asm/events/requests?" + ("$filter=%s&" % urllib.parse.quote(flt) if flt else "")
+    order = "$orderby=requestDatetime%20desc&"
+    st, ok0, d0 = rest_get(sess, base + order + "$top=1")
+    newest_first = ok0 and isinstance(d0, dict) and bool(d0.get("items"))
+    base += order if newest_first else ""
+
+    def hdr_values(i):
+        return [v for k, v in asm_http(i)[1] if k == hkey]
+
+    matches, scanned, fetched, with_raw, prev, path, capped = [], 0, 0, 0, None, base, True
+    for skip in range(0, scan, 200):
+        if time.time() - t0 > 100:
+            break
+        path = base + "$top=%d" % min(200, scan - skip) + ("&$skip=%d" % skip if skip else "")
+        st, ok, data = rest_get(sess, path)
+        if not ok or not isinstance(data, dict):
+            return {"ok": False, "status": st, "error": "request log query failed (HTTP %s). Is ASM / Advanced WAF "
+                    "provisioned and does the account have access?" % st}
+        page = data.get("items", [])
+        fid = json.dumps(page[0], sort_keys=True) if page else None
+        if skip and fid == prev:
+            capped = False   # device ignores $skip and repeats the first page
+            break
+        prev = fid
+        scanned += len(page)
+        for i in page:
+            if not asm_recent(i, cutoff) or (hostq and asm_hostname(i) and hostq not in asm_hostname(i).lower()):
+                continue
+            # The list view may omit the raw request; fetch the full record (bounded by time and count).
+            if not i.get("rawRequest") and fetched < 1500 and time.time() - t0 < 100 and asm_enrich(sess, i):
+                fetched += 1
+            if i.get("rawRequest"):
+                with_raw += 1
+            if hostq and hostq not in asm_hostname(i).lower():
+                continue
+            vals = hdr_values(i)
+            if vals and (not vq or any(vq in v.lower() for v in vals)):
+                matches.append(i)
+            if len(matches) >= top:
+                break
+        if len(page) < 200 or len(matches) >= top:
+            capped = False
+            break
+        if cutoff and newest_first and page and not asm_recent(page[-1], cutoff):
+            capped = False   # reached entries older than the time range
+            break
+    rows = []
+    for it in matches:
+        hlines, pairs, body = asm_http(it)
+        hdrs = dict(reversed(pairs))
+        method = str(it.get("method") or (hlines[0].split(" ")[0] if hlines else "")).upper()
+        rows.append({"time": utc3(first(it, "requestDatetime", "occurrenceTime", "dateTime", "time")),
+                     "timezone": "UTC+3",
+                     "header": hname,
+                     "header_value": " | ".join(hdr_values(it)),
+                     "ip": it.get("clientIp", ""),
+                     "true_client_id": it.get("trueClientIp") or hdrs.get("true-client-ip") or asm_header_ip(it),
+                     "hostname": asm_hostname(it) or hdrs.get("host", ""),
+                     "method": method,
+                     "url": str(first(it, "url", "uri") or ""),
+                     "support_id": asm_support_id(it),
+                     "status": first(it, "requestStatus", "enforcementState"),
+                     "body": body if method == "POST" else ""})
+    notes = ["Header %s %s; scanned %d log entries (%d with raw request data)%s." % (
+        hname, ("value contains '%s'" % hval) if hval else "present (any value)", scanned, with_raw,
+        ", status " + status if status else "")]
+    if cutoff:
+        notes.append("Time range: %s (applied to the request time of each entry)." % b.get("within"))
+    notes.append("Times are shown in UTC+3." if newest_first else
+                 "Order: device default (the device rejected $orderby=requestDatetime desc). Times are in UTC+3.")
+    if capped and len(matches) < top:
+        notes.append("Scan stopped at %d entries / time limit before reaching the end of the log; raise 'Entries to "
+                     "scan' or add a status / hostname filter to narrow it." % scanned)
+    if scanned and not with_raw:
+        notes.append("No entry includes the raw request, so headers cannot be read: the logging profile may not store "
+                     "request headers.")
+    lines = ["%(time)s %(timezone)s  %(status)-8s %(ip)s  [True-Client-IP %(true_client_id)s]  %(method)s %(hostname)s"
+             "%(url)s  %(header)s: %(header_value)s  (support ID %(support_id)s)" % r
+             + ("\n    body: " + r["body"][:2000] if r["body"] else "") for r in rows]
+    return {"ok": True, "status": st, "ms": int((time.time() - t0) * 1000), "request": "GET " + path,
+            "verdict": {"label": "%d REQUEST(S) WITH HEADER %s" % (len(rows), hname.upper()),
+                        "kind": "warn" if rows else "info"},
+            "summary": notes, "data": {"lines": lines, "requests": rows}}
+
+
 def asm_enrich(sess, it):
     """Merge the full request record (violations, raw request, support ID) into a list entry. True if fetched."""
     path = urllib.parse.urlparse(str(it.get("selfLink") or "")).path
@@ -2314,6 +2488,8 @@ def do_f5_asm(b):
     try:
         if b.get("mode") == "tophosts":
             return f5_asm_top_hosts(sess, b, t0)
+        if b.get("mode") == "header":
+            return f5_asm_by_header(sess, b, t0)
         cutoff = cutoff_epoch(b)
         outside = []
         if b.get("mode") == "supportid":
@@ -2527,16 +2703,9 @@ def do_f5_asm(b):
                     + ["Support IDs the device returned (first few): " + (", ".join(seen) or "none")],
                     "data": {}}
         it, cache = items[0], {}
-        raw = it.get("rawRequest") or {}
-        http_text = raw.get("httpRequest") if isinstance(raw, dict) else raw
-        http_text = http_text if isinstance(http_text, str) else ""
-        head, _, body = http_text.replace("\r\n", "\n").partition("\n\n")
-        hlines = head.split("\n")
-        hdrs = {}
-        for ln in hlines[1:]:
-            k, _, val = ln.partition(":")
-            if val:
-                hdrs.setdefault(k.strip().lower(), val.strip())
+        hlines, pairs, body = asm_http(it)
+        http_text = "\n".join(hlines)
+        hdrs = dict(reversed(pairs))
         violations = []
         blocking = {}
         plink = urllib.parse.urlparse((it.get("requestPolicyReference") or {}).get("link") or "").path
@@ -3565,6 +3734,1527 @@ def do_backup(b):
             "data": {"saved_file": local, "size_bytes": size}}
 
 
+# ----------------------------------------------------------------------------
+# Cloudflare: read-only lookups with an API token. Analytics come from the GraphQL Analytics API (queries
+# only), configuration from REST GETs. Lookups span every zone the token sees, or one zone.
+# ----------------------------------------------------------------------------
+CF_HOST = "api.cloudflare.com"
+CF_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+CF_RAY_RE = re.compile(r"^([0-9a-f]{16})(?:-[a-z]{3})?$", re.I)
+CF_WORD_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+CF_TEXT_RE = re.compile(r'^[^\x00-\x1f"\\]{1,200}$')
+CF_HOSTNAME_RE = re.compile(r"^[a-z0-9*_.\-]{1,253}$")
+CF_IPTOK_RE = re.compile(r"(?<![\w.:])(?:\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?|[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7}(?:/\d{1,3})?)"
+                         r"(?![\w.:])", re.I)
+CF_TZ = datetime.timezone(datetime.timedelta(hours=3))
+CF_WITHIN = {"last 15 minutes": 900, "last hour": 3600, "last 6 hours": 21600, "last 12 hours": 43200,
+             "last 24 hours": 86400, "last 3 days": 259200, "last 7 days": 604800, "last 30 days": 2592000}
+CF_MAX_ZONES = 100      # analytics lookups over "all zones" (10 zones per GraphQL query)
+CF_MAX_CFG_ZONES = 30   # configuration lookups over "all zones" (several REST calls per zone)
+CF_EDGE = {}            # Cloudflare's published edge ranges, fetched once
+CF_BLOCK = ("block", "drop", "connection_close", "force_connection_close")
+# Optional output fields: those a plan or API version does not offer are dropped and the query retried.
+CF_EV_FIELDS = ("action", "source", "ruleId", "rulesetId", "description", "rayName", "clientIP", "clientCountryName",
+                "clientAsn", "clientASNDescription", "clientRequestHTTPHost", "clientRequestHTTPMethodName",
+                "clientRequestPath", "clientRequestQuery", "userAgent", "edgeResponseStatus", "originResponseStatus",
+                "edgeColoName")
+CF_RQ_FIELDS = ("rayName", "clientIP", "clientCountryName", "clientAsn", "clientRequestHTTPHost",
+                "clientRequestHTTPMethodName", "clientRequestPath", "clientRequestQuery", "clientRequestHTTPProtocol",
+                "edgeResponseStatus", "originResponseStatus", "cacheStatus", "securityAction", "securitySource",
+                "userAgent", "coloCode", "edgeTimeToFirstByteMs", "originResponseDurationMs", "clientSSLProtocol",
+                "botScore", "wafAttackScore", "originIP", "edgeResponseBytes", "sampleInterval")
+CF_COL = {"clientRequestHTTPHost": "host", "clientIP": "client_ip", "clientRequestPath": "path",
+          "clientCountryName": "country", "clientAsn": "asn", "clientASNDescription": "asn_name",
+          "userAgent": "user_agent", "edgeResponseStatus": "edge_status", "originResponseStatus": "origin_status",
+          "cacheStatus": "cache", "coloCode": "colo", "edgeColoName": "colo", "securityAction": "security_action",
+          "securitySource": "security_source", "clientSSLProtocol": "tls", "clientRequestHTTPProtocol": "http_version",
+          "ruleId": "rule_id", "datetimeHour": "time", "datetimeFiveMinutes": "time", "date": "date",
+          "clientRequestHTTPMethodName": "method", "rayName": "ray_id"}
+# Group-by choices: (required dimensions, optional dimensions). "@time" picks a bucket size from the range.
+CF_DIM_EV = {"action": (("action",), ()), "source": (("source",), ()),
+             "rule": (("ruleId",), ("source", "description")), "client IP": (("clientIP",), ("clientCountryName",)),
+             "host": (("clientRequestHTTPHost",), ()), "path": (("clientRequestPath",), ()),
+             "country": (("clientCountryName",), ()), "ASN": (("clientAsn",), ("clientASNDescription",)),
+             "user agent": (("userAgent",), ()), "colo": (("edgeColoName",), ()), "time": (("@time",), ())}
+CF_DIM_HTTP = {"host": (("clientRequestHTTPHost",), ()), "edge status": (("edgeResponseStatus",), ()),
+               "origin status": (("originResponseStatus",), ()),
+               "edge + origin status": (("edgeResponseStatus", "originResponseStatus"), ()),
+               "cache status": (("cacheStatus",), ()), "client IP": (("clientIP",), ()),
+               "path": (("clientRequestPath",), ()), "country": (("clientCountryName",), ()),
+               "ASN": (("clientAsn",), ()), "user agent": (("userAgent",), ()), "colo": (("coloCode",), ()),
+               "security action": (("securityAction",), ("securitySource",)),
+               "TLS version": (("clientSSLProtocol",), ()), "HTTP version": (("clientRequestHTTPProtocol",), ()),
+               "time": (("@time",), ())}
+CF_HTTP_METRICS = ("sum{edgeResponseBytes}", "avg{edgeTimeToFirstByteMs originResponseDurationMs}")
+CF_STATUS = {"2xx": (200, 300), "3xx": (300, 400), "4xx": (400, 500), "5xx": (500, 600), "4xx + 5xx": (400, 600),
+             "origin errors (520-527)": (520, 528)}
+CF_SETTINGS = ("ssl", "min_tls_version", "tls_1_3", "always_use_https", "automatic_https_rewrites", "security_level",
+               "browser_check", "challenge_ttl", "true_client_ip_header", "ip_geolocation", "development_mode", "0rtt",
+               "http3", "websockets", "opportunistic_encryption", "cache_level")
+CF_SEC_PHASES = ("http_request_firewall_custom", "http_ratelimit", "http_request_firewall_managed")
+
+
+def cf_get(sess, path):
+    st, ok, data = rest_get(sess, "/client/v4" + path)
+    if isinstance(data, dict) and data.get("success") is False:
+        ok = False
+    return st, ok and isinstance(data, dict), data
+
+
+def cf_errtext(st, data):
+    errs = data.get("errors") if isinstance(data, dict) else None
+    msg = "; ".join(("%s %s" % (e.get("code", ""), e.get("message", ""))).strip()
+                    for e in errs or [] if isinstance(e, dict))
+    return "HTTP %s%s" % (st, (": " + msg[:300]) if msg else "")
+
+
+def cf_list(sess, path, per_page=100, max_pages=20):
+    """Every result of a paged REST list -> (items, error text or '', truncated)."""
+    items, sep, prev = [], "&" if "?" in path else "?", None
+    for page in range(1, max_pages + 1):
+        st, ok, d = cf_get(sess, "%s%spage=%d&per_page=%d" % (path, sep, page, per_page))
+        if not ok:
+            return items, cf_errtext(st, d), False
+        res = d.get("result") or []
+        res = res if isinstance(res, list) else []
+        fid = json.dumps(res[0], sort_keys=True) if res else None
+        if page > 1 and fid == prev:
+            return items, "", False   # the endpoint ignores paging
+        prev = fid
+        items += res
+        tp = (d.get("result_info") or {}).get("total_pages")
+        if not res or (tp and page >= int(tp)) or (not tp and len(res) < per_page):
+            return items, "", False
+    return items, "", True
+
+
+def cf_gql(sess, query):
+    """One GraphQL Analytics query -> (ok, data, [error messages])."""
+    body = json.dumps({"query": query}).encode()
+    st, raw = http(sess, "POST", "/client/v4/graphql", dict(sess["hdr"], **{"Content-Type": "application/json"}),
+                   body, timeout=60)
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return False, None, ["HTTP %s: the GraphQL API did not answer with JSON" % st]
+    d = d if isinstance(d, dict) else {}
+    errs = [str(e.get("message") if isinstance(e, dict) else e) for e in (d.get("errors") or [])]
+    if st != 200 and not errs:
+        errs = ["HTTP %s" % st]
+    return not errs and d.get("data") is not None, d.get("data"), errs
+
+
+def cf_gql_opt(sess, build, opt):
+    """Run build(optional fields); when the schema rejects some of them (they vary by plan and API version), drop
+    those and retry. -> (ok, data, errors, dropped)."""
+    opt, dropped, errs = list(opt), [], []
+    for _ in range(8):
+        ok, data, errs = cf_gql(sess, build(opt))
+        if ok:
+            return ok, data, errs, dropped
+        text = " ".join(errs)
+        bad = [f for f in opt if any(re.search(r"[\"'`]%s[\"'`]|field %s\b" % (re.escape(n), re.escape(n)), text)
+                                     for n in re.findall(r"[A-Za-z_]\w*", f))]
+        if not bad:
+            return ok, data, errs, dropped
+        dropped += bad
+        opt = [f for f in opt if f not in bad]
+    return False, None, errs, dropped
+
+
+def cf_gql_zones(sess, zones, sel, opt=(), chunk=10):
+    """Run one zone-level selection for many zones, `chunk` per query as aliases. sel(optional fields) is the text
+    inside zones(...){ }. -> ({zone id: (zone data or None, errors)}, dropped optional fields)."""
+    def run(chunk):
+        q = lambda f: "{viewer{%s}}" % " ".join("z%d:zones(filter:{zoneTag:%s}){%s}" % (i, json.dumps(z["id"]), sel(f))
+                                                for i, z in enumerate(chunk))
+        ok, data, errs, drop = cf_gql_opt(sess, q, opt)
+        viewer = (data or {}).get("viewer") or {}
+        got = {z["id"]: (viewer.get("z%d" % i) or [None])[0] for i, z in enumerate(chunk)}
+        if not ok and len(chunk) > 1 and not any(got.values()):
+            res = {}
+            for z in chunk:   # one zone's error (e.g. a plan without this dataset) fails the whole query
+                r1, d1 = run([z])
+                res.update(r1)
+                drop = drop + d1
+            return res, drop
+        return {zid: (zd, [] if ok or zd else errs) for zid, zd in got.items()}, drop
+    out, dropped = {}, set()
+    chunks = [zones[i:i + chunk] for i in range(0, len(zones), chunk)]
+    if chunks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(chunks))) as ex:
+            for res, drop in ex.map(run, chunks):
+                out.update(res)
+                dropped.update(drop)
+    return out, sorted(dropped)
+
+
+def cf_each(items, fn, workers=8):
+    """fn(item) for each item in parallel; an item whose call fails yields {'error': ...}."""
+    def safe(x):
+        try:
+            return fn(x)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            return {"error": "request failed: %s" % getattr(e, "reason", e)}
+    if not items:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
+        return list(ex.map(safe, items))
+
+
+def cf_load(sess):
+    """Zones and accounts the token can see, kept in the session for zone pickers and account-level lookups."""
+    items, err, trunc = cf_list(sess, "/zones", per_page=50, max_pages=40)
+    sess["zones"] = [{"id": z["id"], "name": str(z.get("name") or "").lower(), "status": z.get("status", ""),
+                      "plan": (z.get("plan") or {}).get("name", ""), "account": (z.get("account") or {}).get("id", "")}
+                     for z in items if CF_ID_RE.match(str(z.get("id") or ""))]
+    accts, _, _ = cf_list(sess, "/accounts", per_page=50, max_pages=5)
+    names = {(z.get("account") or {}).get("id"): (z.get("account") or {}).get("name") for z in items}
+    names.update({a.get("id"): a.get("name") for a in accts})
+    sess["accounts"] = {k: str(v or k) for k, v in names.items() if CF_ID_RE.match(str(k or ""))}
+    return err or ("only the first 2000 zones were loaded" if trunc else "")
+
+
+def cf_zones(sess, z, allow_all=True):
+    """Zones for a lookup: blank / 'all' = every zone (capped), else a zone name or ID, or a hostname in a zone."""
+    z = str(z or "").strip().lower().rstrip(".")
+    zones = sess.get("zones") or []
+    if z in ("", "all", "all zones", "*"):
+        if not allow_all:
+            raise ValueError("choose a zone for this lookup")
+        if not zones:
+            raise ValueError("the token can see no zones (it needs Zone Read)")
+        return zones[:CF_MAX_ZONES]
+    for x in zones:
+        if z in (x["id"], x["name"]):
+            return [x]
+    best = cf_zone_of_host(sess, z)
+    if best:
+        return [best]
+    raise ValueError("zone %s is not visible to this token" % z)
+
+
+def cf_zone_of_host(sess, host):
+    host = host.lower().rstrip(".")
+    cands = [x for x in sess.get("zones") or [] if host == x["name"] or host.endswith("." + x["name"])]
+    return max(cands, key=lambda x: len(x["name"])) if cands else None
+
+
+def cf_accounts(sess, zones=None):
+    if sess.get("account"):
+        return [sess["account"]]
+    ids = list(dict.fromkeys(z["account"] for z in zones or sess.get("zones") or [] if z.get("account")))
+    return ids or list(sess.get("accounts") or {})
+
+
+def cf_acct_name(sess, a):
+    return "account %s" % (sess.get("accounts") or {}).get(a, a)
+
+
+def cf_scope(sess, zones):
+    allz = sess.get("zones") or []
+    if len(zones) == 1 and len(allz) != 1:
+        return "Zone: %s." % zones[0]["name"]
+    return "All %d zone(s) visible to the token%s." % (len(zones), "" if len(zones) == len(allz) else
+                                                       " (first %d of %d; choose a zone for the rest)" %
+                                                       (len(zones), len(allz)))
+
+
+def cf_window(b):
+    """(since, until, text) as ISO UTC strings, from the time range or custom From / To entered in UTC+3."""
+    def parse(v, label):
+        try:
+            d = datetime.datetime.strptime(v, "%Y-%m-%d %H:%M")
+        except ValueError:
+            raise ValueError("%s must look like 2026-11-01 14:30 (UTC+3)" % label)
+        return d.replace(tzinfo=CF_TZ).astimezone(datetime.timezone.utc)
+    s, u = str(b.get("since") or "").strip(), str(b.get("until") or "").strip()
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    if s or u:
+        if not s:
+            raise ValueError("enter a custom From time too (or clear both)")
+        since, until = parse(s, "From"), parse(u, "To") if u else now
+        if since >= until:
+            raise ValueError("From must be before To")
+    else:
+        w = str(b.get("within") or "last 24 hours").strip().lower()
+        if w not in CF_WITHIN:
+            raise ValueError("invalid time range")
+        since, until = now - datetime.timedelta(seconds=CF_WITHIN[w]), now
+    iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return iso(since), iso(until), "%s to %s (UTC+3)" % (utc3(iso(since)), utc3(iso(until)))
+
+
+def cf_f5_within(b):
+    """The F5 ASM time range closest to the Cloudflare one (F5 lookups go back at most a day)."""
+    w = str(b.get("within") or "").strip().lower()
+    return w if not b.get("since") and w in LOOKBACK else "any time"
+
+
+def cf_text(v, label):
+    v = str(v or "").strip()
+    if v and not CF_TEXT_RE.match(v):
+        raise ValueError("%s has characters that are not allowed (no quotes or backslashes)" % label)
+    return v
+
+
+def cf_lit(filters):
+    """GraphQL input-object literal; values are JSON-encoded, so they cannot break out of the string."""
+    return "{" + ",".join("%s:%s" % (k, json.dumps(v)) for k, v in filters.items() if v not in (None, "")) + "}"
+
+
+def cf_filters(b, kind, since, until):
+    """GraphQL filter from the form. kind 'ev' = firewallEventsAdaptive*, 'http' = httpRequestsAdaptive*."""
+    f = {"datetime_geq": since, "datetime_leq": until}
+    if str(b.get("ip") or "").strip():
+        f["clientIP"] = str(parse_ip(b.get("ip"), "client IP"))
+    host = str(b.get("host") or "").strip().lower()
+    if host:
+        if not CF_HOSTNAME_RE.match(host):
+            raise ValueError("hostname has characters that are not allowed (letters, digits, . - _ * only)")
+        f["clientRequestHTTPHost_like" if "*" in host else "clientRequestHTTPHost"] = host.replace("*", "%")
+    path = cf_text(b.get("path"), "path")
+    if path:
+        f["clientRequestPath_like"] = "%" + path + "%"
+    ray = str(b.get("ray") or "").strip()
+    if ray:
+        m = CF_RAY_RE.match(ray)
+        if not m:
+            raise ValueError("Ray ID must be 16 hex characters, optionally with the -ABC colo suffix")
+        f["rayName"] = m.group(1).lower()
+    ua = cf_text(b.get("ua"), "user agent")
+    if ua:
+        f["userAgent_like"] = "%" + ua + "%"
+    cc = str(b.get("country") or "").strip().upper()
+    if cc:
+        if not re.fullmatch(r"[A-Z][A-Z0-9]", cc):
+            raise ValueError("country must be a 2-letter code, e.g. US")
+        f["clientCountryName"] = cc
+    asn = re.sub(r"(?i)^AS", "", str(b.get("asn") or "").strip())
+    if asn:
+        if not asn.isdigit():
+            raise ValueError("ASN must be a number, e.g. 13335 or AS13335")
+        f["clientAsn"] = asn
+    method = str(b.get("method") or "").strip().upper()
+    if method:
+        if not re.fullmatch(r"[A-Z]{3,10}", method):
+            raise ValueError("invalid HTTP method")
+        f["clientRequestHTTPMethodName"] = method
+    for key, ev, http_ in (("action", "action", "securityAction"), ("source", "source", "securitySource")):
+        v = str(b.get(key) or "").strip()
+        if v:
+            if not CF_WORD_RE.match(v):
+                raise ValueError("invalid " + key)
+            f[ev if kind == "ev" else http_] = v
+    if kind == "ev" and str(b.get("rule") or "").strip():
+        rule = str(b.get("rule")).strip().lower()
+        if not CF_WORD_RE.match(rule):
+            raise ValueError("invalid rule ID")
+        f["ruleId"] = rule
+    if kind == "http":
+        st = str(b.get("status") or "").strip()
+        if st in CF_STATUS:
+            f["edgeResponseStatus_geq"], f["edgeResponseStatus_lt"] = CF_STATUS[st]
+        elif re.fullmatch(r"[1-5]\d\d", st):
+            f["edgeResponseStatus"] = int(st)
+        elif st:
+            raise ValueError("status must be a class (2xx, 5xx, ...) or a code such as 503")
+        cache = str(b.get("cache") or "").strip().lower()
+        if cache:
+            if not CF_WORD_RE.match(cache):
+                raise ValueError("invalid cache status")
+            f["cacheStatus"] = cache
+    return f
+
+
+def cf_time_dim(since, until):
+    span = to_epoch(until) - to_epoch(since)
+    return "datetimeFiveMinutes" if span <= 21600 else "datetimeHour" if span <= 604800 else "date"
+
+
+def cf_q_events(lit, limit):
+    return lambda f: "firewallEventsAdaptive(filter:%s,limit:%d,orderBy:[datetime_DESC]){datetime %s}" % (
+        lit, limit, " ".join(f))
+
+
+def cf_q_requests(lit, limit):
+    return lambda f: "httpRequestsAdaptive(filter:%s,limit:%d,orderBy:[datetime_DESC]){datetime %s}" % (
+        lit, limit, " ".join(f))
+
+
+def cf_q_groups(dataset, lit, limit, req, order="count_DESC"):
+    """Grouped counts ('g') plus the overall count for the same filter ('t'). Optional tokens with '{' are
+    metrics, the others dimensions."""
+    return lambda f: "g:%s(filter:%s,limit:%d,orderBy:[%s]){count %s dimensions{%s}} t:%s(filter:%s,limit:1){count}" % (
+        dataset, lit, limit, order, " ".join(m for m in f if "{" in m),
+        " ".join(list(req) + [d for d in f if "{" not in d]), dataset, lit)
+
+
+def cf_gql_notes(zones, res, dropped):
+    notes, errs = [], []
+    for z in zones:
+        e = res.get(z["id"], (None, []))[1]
+        if e:
+            errs.append("%s: %s" % (z["name"], "; ".join(e)[:300]))
+    if errs:
+        notes.append("%d zone(s) returned errors: %s%s" % (len(errs), " | ".join(errs[:4]), " …" if len(errs) > 4 else ""))
+        if any(re.search(r"(?i)time ?range|too far|older|exceed|limit|quota|authoriz|access|plan|permission", x) for x in errs):
+            notes.append("Cloudflare limits which datasets, how far back and how wide one query can be by plan, and the "
+                         "token needs Analytics Read. Try a shorter time range or a single zone.")
+    if dropped:
+        notes.append("Not offered for this account / plan, so left out: %s." % ", ".join(dropped))
+    return notes
+
+
+def cf_result(t0, request, label, kind, summary, data):
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": request,
+            "verdict": {"label": label, "kind": kind}, "summary": [s for s in summary if s], "data": data}
+
+
+def cf_url(e):
+    q = str(e.get("clientRequestQuery") or "")
+    return str(e.get("clientRequestPath") or "") + (q if not q or q.startswith("?") else "?" + q)
+
+
+def cf_cc_asn(e):
+    return " ".join(str(x) for x in (e.get("clientCountryName"), ("AS%s" % e["clientAsn"]) if e.get("clientAsn") else "",
+                                     e.get("clientASNDescription")) if x)
+
+
+def cf_ev_row(z, e):
+    return {"time": utc3(e.get("datetime")), "cf_zone": z["name"], "action": e.get("action", ""),
+            "source": e.get("source", ""), "rule_id": e.get("ruleId", ""), "description": e.get("description", ""),
+            "client_ip": e.get("clientIP", ""), "country_asn": cf_cc_asn(e),
+            "method": e.get("clientRequestHTTPMethodName", ""), "host": e.get("clientRequestHTTPHost", ""),
+            "url": cf_url(e), "edge_origin_status": "/".join(str(e[k]) for k in ("edgeResponseStatus", "originResponseStatus")
+                                                              if e.get(k)),
+            "colo": e.get("edgeColoName", ""), "ray_id": e.get("rayName", ""), "ruleset_id": e.get("rulesetId", ""),
+            "user_agent": e.get("userAgent", "")}
+
+
+def cf_rq_row(z, e):
+    sec = "/".join(str(e[k]) for k in ("securityAction", "securitySource") if e.get(k) and e[k] != "unknown")
+    scores = ", ".join("%s %s" % (lbl, e[k]) for lbl, k in (("bot", "botScore"), ("WAF attack", "wafAttackScore"))
+                       if e.get(k) not in (None, "", 0))
+    return {"time": utc3(e.get("datetime")), "cf_zone": z["name"], "client_ip": e.get("clientIP", ""),
+            "country_asn": cf_cc_asn(e), "method": e.get("clientRequestHTTPMethodName", ""),
+            "host": e.get("clientRequestHTTPHost", ""), "url": cf_url(e), "edge_status": e.get("edgeResponseStatus", ""),
+            "origin_status": e.get("originResponseStatus") or "", "cache": e.get("cacheStatus", ""), "security": sec,
+            "ttfb_ms": e.get("edgeTimeToFirstByteMs", ""), "origin_ms": e.get("originResponseDurationMs", ""),
+            "scores": scores, "tls": e.get("clientSSLProtocol", ""), "http_version": e.get("clientRequestHTTPProtocol", ""),
+            "colo": e.get("coloCode", ""), "origin_ip": e.get("originIP", ""), "ray_id": e.get("rayName", ""),
+            "user_agent": e.get("userAgent", "")}
+
+
+def cf_rows(zones, res, dataset, rowfn, limit):
+    rows = []
+    for z in zones:
+        for e in (res.get(z["id"], (None, []))[0] or {}).get(dataset) or []:
+            rows.append((str(e.get("datetime") or ""), rowfn(z, e)))
+    return [r for _, r in sorted(rows, key=lambda x: x[0], reverse=True)][:limit]
+
+
+def cf_merge(zones, res, limit, time_dim):
+    """Merge grouped counts ('g') across zones -> (rows, overall count from 't')."""
+    acc, total = {}, 0
+    for z in zones:
+        zd = res.get(z["id"], (None, []))[0] or {}
+        total += sum(int(t.get("count") or 0) for t in zd.get("t") or [])
+        for g in zd.get("g") or []:
+            d = g.get("dimensions") or {}
+            a = acc.setdefault(tuple(sorted((k, str(v)) for k, v in d.items())),
+                               {"d": d, "n": 0, "bytes": 0, "ttfb": 0.0, "orig": 0.0, "zones": collections.Counter()})
+            n = int(g.get("count") or 0)
+            a["n"] += n
+            a["zones"][z["name"]] += n
+            a["bytes"] += int((g.get("sum") or {}).get("edgeResponseBytes") or 0)
+            av = g.get("avg") or {}
+            a["ttfb"] += float(av.get("edgeTimeToFirstByteMs") or 0) * n
+            a["orig"] += float(av.get("originResponseDurationMs") or 0) * n
+    items = sorted(acc.values(), key=(lambda a: [str(v) for v in a["d"].values()]) if time_dim else (lambda a: -a["n"]))
+    rows = []
+    for a in items if time_dim else items[:limit]:
+        r = {"cf_zone": ", ".join(k for k, _ in a["zones"].most_common(3)) + (" …" if len(a["zones"]) > 3 else "")}
+        for k, v in a["d"].items():
+            r[CF_COL.get(k, k)] = utc3(v) if k.startswith("datetime") else v
+        r["count"] = a["n"]
+        r["share"] = "%.1f%%" % (100.0 * a["n"] / total) if total else ""
+        if a["bytes"]:
+            r["bytes"] = a["bytes"]
+        if a["ttfb"] and a["n"]:
+            r["avg_ttfb_ms"] = round(a["ttfb"] / a["n"])
+        if a["orig"] and a["n"]:
+            r["avg_origin_ms"] = round(a["orig"] / a["n"])
+        rows.append(r)
+    return rows, total
+
+
+def cf_edge_nets(sess):
+    if not CF_EDGE.get("nets"):
+        st, ok, d = cf_get(sess, "/ips")
+        r = (d.get("result") or {}) if ok else {}
+        CF_EDGE["nets"] = [ipaddress.ip_network(n) for n in (r.get("ipv4_cidrs") or []) + (r.get("ipv6_cidrs") or [])]
+    return CF_EDGE["nets"]
+
+
+def cf_f5_check(b, kind, value):
+    """F5 ASM lookup on the F5 device chosen for cross-checks -> (rows, summary lines, verdict label)."""
+    fid = b.get("f5")
+    if not fid:
+        return None, [], ""
+    f5 = SESSIONS.get(fid)
+    if not f5 or f5["vendor"] != "f5":
+        return [], ["F5 cross-check skipped: that F5 device is no longer connected."], ""
+    try:
+        if kind == "ray":   # Cloudflare forwards the Ray ID to the origin in the CF-Ray header
+            r = f5_asm_by_header(f5, {"header_name": "CF-Ray", "header_value": value, "within": cf_f5_within(b),
+                                      "top": 10, "scan": 2000}, time.time())
+        else:
+            r = do_f5_asm({"id": fid, "mode": "search", "header_ip": value, "top": 50, "within": cf_f5_within(b)})
+    except (ValueError, urllib.error.URLError, OSError) as e:
+        r = {"ok": False, "error": str(getattr(e, "reason", e))}
+    if not r.get("ok"):
+        return [], ["F5 %s cross-check failed: %s" % (f5["name"], r.get("error"))], ""
+    label = (r.get("verdict") or {}).get("label", "")
+    return ((r.get("data") or {}).get("requests") or [],
+            ["F5 %s (ASM, %s): %s" % (f5["name"], cf_f5_within(b), label)] +
+            ["F5: " + s for s in (r.get("summary") or [])[:3]], label)
+
+
+def cf_sev_verdict(findings, ok_label):
+    findings.sort(key=lambda f: SEV_ORDER.get(f["severity"], 9))
+    counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEV_ORDER}
+    label = ", ".join("%d %s" % (counts[s], s.upper()) for s in ("high", "medium", "low") if counts[s])
+    return label or ok_label, "bad" if counts["high"] else "warn" if counts["medium"] else "ok"
+
+
+# ---- Cloudflare configuration helpers ------------------------------------------
+def cf_zone_rules(sess, where, base, cache):
+    """Rules of the non-managed rulesets at base (/zones/<id> or /accounts/<id>) -> (rules, errors)."""
+    st, ok, d = cf_get(sess, base + "/rulesets")
+    if not ok:
+        return [], ["%s rulesets: %s" % (where, cf_errtext(st, d))]
+    out, errs = [], []
+    for rs in d.get("result") or []:
+        if rs.get("kind") == "managed" or not CF_ID_RE.match(str(rs.get("id") or "")):
+            continue
+        st2, ok2, d2 = cf_get(sess, "%s/rulesets/%s" % (base, rs["id"]))
+        if not ok2:
+            errs.append("%s ruleset %s: %s" % (where, rs.get("name"), cf_errtext(st2, d2)))
+            continue
+        r = d2.get("result") or {}
+        cache[r.get("id")] = r
+        for pos, rule in enumerate(r.get("rules") or [], 1):
+            out.append({"where": where, "base": base, "phase": r.get("phase") or rs.get("phase") or "",
+                        "ruleset": r.get("name") or "", "ruleset_id": r.get("id"), "pos": pos, "rule": rule})
+    return out, errs
+
+
+def cf_all_rules(sess, zones, accounts=True):
+    """Rules of the given zones plus the account-level rulesets (WAF custom rulesets deployed from the account)."""
+    cache, rules, errs = {}, [], []
+    jobs = [(z["name"], "/zones/" + z["id"]) for z in zones]
+    if accounts:
+        jobs += [(cf_acct_name(sess, a), "/accounts/" + a) for a in cf_accounts(sess, zones)]
+    for res in cf_each(jobs, lambda j: cf_zone_rules(sess, j[0], j[1], cache)):
+        if isinstance(res, dict):
+            errs.append(res["error"])
+        else:
+            rules += res[0]
+            errs += res[1]
+    return rules, errs, cache
+
+
+def cf_rule_row(x, why=""):
+    r = x["rule"]
+    ap = r.get("action_parameters") or {}
+    det = []
+    if r.get("action") == "execute" and ap.get("id"):
+        det.append("runs ruleset %s" % ap["id"])
+        if ap.get("overrides"):
+            det.append("overrides: " + json.dumps(ap["overrides"])[:300])
+    elif ap:
+        det.append(json.dumps(ap)[:300])
+    rl = r.get("ratelimit")
+    if rl:
+        det.append("rate limit %s requests / %ss counted by %s, mitigation %ss" % (
+            rl.get("requests_per_period"), rl.get("period"), ", ".join(rl.get("characteristics") or []),
+            rl.get("mitigation_timeout")))
+    return {"cf_zone": x["where"], "phase": x["phase"], "ruleset": x["ruleset"], "position": x["pos"],
+            "rule_id": r.get("id", ""), "description": r.get("description", ""), "action": r.get("action", ""),
+            "enabled": r.get("enabled", True), "expression": r.get("expression", ""), "details": "; ".join(det),
+            "matched_on": why, "last_updated": utc3(r.get("last_updated", ""))}
+
+
+def cf_rule_match(x, term="", ip=None, lists=()):
+    r = x["rule"]
+    expr = str(r.get("expression") or "")
+    if ip is not None:
+        for tok in CF_IPTOK_RE.findall(expr):
+            if ip_in_spec(ip, tok):
+                return "IP %s" % ip if tok == str(ip) else "%s contains %s" % (tok, ip)
+        for name in lists:
+            if re.search(r"\$%s\b" % re.escape(name), expr):
+                return "list $%s (contains %s)" % (name, ip)
+        return ""
+    return "text '%s'" % term if term and term.lower() in json.dumps(r).lower() else ""
+
+
+def cf_dns_row(z, r):
+    return {"cf_zone": z["name"], "name": r.get("name", ""), "type": r.get("type", ""), "content": r.get("content", ""),
+            "proxied": r.get("proxied", False), "ttl": "auto" if r.get("ttl") == 1 else r.get("ttl", ""),
+            "comment": r.get("comment") or "", "tags": r.get("tags") or [], "modified": utc3(r.get("modified_on", ""))}
+
+
+def cf_host_match(pattern, host):
+    """Certificate-style match: '*.example.com' covers exactly one label."""
+    p = str(pattern or "").lower()
+    if p.startswith("*."):
+        return host.endswith(p[1:]) and host.count(".") == p.count(".")
+    return p == host
+
+
+def cf_route_match(pattern, host):
+    """Worker route / page rule target ('*example.com/api/*') -> True if its host part can match host."""
+    hp = re.sub(r"^https?://", "", str(pattern or "").lower()).split("/", 1)[0].split(":", 1)[0]
+    return bool(hp) and fnmatch_host(hp, host)
+
+
+def fnmatch_host(pat, host):
+    return re.fullmatch(".*".join(re.escape(p) for p in pat.split("*")), host) is not None
+
+
+def cf_zone_settings(sess, z):
+    st, ok, d = cf_get(sess, "/zones/%s/settings" % z["id"])
+    if not ok:
+        return None, cf_errtext(st, d)
+    return {s.get("id"): s.get("value") for s in d.get("result") or [] if isinstance(s, dict)}, ""
+
+
+def cf_tci_managed(sess, z):
+    """True / False for the 'Add True-Client-IP headers' Managed Transform; None if it cannot be read."""
+    st, ok, d = cf_get(sess, "/zones/%s/managed_headers" % z["id"])
+    if not ok:
+        return None
+    for h in (d.get("result") or {}).get("managed_request_headers") or []:
+        if h.get("id") == "add_true_client_ip_headers":
+            return bool(h.get("enabled"))
+    return None
+
+
+def cf_settings_findings(z, s, tci_managed):
+    f, n = [], z["name"]
+    ssl_ = s.get("ssl")
+    if ssl_ in ("off", "flexible"):
+        f.append(finding("high", n, "SSL/TLS mode is '%s': Cloudflare to origin is not encrypted" % ssl_, "Use Full (strict)."))
+    elif ssl_ == "full":
+        f.append(finding("medium", n, "SSL/TLS mode is Full: the origin certificate is not validated", "Use Full (strict)."))
+    if str(s.get("min_tls_version") or "") in ("1.0", "1.1"):
+        f.append(finding("medium", n, "Minimum TLS version is %s" % s["min_tls_version"], "Set 1.2 or higher."))
+    if s.get("tls_1_3") == "off":
+        f.append(finding("low", n, "TLS 1.3 is off"))
+    if s.get("always_use_https") == "off":
+        f.append(finding("low", n, "Always Use HTTPS is off", "Plain-HTTP requests are served instead of redirected."))
+    if s.get("security_level") in ("off", "essentially_off"):
+        f.append(finding("medium", n, "Security level is '%s'" % s["security_level"]))
+    elif s.get("security_level") == "under_attack":
+        f.append(finding("info", n, "Under Attack mode is on", "Every visitor gets a challenge page."))
+    if s.get("browser_check") == "off":
+        f.append(finding("low", n, "Browser Integrity Check is off"))
+    if s.get("development_mode") == "on":
+        f.append(finding("medium", n, "Development mode is on", "The cache is bypassed for the whole zone."))
+    if s.get("0rtt") == "on":
+        f.append(finding("low", n, "0-RTT is on", "Early data can be replayed; keep it off for state-changing apps."))
+    if s.get("true_client_ip_header") != "on" and not tci_managed:
+        f.append(finding("medium", n, "True-Client-IP header is not added to requests sent to the origin",
+                         "The F5 sees Cloudflare's edge as the client; ASM True-Client-IP lookups need this (Enterprise "
+                         "setting, or the 'Add True-Client-IP headers' Managed Transform)."))
+    return f
+
+
+def cf_cert_rows(sess, z):
+    rows, errs = [], []
+    packs, err, _ = cf_list(sess, "/zones/%s/ssl/certificate_packs?status=all" % z["id"], per_page=50, max_pages=5)
+    if err:
+        errs.append("%s certificate packs: %s" % (z["name"], err))
+    for p in packs:
+        exps = sorted(str(c.get("expires_on")) for c in p.get("certificates") or [] if c.get("expires_on"))
+        exp = exps[0] if exps else str(p.get("expires_on") or "")
+        rows.append({"cf_zone": z["name"], "kind": "edge (%s)" % p.get("type", ""), "hosts": p.get("hosts") or [],
+                     "status": p.get("status", ""), "authority": p.get("certificate_authority", ""),
+                     "expires": utc3(exp), "days_left": days_from_now(to_epoch(exp)) if to_epoch(exp) else ""})
+    custom, err, _ = cf_list(sess, "/zones/%s/custom_certificates" % z["id"], per_page=50, max_pages=2)
+    if err:
+        errs.append("%s custom certificates: %s" % (z["name"], err))
+    for c in custom:
+        exp = str(c.get("expires_on") or "")
+        rows.append({"cf_zone": z["name"], "kind": "custom", "hosts": c.get("hosts") or [], "status": c.get("status", ""),
+                     "authority": c.get("issuer", ""), "expires": utc3(exp),
+                     "days_left": days_from_now(to_epoch(exp)) if to_epoch(exp) else ""})
+    return rows, errs
+
+
+def cf_cert_findings(rows, warn_days):
+    f = []
+    for c in rows:
+        obj = "%s %s (%s)" % (c["cf_zone"], c["kind"], ", ".join(c["hosts"][:3]))
+        d = c["days_left"]
+        if c["status"] not in ("active", ""):
+            f.append(finding("medium", obj, "Certificate status is '%s'" % c["status"]))
+        if d != "" and d < 0:
+            f.append(finding("high", obj, "Certificate expired %d day(s) ago" % -d))
+        elif d != "" and c["kind"] == "custom" and d <= warn_days:
+            f.append(finding("high" if d <= 14 else "medium", obj, "Custom certificate expires in %d day(s)" % d,
+                             "Custom certificates are not renewed by Cloudflare."))
+        elif d != "" and d <= 7:
+            f.append(finding("medium", obj, "Edge certificate expires in %d day(s)" % d, "Check that renewal / DCV is not stuck."))
+    return f
+
+
+def cf_access_rules(sess, where, base, ip, extra=()):
+    """IP Access Rules at base that match the IP exactly, by range, or by the given (target, value) pairs."""
+    rows, errs, seen = [], [], set()
+    queries = [("ip6" if ip.version == 6 else "ip", str(ip))] + list(extra)
+    for tgt, val in queries:
+        items, err, _ = cf_list(sess, "%s/firewall/access_rules/rules?configuration.target=%s&configuration.value=%s"
+                                % (base, tgt, urllib.parse.quote(val)), per_page=100, max_pages=2)
+        if err:
+            errs.append("%s access rules: %s" % (where, err))
+            return rows, errs
+        rows += [(r, "exact") for r in items]
+    ranges, err, trunc = cf_list(sess, base + "/firewall/access_rules/rules?configuration.target=ip_range",
+                                 per_page=100, max_pages=30)
+    if err:
+        errs.append("%s access rules (ranges): %s" % (where, err))
+    rows += [(r, "range") for r in ranges if ip_in_spec(ip, str((r.get("configuration") or {}).get("value") or ""))]
+    out = []
+    for r, how in rows:
+        if r.get("id") in seen:
+            continue
+        seen.add(r.get("id"))
+        c = r.get("configuration") or {}
+        out.append({"cf_zone": where, "applies_to": (r.get("scope") or {}).get("type", ""), "mode": r.get("mode", ""),
+                    "target": c.get("target", ""), "value": c.get("value", ""), "notes": r.get("notes", ""),
+                    "rule_id": r.get("id", ""), "modified": utc3(r.get("modified_on", ""))})
+    if trunc:
+        errs.append("%s: more than 3000 IP range access rules; only the first 3000 were checked." % where)
+    return out, errs
+
+
+def cf_ip_lists(sess, acct, ip, deadline):
+    """Account IP lists that contain the IP -> (rows, list names, errors)."""
+    st, ok, d = cf_get(sess, "/accounts/%s/rules/lists" % acct)
+    if not ok:
+        return [], [], ["%s lists: %s" % (cf_acct_name(sess, acct), cf_errtext(st, d))]
+    rows, names, errs = [], [], []
+    for lst in d.get("result") or []:
+        if lst.get("kind") != "ip" or not CF_ID_RE.match(str(lst.get("id") or "")):
+            continue
+        cursor, pages = "", 0
+        while pages < 40 and time.time() < deadline:
+            st2, ok2, d2 = cf_get(sess, "/accounts/%s/rules/lists/%s/items?per_page=500%s" % (
+                acct, lst["id"], "&cursor=" + urllib.parse.quote(cursor) if cursor else ""))
+            if not ok2:
+                errs.append("list %s: %s" % (lst.get("name"), cf_errtext(st2, d2)))
+                break
+            for it in d2.get("result") or []:
+                if ip_in_spec(ip, str(it.get("ip") or "")):
+                    rows.append({"account": cf_acct_name(sess, acct)[8:], "list": lst.get("name", ""), "item": it.get("ip"),
+                                 "comment": it.get("comment", ""), "added": utc3(it.get("created_on", "")),
+                                 "list_items": lst.get("num_items", "")})
+                    names.append(lst.get("name", ""))
+            cursor = ((d2.get("result_info") or {}).get("cursors") or {}).get("after") or ""
+            pages += 1
+            if not cursor:
+                break
+        if cursor:
+            errs.append("list %s was only partly checked (size / time limit)." % lst.get("name"))
+    return rows, list(dict.fromkeys(names)), errs
+
+
+# ---- Cloudflare lookups ---------------------------------------------------------
+def cf_m_events(sess, b, t0):
+    zones = cf_zones(sess, b.get("zone"))
+    since, until, span = cf_window(b)
+    flt = cf_filters(b, "ev", since, until)
+    limit = num(b.get("top"), 1, 1000, 100, "max rows")
+    audit(sess, "Cloudflare security events %s" % json.dumps({k: v for k, v in flt.items() if "datetime" not in k}))
+    res, dropped = cf_gql_zones(sess, zones, cf_q_events(cf_lit(flt), limit), CF_EV_FIELDS)
+    rows = cf_rows(zones, res, "firewallEventsAdaptive", cf_ev_row, limit)
+    acts = collections.Counter(r["action"] for r in rows)
+    label = "%d SECURITY EVENT(S)" % len(rows) + (" · " + ", ".join("%s %d" % kv for kv in acts.most_common(4)) if rows else "")
+    kind = "bad" if any(a in CF_BLOCK for a in acts) else "warn" if rows else "info"
+    return cf_result(t0, "GraphQL firewallEventsAdaptive", label, kind,
+                     [cf_scope(sess, zones), "Time range: " + span] + cf_gql_notes(zones, res, dropped) +
+                     (["Showing the newest %d; narrow the filters or raise Max rows for more." % limit] if len(rows) >= limit else []),
+                     {"events": rows})
+
+
+def cf_m_groups(sess, b, t0, kind):
+    zones = cf_zones(sess, b.get("zone"))
+    since, until, span = cf_window(b)
+    flt = cf_filters(b, kind, since, until)
+    dims = CF_DIM_EV if kind == "ev" else CF_DIM_HTTP
+    by = str(b.get("by") or "").strip()
+    if by not in dims:
+        raise ValueError("choose what to group by")
+    req, opt = dims[by]
+    time_dim = req == ("@time",)
+    if time_dim:
+        req = (cf_time_dim(since, until),)
+    top = num(b.get("top"), 1, 500, 20, "top N")
+    dataset = "firewallEventsAdaptiveGroups" if kind == "ev" else "httpRequestsAdaptiveGroups"
+    audit(sess, "Cloudflare %s by %s" % (dataset, by))
+    res, dropped = cf_gql_zones(sess, zones, cf_q_groups(dataset, cf_lit(flt), 5000 if time_dim else top, req,
+                                                         req[0] + "_ASC" if time_dim else "count_DESC"),
+                                tuple(opt) + (CF_HTTP_METRICS if kind == "http" else ()))
+    rows, total = cf_merge(zones, res, top, time_dim)
+    what = "SECURITY EVENTS" if kind == "ev" else "REQUESTS"
+    notes = [cf_scope(sess, zones), "Time range: " + span,
+             "Total %s for these filters: %d; 'share' is each row's part of that total." % (what.lower(), total)]
+    if kind == "http":
+        notes.append("Counts are Cloudflare's sample-adjusted estimates (adaptive sampling).")
+        errs = sum(r["count"] for r in rows if str(r.get("edge_status", "")).startswith("5"))
+        if errs and by in ("edge status", "edge + origin status") and total:
+            notes.append("5xx responses: %d (%.1f%% of all requests)." % (errs, 100.0 * errs / total))
+    if time_dim:
+        notes.append("Buckets: %s (UTC+3)." % {"datetimeFiveMinutes": "5 minutes", "datetimeHour": "1 hour",
+                                                "date": "1 day, UTC dates"}[req[0]])
+    return cf_result(t0, "GraphQL " + dataset, "%d %s · TOP %d BY %s" % (total, what, len(rows), by.upper()),
+                     "warn" if total else "info", notes + cf_gql_notes(zones, res, dropped),
+                     {("security_events_by_" if kind == "ev" else "requests_by_") + re.sub(r"\W+", "_", by.lower()): rows})
+
+
+def cf_m_requests(sess, b, t0):
+    zones = cf_zones(sess, b.get("zone"))
+    since, until, span = cf_window(b)
+    flt = cf_filters(b, "http", since, until)
+    limit = num(b.get("top"), 1, 1000, 100, "max rows")
+    audit(sess, "Cloudflare sampled requests %s" % json.dumps({k: v for k, v in flt.items() if "datetime" not in k}))
+    res, dropped = cf_gql_zones(sess, zones, cf_q_requests(cf_lit(flt), limit), CF_RQ_FIELDS)
+    rows = cf_rows(zones, res, "httpRequestsAdaptive", cf_rq_row, limit)
+    e5 = sum(1 for r in rows if str(r["edge_status"]).startswith("5"))
+    e4 = sum(1 for r in rows if str(r["edge_status"]).startswith("4"))
+    return cf_result(t0, "GraphQL httpRequestsAdaptive", "%d SAMPLED REQUEST(S)%s" % (
+                         len(rows), " · %d 5xx, %d 4xx" % (e5, e4) if e5 or e4 else ""),
+                     "bad" if e5 else "warn" if e4 else "ok" if rows else "info",
+                     [cf_scope(sess, zones), "Time range: " + span,
+                      "These are sampled requests (adaptive sampling), not every request; use Traffic summary for totals."]
+                     + cf_gql_notes(zones, res, dropped), {"requests": rows})
+
+
+def cf_m_ray(sess, b, t0):
+    m = CF_RAY_RE.match(str(b.get("ray") or "").strip())
+    if not m:
+        raise ValueError("Ray ID must be 16 hex characters, optionally with the -ABC colo suffix")
+    ray = m.group(1).lower()
+    zones = cf_zones(sess, b.get("zone"))
+    since, until, span = cf_window(b)
+    audit(sess, "Cloudflare Ray ID lookup " + ray)
+    lit = cf_lit({"datetime_geq": since, "datetime_leq": until, "rayName": ray})
+    res, dropped = cf_gql_zones(sess, zones, cf_q_events(lit, 50), CF_EV_FIELDS)
+    events = cf_rows(zones, res, "firewallEventsAdaptive", cf_ev_row, 50)[::-1]
+    res2, dropped2 = cf_gql_zones(sess, zones, cf_q_requests(lit, 5), CF_RQ_FIELDS)
+    reqs = cf_rows(zones, res2, "httpRequestsAdaptive", cf_rq_row, 5)
+    f5_rows, f5_notes, f5_label = cf_f5_check(b, "ray", ray)
+    blocks = [e for e in events if e["action"] in CF_BLOCK]
+    chall = [e for e in events if "challenge" in e["action"] and "solved" not in e["action"]]
+    f5_blocked = [r for r in f5_rows or [] if "block" in str(r.get("status", "")).lower()]
+    if blocks:
+        e = blocks[0]
+        label, kind = "BLOCKED AT CLOUDFLARE by %s rule %s%s" % (e["source"], e["rule_id"], " (%s)" % e["description"]
+                                                                if e["description"] else ""), "bad"
+    elif chall:
+        label, kind = "CHALLENGED AT CLOUDFLARE (%s, %s)" % (chall[0]["action"], chall[0]["source"]), "warn"
+    elif f5_blocked:
+        label, kind = "PASSED CLOUDFLARE, BLOCKED BY F5 ASM (support ID %s)" % f5_blocked[0].get("support_id"), "bad"
+    elif reqs:
+        r = reqs[0]
+        label = "PASSED CLOUDFLARE · edge HTTP %s, origin HTTP %s" % (r["edge_status"], r["origin_status"] or "-")
+        kind = "bad" if str(r["edge_status"]).startswith("5") else "warn" if str(r["edge_status"]).startswith("4") else "ok"
+    elif events:
+        label, kind = "LOGGED BY CLOUDFLARE (%s), NOT BLOCKED" % ", ".join(sorted({e["action"] for e in events})), "info"
+    elif f5_rows:
+        label, kind = "FOUND ON F5 ONLY (%s)" % f5_label, "warn"
+    else:
+        label, kind = "RAY ID %s NOT FOUND" % ray, "info"
+    notes = [cf_scope(sess, zones), "Time range: " + span] + f5_notes
+    if not events and not reqs:
+        notes.append("Security events exist only for requests a security feature acted on or logged, and sampled "
+                     "request data does not hold every request. Widen the time range, or pick the zone.")
+    if f5_rows is None:
+        notes.append("Tip: choose an F5 device under 'Cross-check on F5' to also find this request in the ASM log "
+                     "(Cloudflare sends the Ray ID to the origin in the CF-Ray header).")
+    return cf_result(t0, "GraphQL firewallEventsAdaptive + httpRequestsAdaptive (rayName %s)" % ray, label, kind,
+                     notes + cf_gql_notes(zones, res, sorted(set(dropped) | set(dropped2))),
+                     {"security_events": events, "request": reqs, "f5_asm_requests": f5_rows or []})
+
+
+def cf_m_ip(sess, b, t0):
+    ip = parse_ip(b.get("ip"), "IP address")
+    zones = cf_zones(sess, b.get("zone"))
+    since, until, span = cf_window(b)
+    audit(sess, "Cloudflare IP investigation %s" % ip)
+    notes, data, deadline = [cf_scope(sess, zones), "Events and traffic: " + span], {}, t0 + 110
+    if any(ip in n for n in cf_edge_nets(sess) if n.version == ip.version):
+        notes.insert(0, "%s is a Cloudflare edge address. On the F5 it shows as the device-seen client; the real "
+                        "client is in True-Client-IP / CF-Connecting-IP." % ip)
+    # Analytics: what Cloudflare did with this client, and what it requested.
+    lit = cf_lit({"datetime_geq": since, "datetime_leq": until, "clientIP": str(ip)})
+    res, dropped = cf_gql_zones(sess, zones, lambda f: cf_q_groups(
+        "firewallEventsAdaptiveGroups", lit, 50, ("action", "source", "clientRequestHTTPHost"))(()) + " " +
+        "e:" + cf_q_events(lit, 20)(f), CF_EV_FIELDS)
+    actions, _ = cf_merge(zones, res, 50, False)
+    events, extra = [], set()
+    for z in zones:
+        zd = res.get(z["id"], (None, []))[0] or {}
+        for e in zd.get("e") or []:
+            events.append((str(e.get("datetime") or ""), cf_ev_row(z, e)))
+            if e.get("clientAsn"):   # access rules can also target the client's ASN or country
+                extra.add(("asn", "AS%s" % e["clientAsn"]))
+            if e.get("clientCountryName"):
+                extra.add(("country", e["clientCountryName"]))
+    events = [r for _, r in sorted(events, key=lambda x: x[0], reverse=True)][:25]
+    res2, _ = cf_gql_zones(sess, zones, cf_q_groups("httpRequestsAdaptiveGroups", lit, 30,
+                                                    ("clientRequestHTTPHost", "edgeResponseStatus")))
+    traffic, total_req = cf_merge(zones, res2, 30, False)
+    data["security_actions"], data["latest_security_events"], data["traffic_by_host_status"] = actions, events, traffic
+    notes += cf_gql_notes(zones, res, dropped) + cf_gql_notes(zones, res2, [])
+    # Configuration: access rules, IP lists, rules and DNS records that involve the IP.
+    active = {r["cf_zone"] for r in events} | {k.strip() for r in actions + traffic for k in r["cf_zone"].split(",")}
+    cfg = [z for z in zones if z["name"] in active] or zones[:CF_MAX_CFG_ZONES]
+    if len(zones) > 1:
+        notes.append("Configuration was checked in %d zone(s)%s." % (len(cfg), " where this IP was active" if active
+                                                                      else " (the first ones; choose a zone for others)"))
+    extra = sorted(extra)
+    accts = cf_accounts(sess, cfg)
+    jobs = [(z["name"], "/zones/" + z["id"]) for z in cfg] + [(cf_acct_name(sess, a), "/accounts/" + a) for a in accts]
+    access, errs = [], []
+    for r in cf_each(jobs, lambda j: cf_access_rules(sess, j[0], j[1], ip, extra)):
+        if isinstance(r, dict):
+            errs.append(r["error"])
+        else:
+            access += r[0]
+            errs += r[1]
+    lists, lnames = [], []
+    for a in accts:
+        rows, names, e = cf_ip_lists(sess, a, ip, deadline)
+        lists, lnames, errs = lists + rows, lnames + names, errs + e
+    rules, rerrs, _ = cf_all_rules(sess, cfg)
+    hits = [cf_rule_row(x, why) for x in rules for why in [cf_rule_match(x, ip=ip, lists=lnames)] if why]
+    dns = []
+    for z, r in zip(zones, cf_each(zones, lambda z: cf_list(sess, "/zones/%s/dns_records?content=%s" % (
+            z["id"], urllib.parse.quote(str(ip))), per_page=100, max_pages=2))):
+        if isinstance(r, dict):
+            errs.append(r["error"])
+            continue
+        if r[1]:
+            errs.append("%s DNS: %s" % (z["name"], r[1]))
+        dns += [cf_dns_row(z, x) for x in r[0] if str(x.get("content")) == str(ip)]
+    data.update({"ip_access_rules": access, "ip_lists_containing_ip": lists, "rules_referencing_ip": hits,
+                 "dns_records_pointing_to_ip": dns})
+    errs += rerrs
+    if errs:
+        notes.append("Some configuration could not be read (token permission or plan): " + " | ".join(errs[:5]) +
+                     (" …" if len(errs) > 5 else ""))
+    f5_rows, f5_notes, _ = cf_f5_check(b, "ip", str(ip))
+    if f5_rows is not None:
+        data["f5_asm_requests_true_client_ip"] = f5_rows
+    notes += f5_notes
+    if dns:
+        notes.append("%s is the origin for %d DNS record(s); %d of them are proxied." % (
+            ip, len(dns), sum(1 for r in dns if r["proxied"])))
+    # Verdict
+    deny = [r for r in access if r["mode"] in ("block", "challenge", "js_challenge", "managed_challenge")]
+    allow = [r for r in access if r["mode"] == "whitelist"]
+    blocked = sum(r["count"] for r in actions if r.get("action") in CF_BLOCK)
+    challenged = sum(r["count"] for r in actions if "challenge" in str(r.get("action")) and "solved" not in str(r.get("action")))
+    parts, kind = [], "info"
+    if deny:
+        parts.append("IP ACCESS RULE: %s (%s)" % (deny[0]["mode"].upper(), deny[0]["cf_zone"]))
+        kind = "bad"
+    if blocked:
+        parts.append("BLOCKED %d TIME(S)" % blocked)
+        kind = "bad"
+    if challenged:
+        parts.append("CHALLENGED %d TIME(S)" % challenged)
+        kind = "bad" if kind == "bad" else "warn"
+    if allow:
+        parts.append("ALLOWLISTED by an IP Access Rule (%s)" % allow[0]["cf_zone"])
+    if lists:
+        parts.append("IN %d IP LIST(S)" % len(lists))
+    if hits:
+        parts.append("%d RULE(S) REFERENCE IT" % len(hits))
+    if not parts:
+        parts.append("%d REQUEST(S), NOTHING BLOCKED" % total_req if total_req else "NO ACTIVITY OR CONFIGURATION FOUND")
+        kind = "ok" if total_req else "info"
+    return cf_result(t0, "Cloudflare IP investigation %s" % ip, "%s · %s" % (ip, " · ".join(parts)), kind, notes, data)
+
+
+def cf_m_host(sess, b, t0):
+    host = str(b.get("host") or "").strip().lower().rstrip(".")
+    if not host or "*" in host or not CF_HOSTNAME_RE.match(host):
+        raise ValueError("enter a hostname, e.g. app.example.com")
+    zone = cf_zone_of_host(sess, host)
+    if not zone:
+        raise ValueError("no zone visible to this token covers %s" % host)
+    zid, zn = zone["id"], zone["name"]
+    since, until, span = cf_window(b)
+    warn_days = num(b.get("days"), 1, 365, 30, "certificate warning days")
+    audit(sess, "Cloudflare hostname investigation " + host)
+    notes = ["Zone: %s (%s, %s)." % (zn, zone.get("plan") or "plan unknown", zone.get("status") or "status unknown"),
+             "Traffic and events: " + span]
+    findings, data, errs = [], {}, []
+    recs, err, _ = cf_list(sess, "/zones/%s/dns_records?name=%s" % (zid, urllib.parse.quote(host)), per_page=100, max_pages=2)
+    if not recs and not err and host != zn:
+        wc = "*." + host.split(".", 1)[1]
+        recs, err, _ = cf_list(sess, "/zones/%s/dns_records?name=%s" % (zid, urllib.parse.quote(wc)), per_page=100, max_pages=2)
+        if recs:
+            notes.append("No record for %s itself; it is answered by the wildcard %s." % (host, wc))
+    if err:
+        errs.append("DNS: " + err)
+    data["dns_records"] = [cf_dns_row(zone, r) for r in recs]
+    if not recs and not err:
+        findings.append(finding("high", host, "No DNS record for this hostname in the zone",
+                                "Requests for it do not reach Cloudflare through this zone (unless a SaaS / Worker "
+                                "custom hostname serves it)."))
+    for r in recs:
+        if r.get("type") in ("A", "AAAA", "CNAME") and not r.get("proxied"):
+            findings.append(finding("medium", "%s %s" % (r.get("type"), r.get("name")),
+                                    "DNS-only (grey cloud): requests bypass Cloudflare security, and the origin %s is "
+                                    "public" % r.get("content")))
+    proxied = any(r.get("proxied") for r in recs)
+    s, err = cf_zone_settings(sess, zone)
+    if s:
+        findings += cf_settings_findings(zone, s, cf_tci_managed(sess, zone))
+    elif err:
+        errs.append("zone settings: " + err)
+    certs, cerrs = cf_cert_rows(sess, zone)
+    errs += cerrs
+    cov = [c for c in certs if any(cf_host_match(h, host) for h in c["hosts"])]
+    if proxied and not cerrs and not any(c["status"] == "active" for c in cov):
+        findings.append(finding("high", host, "No active edge certificate covers this hostname",
+                                "HTTPS visitors get a TLS handshake failure (e.g. a sub-subdomain that a "
+                                "*.%s certificate does not cover)." % zn))
+    findings += cf_cert_findings(cov, warn_days)
+    rules, rerrs, _ = cf_all_rules(sess, [zone])
+    errs += rerrs
+    data["rules_mentioning_host"] = [cf_rule_row(x, why) for x in rules for why in [cf_rule_match(x, host)] if why]
+    wide = sum(1 for x in rules if x["phase"] in CF_SEC_PHASES and x["rule"].get("enabled", True)
+               and "host" not in str(x["rule"].get("expression") or "") and x["base"].startswith("/zones/"))
+    if wide:
+        notes.append("%d enabled security rule(s) in the zone do not mention a hostname, so they also apply to %s "
+                     "(Search rules with the zone selected lists them)." % (wide, host))
+    st, ok, d = cf_get(sess, "/zones/%s/workers/routes" % zid)
+    if ok:
+        data["worker_routes"] = [{"pattern": r.get("pattern"), "worker": r.get("script") or "(none: route disables Workers)"}
+                                 for r in d.get("result") or [] if cf_route_match(r.get("pattern"), host)]
+    st, ok, d = cf_get(sess, "/zones/%s/pagerules" % zid)
+    if ok:
+        data["page_rules"] = [{"target": t.get("constraint", {}).get("value"), "status": p.get("status"),
+                               "priority": p.get("priority"), "actions": [a.get("id") for a in p.get("actions") or []]}
+                              for p in d.get("result") or [] for t in p.get("targets") or []
+                              if cf_route_match((t.get("constraint") or {}).get("value"), host)]
+    st, ok, d = cf_get(sess, "/zones/%s/load_balancers" % zid)
+    if ok:
+        data["load_balancers"] = [{"name": x.get("name"), "enabled": x.get("enabled"), "proxied": x.get("proxied"),
+                                   "steering": x.get("steering_policy"), "default_pools": x.get("default_pools"),
+                                   "fallback_pool": x.get("fallback_pool")}
+                                  for x in d.get("result") or [] if str(x.get("name", "")).lower() == host]
+    if data.get("load_balancers"):
+        notes.append("This hostname is a Cloudflare load balancer: run 'Load balancers & health' for origin health.")
+    flt = cf_lit({"datetime_geq": since, "datetime_leq": until, "clientRequestHTTPHost": host})
+    res, _ = cf_gql_zones(sess, [zone], cf_q_groups("httpRequestsAdaptiveGroups", flt, 20,
+                                                    ("edgeResponseStatus", "originResponseStatus")))
+    traffic, total = cf_merge([zone], res, 20, False)
+    res2, _ = cf_gql_zones(sess, [zone], cf_q_groups("firewallEventsAdaptiveGroups", flt, 20, ("action", "source")))
+    sec, sec_total = cf_merge([zone], res2, 20, False)
+    data["traffic_by_status"], data["security_events_by_action"] = traffic, sec
+    notes += cf_gql_notes([zone], res, []) + cf_gql_notes([zone], res2, [])
+    if total:
+        e5 = sum(r["count"] for r in traffic if str(r.get("edge_status", "")).startswith("5"))
+        o52 = sum(r["count"] for r in traffic if 520 <= int(r.get("edge_status") or 0) <= 527)
+        notes.append("%d request(s), %d security event(s) in the range; %.1f%% ended in 5xx." % (
+            total, sec_total, 100.0 * e5 / total))
+        if e5 * 20 > total:
+            findings.append(finding("medium", host, "%.1f%% of requests ended in a 5xx error" % (100.0 * e5 / total)))
+        if o52:
+            findings.append(finding("medium", host, "%d request(s) got a Cloudflare 52x origin error" % o52,
+                                    "Cloudflare could not connect to, or got no valid answer from, the origin (F5)."))
+    elif not res.get(zid, (None, []))[1]:
+        notes.append("No requests for this hostname in the range.")
+    if errs:
+        notes.append("Some parts could not be read (token permission or plan): " + " | ".join(errs[:5]))
+    label, kind = cf_sev_verdict(findings, "NO ISSUES FOUND")
+    data = dict({"findings": findings}, **data)
+    return cf_result(t0, "Cloudflare hostname investigation " + host, "%s · %s" % (host, label), kind,
+                     ["HIGH: %s (%s)" % (f["issue"], f["object"]) for f in findings if f["severity"] == "high"] + notes, data)
+
+
+def cf_m_rules(sess, b, t0):
+    q = cf_text(b.get("q"), "search text")
+    zones = cf_zones(sess, b.get("zone"))[:CF_MAX_CFG_ZONES]
+    try:
+        ip = ipaddress.ip_address(q) if q else None
+    except ValueError:
+        ip = None
+    rid = q.lower() if re.fullmatch(r"[0-9a-fA-F]{32}", q) else ""
+    audit(sess, "Cloudflare rule search '%s'" % q)
+    rules, errs, cache = cf_all_rules(sess, zones)
+    if not q:
+        hits = [cf_rule_row(x) for x in rules if x["phase"] in CF_SEC_PHASES or x["rule"].get("action") == "execute"]
+    elif rid:
+        hits = [cf_rule_row(x, "rule ID" if x["rule"].get("id") == rid else "ruleset ID") for x in rules
+                if rid in (x["rule"].get("id"), x["ruleset_id"])]
+    else:
+        hits = [cf_rule_row(x, why) for x in rules for why in [cf_rule_match(x, q, ip)] if why]
+        if ip is not None:
+            hits += [cf_rule_row(x, why) for x in rules for why in [cf_rule_match(x, q)]
+                     if why and not cf_rule_match(x, ip=ip)]
+    managed = []
+    if rid and not hits:
+        # Not one of ours: look for it in the managed rulesets the zones run (e.g. Cloudflare Managed / OWASP).
+        execs = [x for x in rules if x["rule"].get("action") == "execute"
+                 and CF_ID_RE.match(str((x["rule"].get("action_parameters") or {}).get("id") or ""))]
+        seen = {}
+        for x in execs:
+            mid = x["rule"]["action_parameters"]["id"]
+            if mid not in seen and time.time() - t0 < 90:
+                st, ok, d = cf_get(sess, "%s/rulesets/%s" % (x["base"], mid))
+                seen[mid] = (d.get("result") or {}) if ok else {}
+            mr = seen.get(mid) or {}
+            for rule in mr.get("rules") or []:
+                if rule.get("id") != rid:
+                    continue
+                ov = [o for o in ((x["rule"].get("action_parameters") or {}).get("overrides") or {}).get("rules") or []
+                      if o.get("id") == rid]
+                managed.append({"cf_zone": x["where"], "managed_ruleset": mr.get("name", mid), "rule_id": rid,
+                                "description": rule.get("description", ""), "default_action": rule.get("action", ""),
+                                "enabled_by_default": rule.get("enabled", True),
+                                "categories": rule.get("categories") or [],
+                                "zone_override": json.dumps(ov[0]) if ov else "none (ruleset / category settings apply)",
+                                "deployed_by": "%s rule %s (%s)" % (x["phase"], x["pos"], x["rule"].get("description", ""))})
+    notes = [cf_scope(sess, zones).replace("All", "Zones searched: all", 1),
+             "Searched %d rule(s) in custom, rate limiting, managed-deployment, transform, redirect, origin, cache and "
+             "configuration rulesets of the zones and their account(s)." % len(rules)]
+    if rid and not hits and not managed:
+        notes.append("Rule ID not found. Managed rules can only be found in rulesets that a zone deploys.")
+    if errs:
+        notes.append("Some rulesets could not be read (token needs Zone WAF / Account Rulesets read): " +
+                     " | ".join(errs[:5]))
+    return cf_result(t0, "GET /zones/<id>/rulesets", "%d MATCHING RULE(S)" % (len(hits) + len(managed)),
+                     "warn" if hits or managed else "info", notes,
+                     {"managed_rule": managed, "rules": hits})
+
+
+def cf_m_dns(sess, b, t0):
+    name = cf_text(b.get("name"), "name").lower()
+    content = cf_text(b.get("content"), "content")
+    rtype = str(b.get("type") or "").strip().upper()
+    if rtype and not re.fullmatch(r"[A-Z]{1,10}", rtype):
+        raise ValueError("invalid record type")
+    if not (name or content or rtype):
+        raise ValueError("enter a name and/or content to search for, or choose a record type")
+    zones = cf_zones(sess, b.get("zone"))
+    audit(sess, "Cloudflare DNS search name~%s content~%s %s" % (name, content, rtype))
+
+    def one(z):
+        q = [k + "=" + urllib.parse.quote(v) for k, v in (("name.contains", name), ("content.contains", content),
+                                                          ("type", rtype)) if v]
+        items, err, trunc = cf_list(sess, "/zones/%s/dns_records?%s" % (z["id"], "&".join(q)), per_page=500, max_pages=10)
+        if err and (name or content):   # older API without .contains filters: fetch and filter here
+            items, err, trunc = cf_list(sess, "/zones/%s/dns_records%s" % (z["id"], "?type=" + rtype if rtype else ""),
+                                        per_page=500, max_pages=10)
+        hit = [cf_dns_row(z, r) for r in items if (not name or name in str(r.get("name", "")).lower())
+               and (not content or content.lower() in str(r.get("content", "")).lower())
+               and (not rtype or r.get("type") == rtype)]
+        return {"rows": hit, "error": err, "trunc": trunc}
+    rows, errs, trunc = [], [], []
+    for z, r in zip(zones, cf_each(zones, one)):
+        rows += r.get("rows") or []
+        if r.get("error"):
+            errs.append("%s: %s" % (z["name"], r["error"]))
+        if r.get("trunc"):
+            trunc.append(z["name"])
+    notes = [cf_scope(sess, zones)]
+    if errs:
+        notes.append("Errors: " + " | ".join(errs[:5]))
+    if trunc:
+        notes.append("Only the first 5000 records were searched in: " + ", ".join(trunc))
+    exposed = [r for r in rows if r["type"] in ("A", "AAAA", "CNAME") and not r["proxied"]]
+    if exposed:
+        notes.append("%d matching A/AAAA/CNAME record(s) are DNS-only (not proxied through Cloudflare)." % len(exposed))
+    return cf_result(t0, "GET /zones/<id>/dns_records", "%d DNS RECORD(S)" % len(rows), "ok" if rows else "info",
+                     notes, {"dns_records": sorted(rows, key=lambda r: (r["cf_zone"], r["name"], r["type"]))})
+
+
+def cf_m_posture(sess, b, t0):
+    zones = cf_zones(sess, b.get("zone"))[:CF_MAX_CFG_ZONES]
+    warn_days = num(b.get("days"), 1, 365, 30, "certificate warning days")
+    audit(sess, "Cloudflare security posture (%d zones)" % len(zones))
+
+    def one(z):
+        s, err = cf_zone_settings(sess, z)
+        certs, cerrs = cf_cert_rows(sess, z)
+        recs, derr, _ = cf_list(sess, "/zones/%s/dns_records" % z["id"], per_page=500, max_pages=10)
+        return {"s": s, "err": [e for e in [err, derr and "DNS: " + derr] if e] + cerrs, "certs": certs,
+                "recs": recs, "tci": cf_tci_managed(sess, z) if s else None}
+    findings, inv, notes, certs = [], [], [cf_scope(sess, zones)], []
+    for z, r in zip(zones, cf_each(zones, one, workers=6)):
+        if r.get("error"):
+            notes.append("%s: %s" % (z["name"], r["error"]))
+            continue
+        s, zc = r["s"] or {}, r["certs"]
+        notes += [e if e.startswith(z["name"]) else "%s: %s" % (z["name"], e) for e in r["err"]]
+        if r["s"]:
+            findings += cf_settings_findings(z, s, r["tci"])
+        findings += cf_cert_findings(zc, warn_days)
+        certs += zc
+        prox = [x for x in r["recs"] if x.get("type") in ("A", "AAAA", "CNAME")]
+        grey = [x for x in prox if not x.get("proxied")]
+        if grey:
+            findings.append(finding("low", z["name"], "%d of %d A/AAAA/CNAME record(s) are DNS-only" % (len(grey), len(prox)),
+                                    "e.g. " + ", ".join(x.get("name", "") for x in grey[:5])))
+        if z.get("status") not in ("active", ""):
+            findings.append(finding("medium", z["name"], "Zone status is '%s'" % z.get("status")))
+        days = [c["days_left"] for c in zc if c["days_left"] != ""]
+        inv.append({"cf_zone": z["name"], "plan": z.get("plan"), "status": z.get("status"), "ssl": s.get("ssl", ""),
+                    "min_tls": s.get("min_tls_version", ""), "tls_1_3": s.get("tls_1_3", ""),
+                    "always_https": s.get("always_use_https", ""), "security_level": s.get("security_level", ""),
+                    "true_client_ip": "on" if s.get("true_client_ip_header") == "on" or r["tci"] else
+                    ("off" if r["s"] else ""), "dev_mode": s.get("development_mode", ""),
+                    "dns_only_records": "%d of %d" % (len(grey), len(prox)),
+                    "certs": "%d (soonest expiry %s days)" % (len(zc), min(days)) if days else len(zc)})
+    label, kind = cf_sev_verdict(findings, "NO ISSUES FOUND")
+    return cf_result(t0, "GET /zones/<id>/settings, ssl, dns_records", label, kind,
+                     ["HIGH: %s (%s)" % (f["issue"], f["object"]) for f in findings if f["severity"] == "high"][:15] + notes,
+                     {"findings": findings, "zones": inv, "certificates": certs})
+
+
+def cf_m_lb(sess, b, t0):
+    zones = cf_zones(sess, b.get("zone"))[:CF_MAX_CFG_ZONES]
+    audit(sess, "Cloudflare load balancer / health check status")
+    notes, errs = [cf_scope(sess, zones)], []
+    lbs, checks = [], []
+    for z, r in zip(zones, cf_each(zones, lambda z: (cf_get(sess, "/zones/%s/load_balancers" % z["id"]),
+                                                     cf_get(sess, "/zones/%s/healthchecks" % z["id"])))):
+        if isinstance(r, dict):
+            errs.append(r["error"])
+            continue
+        (st, ok, d), (st2, ok2, d2) = r
+        if ok:
+            lbs += [dict(x, _zone=z["name"]) for x in d.get("result") or []]
+        else:
+            errs.append("%s load balancers: %s" % (z["name"], cf_errtext(st, d)))
+        if ok2:
+            checks += [{"cf_zone": z["name"], "name": h.get("name"), "address": h.get("address"), "type": h.get("type"),
+                        "status": h.get("status"), "failure_reasons": h.get("failure_reason") or h.get("failure_reasons") or "",
+                        "interval_s": h.get("interval"), "regions": h.get("check_regions") or []}
+                       for h in d2.get("result") or []]
+    used_by = collections.defaultdict(list)
+    for x in lbs:
+        for p in (x.get("default_pools") or []) + [x.get("fallback_pool")]:
+            if p and x.get("name") not in used_by[p]:
+                used_by[p].append(x.get("name"))
+    pools = []
+    for a in cf_accounts(sess, zones):
+        st, ok, d = cf_get(sess, "/accounts/%s/load_balancers/pools" % a)
+        if ok:
+            pools += [(a, p) for p in d.get("result") or [] if CF_ID_RE.match(str(p.get("id") or ""))]
+        else:
+            errs.append("%s pools: %s" % (cf_acct_name(sess, a), cf_errtext(st, d)))
+    healths = cf_each(pools[:60], lambda ap: cf_get(sess, "/accounts/%s/load_balancers/pools/%s/health" % (ap[0], ap[1]["id"])))
+    rows, bad = [], 0
+    for (a, p), h in zip(pools[:60], healths):
+        stats = {}
+        if not isinstance(h, dict) and h[1]:
+            for region, v in ((h[2].get("result") or {}).get("pop_health") or {}).items():
+                for o in (v or {}).get("origins") or []:
+                    for addr, oh in (o or {}).items():
+                        s = stats.setdefault(addr, {"ok": 0, "n": 0, "why": collections.Counter(),
+                                                    "code": collections.Counter(), "rtt": ""})
+                        s["n"] += 1
+                        s["ok"] += 1 if oh.get("healthy") else 0
+                        if oh.get("failure_reason") and oh["failure_reason"] != "No failures":
+                            s["why"][oh["failure_reason"]] += 1
+                        if oh.get("response_code"):
+                            s["code"][str(oh["response_code"])] += 1
+                        s["rtt"] = oh.get("rtt") or s["rtt"]
+        for o in p.get("origins") or []:
+            s = stats.get(o.get("address")) or stats.get(o.get("name")) or {}
+            unhealthy = s and s["ok"] < s["n"]
+            bad += 1 if unhealthy and o.get("enabled", True) and p.get("enabled", True) else 0
+            rows.append({"pool": p.get("name"), "pool_enabled": p.get("enabled"), "origin": o.get("name"),
+                         "address": o.get("address"), "origin_enabled": o.get("enabled", True), "weight": o.get("weight"),
+                         "health": ("healthy" if not unhealthy else "unhealthy") + " in %d of %d region(s)" % (s["ok"], s["n"])
+                         if s else "no health data (no monitor?)",
+                         "failure_reason": "; ".join("%s (%d)" % kv for kv in s["why"].most_common(3)) if s else "",
+                         "response_codes": ", ".join(s["code"]) if s else "", "rtt": s.get("rtt", "") if s else "",
+                         "used_by": used_by.get(p.get("id")) or [], "monitor": p.get("monitor") or ""})
+    lb_rows = [{"cf_zone": x["_zone"], "name": x.get("name"), "enabled": x.get("enabled"), "proxied": x.get("proxied"),
+                "steering": x.get("steering_policy"), "session_affinity": x.get("session_affinity"),
+                "pools": [next((p.get("name") for _, p in pools if p.get("id") == i), i) for i in x.get("default_pools") or []],
+                "fallback": next((p.get("name") for _, p in pools if p.get("id") == x.get("fallback_pool")), x.get("fallback_pool"))}
+               for x in lbs]
+    bad += sum(1 for c in checks if c["status"] not in ("healthy", "suspended"))
+    if len(pools) > 60:
+        notes.append("Health was read for the first 60 of %d pools." % len(pools))
+    if errs:
+        notes.append("Some parts could not be read (Load Balancing / Health Checks read permissions): " + " | ".join(errs[:5]))
+    return cf_result(t0, "GET load_balancers, pools/<id>/health, healthchecks",
+                     "%d UNHEALTHY ORIGIN(S) / HEALTH CHECK(S)" % bad if bad else
+                     "%d LOAD BALANCER(S), %d POOL(S), %d HEALTH CHECK(S): ALL HEALTHY" % (len(lb_rows), len(pools), len(checks)),
+                     "bad" if bad else "ok" if rows or checks else "info", notes,
+                     {"load_balancers": lb_rows, "pool_origins": rows, "health_checks": checks})
+
+
+def cf_m_audit(sess, b, t0):
+    zones = cf_zones(sess, b.get("zone"))
+    since, until, span = cf_window(b)
+    email = str(b.get("email") or "").strip()
+    if email and not re.fullmatch(r"[^\s@\"\\]{1,64}@[A-Za-z0-9.\-]{1,190}", email):
+        raise ValueError("invalid e-mail address")
+    actq, resq = cf_text(b.get("action"), "action").lower(), cf_text(b.get("resource"), "resource").lower()
+    limit = num(b.get("top"), 1, 1000, 100, "max rows")
+    one_zone = zones[0]["name"] if len(zones) == 1 and len(sess.get("zones") or []) != 1 else ""
+    audit(sess, "Cloudflare audit log %s %s" % (email or "*", one_zone or "all zones"))
+    rows, errs = [], []
+    for a in cf_accounts(sess, zones):
+        q = {"since": since, "before": until, "direction": "desc", "per_page": 100}
+        if email:
+            q["actor.email"] = email
+        if one_zone:
+            q["zone.name"] = one_zone
+        for page in range(1, 21):
+            q["page"] = page
+            st, ok, d = cf_get(sess, "/accounts/%s/audit_logs?%s" % (a, urllib.parse.urlencode(q)))
+            if not ok:
+                errs.append("%s: %s" % (cf_acct_name(sess, a), cf_errtext(st, d)))
+                break
+            res = d.get("result") or []
+            for x in res:
+                act, rsc, meta = x.get("action") or {}, x.get("resource") or {}, x.get("metadata") or {}
+                actor = x.get("actor") or {}
+                text = json.dumps(x).lower()
+                if actq and actq not in str(act.get("type", "")).lower() and actq not in text:
+                    continue
+                if resq and resq not in text:
+                    continue
+                rows.append({"time": utc3(x.get("when", "")), "account": cf_acct_name(sess, a)[8:],
+                             "actor": actor.get("email") or actor.get("type", ""), "actor_ip": actor.get("ip", ""),
+                             "action": act.get("type", ""), "result": "success" if act.get("result") else "failed",
+                             "resource": "%s %s" % (rsc.get("type", ""), rsc.get("id", "")),
+                             "cf_zone": meta.get("zone_name", ""), "interface": x.get("interface", ""),
+                             "new_value": json.dumps(x.get("newValue"))[:300] if x.get("newValue") not in (None, "") else "",
+                             "old_value": json.dumps(x.get("oldValue"))[:300] if x.get("oldValue") not in (None, "") else ""})
+            if len(res) < 100 or len(rows) >= limit or time.time() - t0 > 100:
+                break
+    rows = sorted(rows, key=lambda r: r["time"], reverse=True)[:limit]
+    notes = ["Time range: " + span, "Accounts: " + ", ".join(cf_acct_name(sess, a)[8:] for a in cf_accounts(sess, zones))]
+    if one_zone:
+        notes.append("Zone: " + one_zone)
+    if errs:
+        notes.append("Could not read the audit log (token needs Account Settings Read / Audit Logs Read): " + " | ".join(errs[:3]))
+    failed = sum(1 for r in rows if r["result"] == "failed")
+    return cf_result(t0, "GET /accounts/<id>/audit_logs", "%d CHANGE(S) / EVENT(S)%s" % (
+                         len(rows), " · %d FAILED" % failed if failed else ""), "warn" if failed else "ok" if rows else "info",
+                     notes, {"audit_log": rows})
+
+
+CF_TTFB = ("edgeTimeToFirstByteMsP50", "edgeTimeToFirstByteMsP95", "edgeTimeToFirstByteMsP99")
+CF_CACHE_KEYS = ("hit", "miss", "dynamic", "bypass", "none", "expired")   # the rest is shown as "other"
+CF_CACHED = ("hit", "stale", "updating", "revalidated")
+CF_DASH_TOPS = (("tp", "Top paths", "path", "clientRequestPath"), ("tc", "Top countries", "country", "clientCountryName"),
+                ("ti", "Top client IPs", "client_ip", "clientIP"), ("ta", "Top ASNs", "asn", "clientAsn"),
+                ("th", "Top hosts", "host", "clientRequestHTTPHost"), ("tr", "Top referrers", "referrer", "clientRefererHost"))
+
+
+def cf_fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000 or unit == "TB":
+            return ("%d %s" if unit == "B" else "%.2f %s") % (n, unit)
+        n /= 1000.0
+
+
+def cf_m_dashboard(sess, b, t0):
+    """Cloudflare-style traffic dashboard: headline tiles (vs the previous period of the same length), requests,
+    data transfer, status codes, cache status and edge TTFB over time, and top-N lists. One query per 2 zones."""
+    zones = cf_zones(sess, b.get("zone"))
+    since, until, span = cf_window(b)
+    cur = cf_filters(b, "http", since, until)
+    s0, s1 = to_epoch(since), to_epoch(until)
+    iso = lambda e: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e))
+    prev = dict(cur, datetime_geq=iso(2 * s0 - s1), datetime_leq=iso(s0 - 1))
+    secs = s1 - s0
+    dim, bucket = (("datetimeMinute", "1 minute") if secs <= 10800 else ("datetimeFiveMinutes", "5 minutes")
+                   if secs <= 86400 else ("datetimeHour", "1 hour") if secs <= 604800 else ("date", "1 day (UTC dates)"))
+    audit(sess, "Cloudflare traffic dashboard %s" % json.dumps({k: v for k, v in cur.items() if "datetime" not in k}))
+    G, cl, pl = "httpRequestsAdaptiveGroups", cf_lit(cur), cf_lit(prev)
+    q_tok = "quantiles{%s}" % " ".join(CF_TTFB)
+
+    def sel(f):
+        q = q_tok if q_tok in f else ""
+        sm = "sum{edgeResponseBytes%s}" % (" visits" if "visits" in f else "")
+        parts = ["tot:%s(filter:%s,limit:1){count %s %s}" % (G, cl, sm, q),
+                 "prev:%s(filter:%s,limit:1){count %s %s}" % (G, pl, sm, q),
+                 "pst:%s(filter:%s,limit:100,orderBy:[count_DESC]){count dimensions{edgeResponseStatus}}" % (G, pl),
+                 "pca:%s(filter:%s,limit:50,orderBy:[count_DESC]){count dimensions{cacheStatus}}" % (G, pl),
+                 "ts:%s(filter:%s,limit:5000,orderBy:[%s_ASC]){count %s %s dimensions{%s}}" % (G, cl, dim, sm, q, dim),
+                 "st:%s(filter:%s,limit:10000,orderBy:[%s_ASC]){count dimensions{%s edgeResponseStatus}}" % (G, cl, dim, dim),
+                 "ca:%s(filter:%s,limit:10000,orderBy:[%s_ASC]){count dimensions{%s cacheStatus}}" % (G, cl, dim, dim)]
+        for alias, _, _, field in CF_DASH_TOPS:
+            if field == "clientRefererHost" and field not in f:
+                continue
+            extra = " clientASNDescription" if field == "clientAsn" and "clientASNDescription" in f else ""
+            parts.append("%s:%s(filter:%s,limit:10,orderBy:[count_DESC]){count dimensions{%s%s}}" % (
+                alias, G, cl, field, extra))
+        return " ".join(parts)
+    res, dropped = cf_gql_zones(sess, zones, sel, ("visits", q_tok, "clientASNDescription", "clientRefererHost"), chunk=2)
+
+    def acc():
+        return {"n": 0, "bytes": 0, "visits": 0, "q": [0.0, 0.0, 0.0], "qn": 0}
+
+    def add(a, g):
+        n = int(g.get("count") or 0)
+        a["n"] += n
+        a["bytes"] += int((g.get("sum") or {}).get("edgeResponseBytes") or 0)
+        a["visits"] += int((g.get("sum") or {}).get("visits") or 0)
+        q = g.get("quantiles") or {}
+        if q and n:   # several zones: count-weighted mean of each zone's percentile (an approximation)
+            for i, k in enumerate(CF_TTFB):
+                a["q"][i] += float(q.get(k) or 0) * n
+            a["qn"] += n
+
+    def scls(code):
+        try:
+            return "%dxx" % (int(code) // 100) if 100 <= int(code) < 600 else "other"
+        except (TypeError, ValueError):
+            return "other"
+    tot, prv, ts = acc(), acc(), {}
+    st, ca = collections.defaultdict(collections.Counter), collections.defaultdict(collections.Counter)
+    pst, pca, tops, asn_names = collections.Counter(), collections.Counter(), collections.defaultdict(collections.Counter), {}
+    for z in zones:
+        zd = res.get(z["id"], (None, []))[0] or {}
+        for g in zd.get("tot") or []:
+            add(tot, g)
+        for g in zd.get("prev") or []:
+            add(prv, g)
+        for g in zd.get("ts") or []:
+            add(ts.setdefault(str((g.get("dimensions") or {}).get(dim)), acc()), g)
+        for g in zd.get("st") or []:
+            d = g.get("dimensions") or {}
+            st[str(d.get(dim))][scls(d.get("edgeResponseStatus"))] += int(g.get("count") or 0)
+        for g in zd.get("ca") or []:
+            d = g.get("dimensions") or {}
+            c = str(d.get("cacheStatus") or "none").lower()
+            ca[str(d.get(dim))][c] += int(g.get("count") or 0)
+        for g in zd.get("pst") or []:
+            pst[scls((g.get("dimensions") or {}).get("edgeResponseStatus"))] += int(g.get("count") or 0)
+        for g in zd.get("pca") or []:
+            pca[str((g.get("dimensions") or {}).get("cacheStatus") or "none").lower()] += int(g.get("count") or 0)
+        for alias, _, _, field in CF_DASH_TOPS:
+            for g in zd.get(alias) or []:
+                d = g.get("dimensions") or {}
+                tops[alias][str(d.get(field) if d.get(field) not in (None, "") else "(none)")] += int(g.get("count") or 0)
+                if field == "clientAsn" and d.get("clientASNDescription"):
+                    asn_names[str(d.get(field))] = d["clientASNDescription"]
+    keys = sorted(set(ts) | set(st) | set(ca))
+    labels = [k if dim == "date" else utc3(k) for k in keys]
+    sc_tot, ca_tot = collections.Counter(), collections.Counter()
+    for k in keys:
+        sc_tot.update(st[k])
+        ca_tot.update(ca[k])
+
+    def rate(c, which):
+        n = sum(c.values())
+        return 100.0 * sum(c[x] for x in which) / n if n else None
+
+    def ttfb(a, i):
+        return a["q"][i] / a["qn"] if a["qn"] else None
+    has_q, has_v = q_tok not in dropped, "visits" not in dropped
+    spark_rate = lambda which, src: [rate(src[k], which) or 0 for k in keys]
+    tiles = [{"label": "Total requests", "value": tot["n"], "prev": prv["n"], "fmt": "num",
+              "spark": [ts[k]["n"] if k in ts else 0 for k in keys]},
+             {"label": "Total data transfer", "value": tot["bytes"], "prev": prv["bytes"], "fmt": "bytes",
+              "spark": [ts[k]["bytes"] if k in ts else 0 for k in keys]}]
+    if has_v:
+        tiles.append({"label": "Total visits", "value": tot["visits"], "prev": prv["visits"], "fmt": "num",
+                      "spark": [ts[k]["visits"] if k in ts else 0 for k in keys]})
+    tiles += [{"label": "Cache hit rate", "value": rate(ca_tot, CF_CACHED), "prev": rate(pca, CF_CACHED), "fmt": "pct",
+               "spark": spark_rate(CF_CACHED, ca)},
+              {"label": "5xx error rate", "value": rate(sc_tot, ("5xx",)), "prev": rate(pst, ("5xx",)), "fmt": "pct",
+               "spark": spark_rate(("5xx",), st)}]
+    if has_q:
+        tiles.append({"label": "Edge TTFB (p95)", "value": ttfb(tot, 1), "prev": ttfb(prv, 1), "fmt": "ms",
+                      "spark": [ttfb(ts[k], 1) or 0 if k in ts else 0 for k in keys]})
+    st_keys = [k for k in ("2xx", "3xx", "4xx", "5xx", "1xx", "other") if sc_tot[k]]
+    other = [c for c in ca_tot if c not in CF_CACHE_KEYS]
+    ca_keys = [c for c in CF_CACHE_KEYS if ca_tot[c]] + (["other"] if other else [])
+    cache_series = {c: [sum(ca[k][x] for x in other) if c == "other" else ca[k][c] for k in keys] for c in ca_keys}
+    top_lists = []
+    for alias, title, col, field in CF_DASH_TOPS:
+        if tops[alias]:
+            top_lists.append([title, [[("AS%s %s" % (n, asn_names.get(n, ""))).strip() if field == "clientAsn" else n, v]
+                                      for n, v in tops[alias].most_common(10)]])
+    dash = {"bucket": bucket, "tiles": tiles, "t": labels,
+            "requests": [ts[k]["n"] if k in ts else 0 for k in keys],
+            "bytes": [ts[k]["bytes"] if k in ts else 0 for k in keys],
+            "status": [[s, [st[k][s] for k in keys]] for s in st_keys],
+            "cache": [[c, cache_series[c]] for c in ca_keys],
+            "ttfb": [[p, [round(ttfb(ts[k], i) or 0) if k in ts else 0 for k in keys]]
+                     for i, p in enumerate(("p50", "p95", "p99"))] if has_q else [], "tops": top_lists}
+    # The same numbers as tables: the table view, and what Copy / CSV / HTML report export.
+    chg = lambda v, p: "" if v is None or not p else " (%+.1f%% vs previous period)" % (100.0 * (v - p) / p)
+    shown = {"num": lambda v: "{:,}".format(v), "bytes": cf_fmt_bytes, "pct": lambda v: "%.2f%%" % v,
+             "ms": lambda v: "%d ms" % round(v)}
+    data = {"headline": {t["label"]: (shown[t["fmt"]](t["value"]) if t["value"] is not None else "n/a") +
+                         chg(t["value"], t["prev"]) for t in tiles}}
+    for alias, title, col, field in CF_DASH_TOPS:
+        for t_, rows in top_lists:
+            if t_ == title:
+                data[re.sub(r"\W+", "_", title.lower())] = [
+                    {col: n, "requests": v, "share": "%.1f%%" % (100.0 * v / tot["n"]) if tot["n"] else ""} for n, v in rows]
+    data["timeline"] = [dict([("time", lbl), ("requests", ts[k]["n"] if k in ts else 0),
+                              ("data_transfer", cf_fmt_bytes(ts[k]["bytes"] if k in ts else 0))] +
+                             [(s, st[k][s]) for s in ("2xx", "3xx", "4xx", "5xx") if s in st_keys] +
+                             ([("ttfb_%s_ms" % p, round(ttfb(ts[k], i) or 0) if k in ts else 0)
+                               for i, p in enumerate(("p50", "p95", "p99"))] if has_q else []))
+                        for k, lbl in zip(keys, labels)]
+    notes = [cf_scope(sess, zones), "Time range: %s; buckets of %s; changes compare with the previous %s." % (
+        span, bucket, re.sub(r"^last ", "", str(b.get("within") or "period")) if not b.get("since") else "period of the same length"),
+             "Counts are Cloudflare's sample-adjusted estimates, so they can differ slightly from the Cloudflare dashboard."]
+    if len(zones) > 1 and has_q:
+        notes.append("TTFB percentiles across several zones are count-weighted averages of each zone's percentile (approximate).")
+    r = cf_result(t0, "GraphQL httpRequestsAdaptiveGroups (dashboard)", "%s REQUESTS · %s · 5xx %s" % (
+        "{:,}".format(tot["n"]), cf_fmt_bytes(tot["bytes"]),
+        "%.2f%%" % rate(sc_tot, ("5xx",)) if sc_tot else "n/a"),
+        "bad" if (rate(sc_tot, ("5xx",)) or 0) >= 5 else "ok" if tot["n"] else "info",
+        notes + cf_gql_notes(zones, res, dropped), data)
+    r["dashboard"] = dash
+    return r
+
+
+CF_MODES = {"events": cf_m_events, "event_top": lambda s, b, t: cf_m_groups(s, b, t, "ev"),
+            "traffic": lambda s, b, t: cf_m_groups(s, b, t, "http"), "requests": cf_m_requests, "ray": cf_m_ray,
+            "ip": cf_m_ip, "host": cf_m_host, "rules": cf_m_rules, "dns": cf_m_dns, "posture": cf_m_posture,
+            "lb": cf_m_lb, "audit": cf_m_audit, "dashboard": cf_m_dashboard}
+
+
+def do_cf(b):
+    sess = SESSIONS.get(b.get("id"))
+    if not sess or sess["vendor"] != "cloudflare":
+        return {"ok": False, "error": "connect a Cloudflare account first"}
+    fn = CF_MODES.get(b.get("mode"))
+    if not fn:
+        return {"ok": False, "error": "unknown Cloudflare lookup"}
+    try:
+        return fn(sess, b, time.time())
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ITSecOps"
 
@@ -3659,7 +5349,7 @@ class Handler(BaseHTTPRequestHandler):
                   "/api/profile/delete": do_profile_delete, "/api/health": do_health,
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
                   "/api/fglogs": do_fg_logs, "/api/adminaudit": do_admin_audit, "/api/f5sync": do_f5_sync, "/api/pancapture": do_pan_capture,
-                  "/api/backup": do_backup}
+                  "/api/backup": do_backup, "/api/cf": do_cf}
         fn = routes.get(self.path)
         if not fn:
             return self._send(404, {"error": "not found"})
@@ -3707,7 +5397,7 @@ border:1px solid transparent;cursor:pointer}
 .dev.sel{border-color:var(--violet);background:var(--panel2);box-shadow:0 0 14px #7C6CFF33}
 .tag{font-size:11px;padding:1px 7px;border-radius:99px;margin-left:6px}
 .f5{background:#FF7A5922;color:var(--coral)}.paloalto{background:#2EE6C522;color:var(--mint)}
-.fortigate{background:#7C6CFF33;color:#b3a9ff}
+.fortigate{background:#7C6CFF33;color:#b3a9ff}.cloudflare{background:#F3802022;color:#F38020}
 .grp{margin:12px 0 4px;color:var(--mint);font-size:12px;letter-spacing:.1em;text-transform:uppercase}
 .chkrow{display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px dashed #2a285088;flex-wrap:wrap}
 .chkrow .lbl{flex:1 1 220px}
@@ -3753,8 +5443,27 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .tx{white-space:pre-wrap;word-break:break-word;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:340px;overflow:auto}
 #pretty ul.sum{margin:0 0 0 18px}
 .warnbox{border-color:var(--coral);box-shadow:0 0 18px #FF7A5922}
+#pretty .dash{display:flex;flex-direction:column;gap:12px;margin-bottom:18px}
+#pretty .dtiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+#pretty .dtile{border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:var(--panel)}
+#pretty .dtile .dl{color:var(--dim);font-size:12px}#pretty .dtile .dv{font-size:20px;font-weight:600}
+#pretty .dtile .dc{color:var(--dim);font-size:12px;margin-left:6px;font-weight:400}
+#pretty.tall{max-height:none}
+#pretty .dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:12px}
+#pretty .dgrid.tops{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+@media(max-width:700px){#pretty .dgrid{grid-template-columns:1fr}}
+#pretty .dcard{border:1px solid var(--line);border-radius:10px;padding:10px;background:var(--panel);min-width:0}
+#pretty .dcard svg{width:100%;height:auto;display:block}
+#pretty .dleg{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:var(--dim);margin:2px 0 6px}
+#pretty .dleg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+#pretty .dleg b{color:var(--text);font-weight:600;margin-left:4px}
+#pretty svg .hv{fill:transparent}#pretty svg .hv:hover{fill:#ffffff12}
+#pretty .dtop{display:grid;grid-template-columns:minmax(0,1fr) 30% auto;gap:6px 10px;align-items:center;font-size:12.5px}
+#pretty .dtop .dn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#pretty .dtop .dn.lnk{cursor:pointer;color:var(--mint)}
+#pretty .dtop .db{height:6px;border-radius:3px;background:var(--panel2)}#pretty .dtop .db span{display:block;height:6px;border-radius:3px;background:#3987e5}
+#pretty .dtop .dvv{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
 </style></head><body>
-<header><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><small>read-only troubleshooting · F5 · Palo Alto · FortiGate · local only</small></header>
+<header><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><small>read-only troubleshooting · F5 · Palo Alto · FortiGate · Cloudflare · local only</small></header>
 <div class="wrap">
 <div>
   <div class="card"><h3>Saved device profiles</h3>
@@ -3770,14 +5479,16 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
     <label>Vendor</label>
     <select id="vendor"><option value="f5">F5 BIG-IP (iControl REST)</option>
     <option value="paloalto">Palo Alto (PAN-OS XML API)</option>
-    <option value="fortigate">FortiGate (REST API)</option></select>
+    <option value="fortigate">FortiGate (REST API)</option>
+    <option value="cloudflare">Cloudflare (API token)</option></select>
     <label>Display name (optional)</label><input id="name" placeholder="e.g. edge-fw-01">
-    <div class="row"><div><label>Mgmt host / IP</label><input id="host"></div>
+    <div class="row" id="f-host"><div><label>Mgmt host / IP</label><input id="host"></div>
     <div style="max-width:90px"><label>Port</label><input id="port" value="443"></div></div>
     <div id="f-user"><label>Username</label><input id="username" autocomplete="off"></div>
     <div id="f-pass"><label>Password</label><input id="password" type="password" autocomplete="off"></div>
     <div id="f-key"><label id="keylbl">API key</label><input id="apikey" type="password" autocomplete="off"></div>
-    <div class="chk"><input type="checkbox" id="insecure"><span>Skip TLS verification (self-signed mgmt cert). Credentials are then sent to whatever answers at that address: use only on a trusted network.</span></div>
+    <div id="f-acct" style="display:none"><label>Account ID (optional; needed for account-owned tokens)</label><input id="account" autocomplete="off" placeholder="32 hex characters"></div>
+    <div class="chk" id="f-ins"><input type="checkbox" id="insecure"><span>Skip TLS verification (self-signed mgmt cert). Credentials are then sent to whatever answers at that address: use only on a trusted network.</span></div>
     <div style="margin-top:12px"><button class="primary" onclick="connect()">Connect</button></div>
     <div id="cerr" class="err"></div>
   </div>
@@ -3786,7 +5497,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
     <p class="muted" style="margin:8px 0 0">Credentials stay in memory of the Python process. Closing it clears everything.</p></div>
 </div>
 <div>
-  <div id="appsec"></div>
+  <div id="cftools"></div><div id="appsec"></div>
   <div id="iplookup"></div><div id="f5tools"></div>
   <div id="health"></div>
   <div class="card" id="main"><h3>Checks</h3><div class="muted">Connect a device to begin.</div></div>
@@ -3807,7 +5518,8 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 const T="__TOKEN__";const $=s=>document.querySelector(s);let catalog={},devices=[],cur=null,last=null;
 const hints={f5:"GET path, e.g. /mgmt/tm/ltm/virtual?$select=name,destination",
 paloalto:"XML op command starting with <show> or <test>, e.g. <show><clock/></show>",
-fortigate:"GET path, e.g. /api/v2/monitor/system/status"};
+fortigate:"GET path, e.g. /api/v2/monitor/system/status",
+cloudflare:"GET path, e.g. /client/v4/zones?per_page=50 — or a GraphQL query starting with { or query"};
 async function api(p,b){const o={headers:{"X-Token":T,"Content-Type":"application/json"}};
  if(b){o.method="POST";o.body=JSON.stringify(b)}const r=await fetch(p,o);return r.json()}
 let profiles=[];
@@ -3831,24 +5543,29 @@ function useProfile(){const p=profiles.find(x=>x.id===$("#profiles").value);if(!
 async function deleteProfile(){const id=$("#profiles").value;if(!id)return;
  const r=await api("/api/profile/delete",{id});if(!r.ok){$("#perr").textContent=r.error;return}
  profiles=profiles.filter(p=>p.id!==id);renderProfiles();$("#perr").textContent="Profile deleted."}
-function fields(){const v=$("#vendor").value;
- $("#f-user").style.display=v==="fortigate"?"none":"";
- $("#f-pass").style.display=v==="fortigate"?"none":"";
+function fields(){const v=$("#vendor").value,cf=v==="cloudflare";
+ $("#f-user").style.display=v==="fortigate"||cf?"none":"";
+ $("#f-pass").style.display=v==="fortigate"||cf?"none":"";
  $("#f-key").style.display=v==="f5"?"none":"";
- $("#keylbl").textContent=v==="fortigate"?"REST API token":"API key (or leave blank and use user/password)"}
+ $("#f-host").style.display=$("#f-ins").style.display=cf?"none":"";
+ $("#f-acct").style.display=cf?"":"none";
+ if(cf){$("#host").value="api.cloudflare.com";$("#port").value="443";$("#insecure").checked=false}
+ else if($("#host").value==="api.cloudflare.com")$("#host").value="";
+ $("#keylbl").textContent=cf?"API token (read-only permissions)":v==="fortigate"?"REST API token":"API key (or leave blank and use user/password)"}
 $("#vendor").onchange=fields;fields();
 async function connect(){$("#cerr").textContent="Connecting…";
  const b={vendor:$("#vendor").value,name:$("#name").value,host:$("#host").value,port:$("#port").value,
- username:$("#username").value,password:$("#password").value,apikey:$("#apikey").value,insecure:$("#insecure").checked};
+ username:$("#username").value,password:$("#password").value,apikey:$("#apikey").value,insecure:$("#insecure").checked,account:$("#account").value};
  const r=await api("/api/connect",b);
  if(!r.ok){$("#cerr").textContent=r.error;return}
- $("#cerr").textContent="";$("#password").value="";$("#apikey").value="";
+ $("#cerr").textContent=r.vendor==="cloudflare"?"Token sees "+r.zones.length+" zone(s) in "+r.accounts+" account(s)."+(r.note?" Note: "+r.note:""):"";
+ $("#password").value="";$("#apikey").value="";
  devices.push(r);select(r.id)}
 async function disconnect(id,ev){ev.stopPropagation();await api("/api/disconnect",{id});
  devices=devices.filter(d=>d.id!==id);if(cur===id)cur=devices.length?devices[0].id:null;renderAll()}
 function select(id){cur=id;renderAll()}
 function dev(){return devices.find(d=>d.id===cur)}
-function renderAll(){renderDevs();renderChecks();renderAppsec();renderIp();renderF5();renderHealth();const d=dev();
+function renderAll(){renderDevs();renderChecks();renderCf();renderAppsec();renderIp();renderF5();renderHealth();const d=dev();
  $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:""}
 function renderDevs(){const el=$("#devs");el.innerHTML="";
  if(!devices.length){el.textContent="No devices connected.";return}
@@ -3893,8 +5610,8 @@ function show(r,l){last=r;const m=$("#ometa");m.textContent="";
 const ACR={ip:"IP",ipv4:"IPv4",ipv6:"IPv6",cpu:"CPU",id:"ID",url:"URL",uri:"URI",ha:"HA",ssl:"SSL",tls:"TLS",vs:"VS",tmm:"TMM",
  dns:"DNS",vpn:"VPN",nat:"NAT",fqdn:"FQDN",vdom:"VDOM",vsys:"vSys",xff:"XFF",http:"HTTP",https:"HTTPS",mac:"MAC",vlan:"VLAN",
  asm:"ASM",waf:"WAF",tcp:"TCP",udp:"UDP",icmp:"ICMP",snmp:"SNMP",ntp:"NTP",os:"OS",uuid:"UUID",pid:"PID",hw:"HW",sw:"SW",
- san:"SAN",cn:"CN",pcap:"PCAP",ms:"ms",sip:"SIP"};
-const LABEL={t:"Time",fullPath:"Name",vip:"VS",body:"Request body",request_headers:"Request headers"};
+ san:"SAN",cn:"CN",pcap:"PCAP",ms:"ms",sip:"SIP",asn:"ASN",ray:"Ray",ttl:"TTL",ttfb:"TTFB",lb:"LB",ua:"UA"};
+const LABEL={t:"Time",fullPath:"Name",vip:"VS",body:"Request body",request_headers:"Request headers",cf_zone:"Zone"};
 function hum(k){if(LABEL[k])return LABEL[k];k=String(k).replace(/^[@#]/,"");
  const w=k.replace(/([a-z0-9])([A-Z])/g,"$1 $2").replace(/[_\-.:\/]+/g," ").trim().split(/\s+/).filter(Boolean);
  return w.map(x=>ACR[x.toLowerCase()]||x[0].toUpperCase()+x.slice(1)).join(" ")||k}
@@ -3921,7 +5638,7 @@ function tableSec(title,rows){
  if(cols.includes("fullPath"))cols=cols.filter(c=>!["name","partition","subPath"].includes(c));
  const data=rows.map(r=>{const o={};cols.forEach(c=>o[c]=cellv(r[c]));return o});
  cols=cols.filter(c=>data.some(r=>r[c]!==""));
- if(cols.includes("vs_name")||cols.includes("pool_member_ip")||cols.includes("policy_name"))return {t:"table",title,cols,data};  // F5 VS overview: keep the column order given
+ if(cols.includes("vs_name")||cols.includes("pool_member_ip")||cols.includes("policy_name")||cols.includes("cf_zone")||cols.includes("pool_enabled"))return {t:"table",title,cols,data};  // F5 VS overview, Cloudflare: keep the column order given
  const lead=/^(name|fullPath|@name|label|object|rule|policy|id|policyid|time|t|severity|support_id|hostname|block_reason)$/i;
  const head=cols.filter(c=>lead.test(c)),rest=cols.filter(c=>!lead.test(c));
  const pr=/(status|state|avail|enabled|conn|bits|pkts|cpu|usage|used|total|address|ip|action|port|type)/i;
@@ -3975,6 +5692,8 @@ function secNode(s){const w=mk("div","rsec");
  return w}
 function renderOut(){const box=$("#pretty");box.textContent="";if(!last)return;
  if(last.error){box.appendChild(mk("div","bad",last.error));return}
+ box.classList.toggle("tall",!!last.dashboard);
+ if(last.dashboard)box.appendChild(dashNode(last.dashboard));  // charts first; the tables below are the table view
  buildSections(last.data).forEach(s=>box.appendChild(secNode(s)));
  if(!box.childNodes.length)box.appendChild(mk("div","nv","Nothing to show for this check."));
  // Blocked / denied traffic in red: table rows with a deny-type cell, and log lines whose action precedes " -> ".
@@ -4015,7 +5734,7 @@ async function showAudit(){const r=await api("/api/audit");last={ok:true,status:
  show(last,"audit log")}
 function fld(id,l,ph,v){return '<div><label>'+l+'</label><input id="'+id+'" placeholder="'+ph+'" value="'+(v||'')+'"></div>'}
 function g(i){const e=$("#"+i);return e?e.value:""}
-function renderIp(){const box=$("#iplookup");box.innerHTML="";const d=dev();if(!d)return;const v=d.vendor;
+function renderIp(){const box=$("#iplookup");box.innerHTML="";const d=dev();if(!d||d.vendor==="cloudflare")return;const v=d.vendor;
  let h='<div class="card"><h3>IP lookup · '+(v==="f5"?"pools, nodes, virtual servers, data groups, local traffic policies":"policy references")+'</h3><div class="row3">'+fld("ip_ip","IP address","203.0.113.7");
  if(v!=="f5"){
   h+=v==="paloalto"?fld("ip_vsys","vsys","vsys1","vsys1"):fld("ip_vdom","VDOM (optional)","root");
@@ -4057,7 +5776,7 @@ const WITHIN=["any time","last 15 minutes","last hour","last 6 hours","last 12 h
 function wsel(id){return sel(id,"Time range (up to 1 day)",WITHIN,"any time")}
 function sel(id,label,opts,def){return '<div><label>'+label+'</label><select id="'+id+'">'+
  opts.map(o=>'<option'+(o===def?' selected':'')+'>'+o+'</option>').join("")+'</select></div>'}
-function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if(!d)return;const v=d.vendor;
+function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if(!d||d.vendor==="cloudflare")return;const v=d.vendor;
  let h='<div class="card"><h3>AppSec checks · read-only</h3><div class="row3">';
  if(v==="paloalto")h+=fld("as_vsys","vsys","vsys1","vsys1");
  if(v==="fortigate")h+=fld("as_vdom","VDOM (optional)","root");
@@ -4072,6 +5791,12 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   fld("asm_tci","True-Client-IP (behind Cloudflare)","198.51.100.9")+fld("asm_host","Hostname contains","app.example.com")+fld("asm_url","URL path contains","/login")+
   sel("asm_st","Status",["","blocked","alerted","passed"],"")+fld("asm_top","Max rows","50","50")+wsel("asm_w")+
   '</div><div style="margin-top:8px"><button onclick="asmLookup(\'search\')">Search requests</button></div>'+
+  '<div class="grp" style="margin-top:14px">Requests by HTTP header</div><div class="row3">'+
+  fld("asm_hn","Header name","X-Request-ID")+fld("asm_hv","Value contains (blank = any)","abc123")+
+  fld("asm_hh","Hostname contains (optional)","app.example.com")+sel("asm_hst","Status",["","blocked","alerted","passed"],"")+
+  fld("asm_htop","Max rows","50","50")+fld("asm_hscan","Entries to scan","1000","1000")+wsel("asm_hw")+
+  '</div><div style="margin-top:8px"><button onclick="asmLookup(\'header\')">Search by header</button> '+
+  '<span class="muted">(shows header value, IP, True-Client-IP, hostname, URL, time, support ID, POST body)</span></div>'+
   '<div class="grp" style="margin-top:14px">Top 10 hostnames by violations</div><div class="row3">'+
   sel("asm_tst","Status",["","blocked","alerted"],"")+fld("asm_scan","Entries to scan","1000","1000")+wsel("asm_tw")+
   '</div><div style="margin-top:8px"><button onclick="asmLookup(\'tophosts\')">Top 10 hostnames by violations</button> '+
@@ -4124,8 +5849,135 @@ async function adminAudit(){setBusy("admin audit (can take up to a minute)");
 async function appsec(c){const names={waf:"coverage",ssl:"SSL posture"};setBusy(names[c]);
  const r=await api("/api/appsec",{id:cur,check:c,vsys:g("as_vsys"),vdom:g("as_vdom"),days:g("as_days")});show(r,names[c])}
 async function asmLookup(m){setBusy("ASM request log");
+ if(m==="header"){const r=await api("/api/f5asm",{id:cur,mode:m,header_name:g("asm_hn"),header_value:g("asm_hv"),hostname:g("asm_hh"),
+  status:g("asm_hst"),top:g("asm_htop"),scan:g("asm_hscan"),within:g("asm_hw")});return show(r,"ASM requests by header")}
  const r=await api("/api/f5asm",{id:cur,mode:m,support_id:g("asm_sid"),ip:g("asm_ip"),header_ip:g("asm_tci"),hostname:g("asm_host"),url:g("asm_url"),status:m==="tophosts"?g("asm_tst"):g("asm_st"),top:g("asm_top"),scan:g("asm_scan"),within:m==="tophosts"?g("asm_tw"):m==="supportid"?g("asm_sw"):g("asm_w")});
  show(r,m==="supportid"?"support ID lookup":m==="tophosts"?"top hostnames by violations":"ASM request search")}
+const CFW=["last 15 minutes","last hour","last 6 hours","last 12 hours","last 24 hours","last 3 days","last 7 days","last 30 days"];
+const CF_ACT=["","block","managed_challenge","challenge","jschallenge","log","skip","allow","bypass","connection_close"];
+const CF_EVBY=["action","source","rule","client IP","host","path","country","ASN","user agent","colo","time"];
+const CF_HTBY=["host","edge status","origin status","edge + origin status","cache status","client IP","path","country","ASN","user agent","colo","security action","TLS version","HTTP version","time"];
+const CF_ST=["","2xx","3xx","4xx","5xx","4xx + 5xx","origin errors (520-527)"];
+function renderCf(){const box=$("#cftools");box.innerHTML="";const d=dev();if(!d||d.vendor!=="cloudflare")return;
+ const f5=devices.filter(x=>x.vendor==="f5");
+ let h='<div class="card"><h3>Cloudflare · scope for every lookup below</h3><div class="row3">'+
+  '<div><label>Zone (blank = all zones)</label><input id="cf_zone" list="cf_zl" placeholder="example.com"><datalist id="cf_zl">'+
+  (d.zones||[]).map(z=>'<option value="'+esc(z)+'">').join("")+'</datalist></div>'+
+  sel("cf_w","Time range",CFW,"last 24 hours")+fld("cf_since","Custom from (UTC+3, optional)","2026-11-01 08:00")+
+  fld("cf_until","Custom to (UTC+3, optional)","2026-11-01 09:00")+
+  '<div><label>Cross-check on F5 (optional)</label><select id="cf_f5"><option value="">none</option>'+
+  f5.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+'</option>').join("")+'</select></div></div>'+
+  '<p class="muted" style="margin:8px 0 0">How far back you can query, and which datasets exist, depends on the zone plan. Times are shown in UTC+3.'+
+  (f5.length?'':' Connect an F5 device to cross-check Ray IDs and IPs against the ASM request log.')+'</p></div>';
+ h+='<div class="card"><h3>Investigate · everything Cloudflare knows</h3><div class="row3">'+
+  fld("cf_ip","Client or origin IP","198.51.100.9")+fld("cf_host","Hostname","app.example.com")+fld("cf_ray","Ray ID","8d3c1a2b3c4d5e6f-FRA")+
+  fld("cf_days","Cert warning (days)","30","30")+'</div><div class="row" style="margin-top:8px;flex-wrap:wrap">'+
+  '<button class="primary" onclick="cfIp()">Investigate IP</button><button class="primary" onclick="cfHost()">Investigate hostname</button>'+
+  '<button class="primary" onclick="cfRay()">Look up Ray ID</button></div>'+
+  '<p class="muted" style="margin:8px 0 0">IP: security events, traffic, IP Access Rules, IP lists, rules and DNS records that involve it. Hostname: DNS, proxy status, certificates, settings, rules, Workers, page rules, load balancers, errors. Ray ID: what Cloudflare did with that one request (plus the F5 ASM entry via the CF-Ray header).</p></div>';
+ h+='<div class="card"><h3>Security events · WAF, rate limiting, bots, IP rules</h3><div class="row3">'+
+  fld("cf_e_ip","Client IP","198.51.100.9")+fld("cf_e_host","Host (* wildcard)","app.example.com")+fld("cf_e_path","Path contains","/login")+
+  fld("cf_e_ray","Ray ID","8d3c1a2b3c4d5e6f")+sel("cf_e_act","Action",CF_ACT,"")+
+  '<div><label>Source (security product)</label><input id="cf_e_src" list="cf_srcl" placeholder="firewallManaged"><datalist id="cf_srcl">'+
+  ["firewallManaged","firewallCustom","ratelimit","waf","firewallRules","botFight","botManagement","bic","hot","l7ddos","securitylevel","uablock","zonelockdown","ip","iprange","asn","country","validation","apiShield","dlp"].map(x=>'<option value="'+x+'">').join("")+'</datalist></div>'+
+  fld("cf_e_rule","Rule ID","")+fld("cf_e_cc","Country (2 letters)","US")+fld("cf_e_asn","ASN","13335")+fld("cf_e_ua","User agent contains","curl")+
+  fld("cf_e_m","Method","POST")+fld("cf_e_n","Max rows","100","100")+'</div><div class="row" style="margin-top:8px;flex-wrap:wrap">'+
+  '<button class="primary" onclick="cfEvents()">Search events</button></div><div class="row3" style="margin-top:8px">'+sel("cf_e_by","Top: group by",CF_EVBY,"action")+fld("cf_e_top","Top N","20","20")+
+  '</div><div style="margin-top:8px"><button onclick="cfEventTop()">Top events</button> <span class="muted">(same filters; "time" gives a timeline)</span></div></div>';
+ h+='<div class="card"><h3>HTTP traffic · requests, status codes, cache, origin errors</h3><div class="row3">'+
+  fld("cf_t_host","Host (* wildcard)","app.example.com")+fld("cf_t_ip","Client IP","198.51.100.9")+fld("cf_t_path","Path contains","/api")+
+  sel("cf_t_st","Edge status",CF_ST,"")+fld("cf_t_cache","Cache status","hit, miss, dynamic")+fld("cf_t_ray","Ray ID (sampled requests)","")+
+  sel("cf_t_by","Summary: group by",CF_HTBY,"edge status")+fld("cf_t_top","Top N","20","20")+fld("cf_t_n","Max sampled rows","100","100")+
+  '</div><div class="row" style="margin-top:8px;flex-wrap:wrap"><button class="primary" onclick="cfTraffic()">Traffic summary</button>'+
+  '<button onclick="cfRequests()">Sampled requests</button><button onclick="cfDash()">Traffic dashboard</button></div></div>';
+ h+='<div class="card"><h3>Configuration</h3><div class="row3">'+fld("cf_r_q","Rules: text, IP, $list, rule or ruleset ID","/login or 203.0.113.7")+
+  '</div><div style="margin-top:8px"><button onclick="cfRules()">Search rules</button> <span class="muted">(blank = list all security rules)</span></div>'+
+  '<div class="row3" style="margin-top:10px">'+fld("cf_d_name","DNS name contains","app")+fld("cf_d_content","DNS content contains","203.0.113.10")+
+  sel("cf_d_type","Record type",["","A","AAAA","CNAME","TXT","MX","NS","CAA","SRV"],"")+'</div><div style="margin-top:8px"><button onclick="cfDns()">Search DNS</button></div>'+
+  '<div class="row" style="margin-top:10px;flex-wrap:wrap"><button onclick="cfPosture()">Security posture (settings, TLS, certificates)</button>'+
+  '<button onclick="cfLb()">Load balancers &amp; health checks</button></div></div>';
+ h+='<div class="card"><h3>Audit log · who changed what</h3><div class="row3">'+fld("cf_a_email","Actor e-mail","admin@example.com")+
+  fld("cf_a_act","Action contains","change, delete, login")+fld("cf_a_res","Resource / text contains","firewall")+fld("cf_a_n","Max rows","100","100")+
+  '</div><div style="margin-top:8px"><button class="primary" onclick="cfAudit()">Search audit log</button> <span class="muted">(uses the scope zone and time range)</span></div></div>';
+ box.innerHTML=h}
+async function cfRun(mode,label,extra){setBusy(label+(g("cf_f5")&&(mode==="ip"||mode==="ray")?" + F5 cross-check (up to a few minutes)":""));
+ const r=await api("/api/cf",Object.assign({id:cur,mode,zone:g("cf_zone"),within:g("cf_w"),since:g("cf_since"),until:g("cf_until"),f5:g("cf_f5")},extra));show(r,label)}
+function cfIp(){cfRun("ip","Cloudflare IP investigation",{ip:g("cf_ip")})}
+function cfHost(){cfRun("host","Cloudflare hostname investigation",{host:g("cf_host"),days:g("cf_days")})}
+function cfRay(){cfRun("ray","Cloudflare Ray ID lookup",{ray:g("cf_ray")})}
+function cfEvF(){return {ip:g("cf_e_ip"),host:g("cf_e_host"),path:g("cf_e_path"),ray:g("cf_e_ray"),action:g("cf_e_act"),source:g("cf_e_src"),
+ rule:g("cf_e_rule"),country:g("cf_e_cc"),asn:g("cf_e_asn"),ua:g("cf_e_ua"),method:g("cf_e_m")}}
+function cfEvents(){cfRun("events","Cloudflare security events",Object.assign(cfEvF(),{top:g("cf_e_n")}))}
+function cfEventTop(){cfRun("event_top","Cloudflare top security events",Object.assign(cfEvF(),{by:g("cf_e_by"),top:g("cf_e_top")}))}
+function cfHtF(){return {host:g("cf_t_host"),ip:g("cf_t_ip"),path:g("cf_t_path"),status:g("cf_t_st"),cache:g("cf_t_cache")}}
+function cfTraffic(){cfRun("traffic","Cloudflare traffic summary",Object.assign(cfHtF(),{by:g("cf_t_by"),top:g("cf_t_top")}))}
+function cfRequests(){cfRun("requests","Cloudflare sampled requests",Object.assign(cfHtF(),{ray:g("cf_t_ray"),top:g("cf_t_n")}))}
+function cfDash(){cfRun("dashboard","Cloudflare traffic dashboard",cfHtF())}
+// ---- Cloudflare traffic dashboard: inline SVG charts (palette validated for the dark chart surface) ----
+const DC=["#3987e5","#d95926","#199e70","#c98500","#d55181","#008300"],DOTHER="#8f8cb8";
+const DKEYS={status:["2xx","3xx","4xx","5xx","1xx"],cache:["hit","miss","dynamic","bypass","none","expired"],ttfb:["p50","p95","p99"]};
+function dColor(kind,name){const i=(DKEYS[kind]||[]).indexOf(name);return i<0?DOTHER:DC[i]}
+function dNum(n){n=+n||0;const a=Math.abs(n);return a>=1e9?(n/1e9).toFixed(2)+"B":a>=1e6?(n/1e6).toFixed(2)+"M":a>=1e3?(n/1e3).toFixed(2)+"k":String(Math.round(n))}
+function dBytes(n){n=+n||0;const u=["B","KB","MB","GB","TB"];let i=0;while(Math.abs(n)>=1000&&i<4){n/=1000;i++}return (i?n.toFixed(2):n)+" "+u[i]}
+function dMs(n){n=+n||0;return n>=1000?(n/1000).toFixed(1)+" s":Math.round(n)+" ms"}
+const DFMT={num:dNum,bytes:dBytes,pct:v=>(+v||0).toFixed(2)+"%",ms:dMs};
+function dNice(m){if(m<=0)return 1;const p=Math.pow(10,Math.floor(Math.log10(m))),f=m/p;return (f<=1?1:f<=2?2:f<=5?5:10)*p}
+function dShort(lbls){const days=new Set(lbls.map(l=>String(l).slice(0,10)));
+ return lbls.map(l=>{l=String(l);return l.length<16?l:days.size>1?l.slice(5,16):l.slice(11,16)})}
+function dSpark(vals){const W=160,H=30,n=vals.length,m=Math.max(...vals,0)||1;if(n<2)return "";
+ const pts=vals.map((v,i)=>(i*(W/(n-1))).toFixed(1)+","+(H-2-(v/m)*(H-4)).toFixed(1)).join(" ");
+ return '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" style="height:30px" aria-hidden="true"><polyline points="'+pts+'" fill="none" stroke="#3987e5" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>'}
+function dChart(title,labels,series,o){
+ const W=640,H=220,L=60,R=8,T=8,B=24,pw=W-L-R,ph=H-T-B,n=labels.length,fmt=o.fmt||dNum,sl=dShort(labels);
+ const card=mk("div","dcard");card.appendChild(mk("div","sec",title));
+ if(series.length>1){const lg=mk("div","dleg");series.forEach(s=>{const x=mk("span");const sw=mk("i");sw.style.background=s.color;
+  x.appendChild(sw);x.appendChild(document.createTextNode(s.name));
+  if(!o.noTotal)x.appendChild(mk("b",null,fmt(s.vals.reduce((a,b)=>a+b,0))));lg.appendChild(x)});card.appendChild(lg)}
+ if(!n){card.appendChild(mk("div","nv","No data in this range."));return card}
+ let max=0;for(let i=0;i<n;i++){max=o.stack?Math.max(max,series.reduce((a,s)=>a+(s.vals[i]||0),0)):Math.max(max,...series.map(s=>s.vals[i]||0))}
+ max=dNice(max);const y=v=>T+ph-(v/max)*ph,step=pw/n;
+ let s='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+esc(title)+'">';
+ for(let k=0;k<=4;k++){const v=max*k/4,yy=y(v).toFixed(1);
+  s+='<line x1="'+L+'" x2="'+(W-R)+'" y1="'+yy+'" y2="'+yy+'" stroke="#2a2850" stroke-width="1"/>'+
+   '<text x="'+(L-6)+'" y="'+(+yy+4)+'" text-anchor="end" font-size="12" fill="#8f8cb8">'+esc(fmt(v))+'</text>'}
+ const ticks=Math.min(6,n);for(let k=0;k<ticks;k++){const i=Math.round(k*(n-1)/Math.max(1,ticks-1));
+  const last=k===ticks-1&&ticks>1;  // keep the last label inside the plot
+  s+='<text x="'+(last?W-R:L+step*i+step/2).toFixed(1)+'" y="'+(H-6)+'" text-anchor="'+(last?"end":"middle")+'" font-size="12" fill="#8f8cb8">'+esc(sl[i])+'</text>'}
+ if(o.stack){const bw=Math.max(1,step-(step>4?2:0));
+  for(let i=0;i<n;i++){let base=0;const x=(L+step*i+(step-bw)/2).toFixed(1);
+   series.forEach(sr=>{const v=sr.vals[i]||0;if(!v)return;const y1=y(base+v),seg=y(base)-y1,gap=base&&seg>3?1:0;  // 1px surface gap between segments
+    s+='<rect x="'+x+'" y="'+y1.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(0,seg-gap).toFixed(1)+'" fill="'+sr.color+'"/>';base+=v})}}
+ else series.forEach(sr=>{const pts=sr.vals.map((v,i)=>(L+step*i+step/2).toFixed(1)+","+y(v||0).toFixed(1)).join(" ");
+  s+='<polyline points="'+pts+'" fill="none" stroke="'+sr.color+'" stroke-width="2" stroke-linejoin="round"/>'});
+ for(let i=0;i<n;i++){const tip=labels[i]+"\n"+series.map(sr=>sr.name+": "+fmt(sr.vals[i]||0)).join("\n");
+  s+='<rect class="hv" x="'+(L+step*i).toFixed(1)+'" y="'+T+'" width="'+Math.max(step,1).toFixed(1)+'" height="'+ph+'"><title>'+esc(tip)+'</title></rect>'}
+ const box=mk("div");box.innerHTML=s+'</svg>';card.appendChild(box);return card}
+function dTop(title,rows){const card=mk("div","dcard");card.appendChild(mk("div","sec",title));
+ const g=mk("div","dtop"),m=Math.max(...rows.map(r=>r[1]),1),ipList=title==="Top client IPs";
+ rows.forEach(([name,v])=>{const nm=mk("div","dn"+(ipList?" lnk":""),name);nm.title=ipList?"Investigate "+name:name;
+  if(ipList)nm.onclick=()=>{const i=$("#cf_ip");if(i){i.value=name;cfIp()}};
+  const bar=mk("div","db"),fill=mk("span");fill.style.width=(100*v/m).toFixed(1)+"%";bar.appendChild(fill);
+  g.appendChild(nm);g.appendChild(bar);g.appendChild(mk("div","dvv",dNum(v)))});card.appendChild(g);return card}
+function dashNode(d){const w=mk("div","dash");
+ const tiles=mk("div","dtiles");d.tiles.forEach(t=>{const x=mk("div","dtile");x.appendChild(mk("div","dl",t.label));
+  const v=mk("div","dv",t.value==null?"n/a":DFMT[t.fmt](t.value));
+  if(t.value!=null&&t.prev){const c=100*(t.value-t.prev)/t.prev;v.appendChild(mk("span","dc",(c>=0?"↗ ":"↘ ")+Math.abs(c).toFixed(1)+"%"))}
+  x.appendChild(v);const sp=mk("div");sp.innerHTML=dSpark(t.spark||[]);x.appendChild(sp);tiles.appendChild(x)});
+ w.appendChild(tiles);w.appendChild(mk("div","muted","↗ / ↘ = change vs the previous period of the same length · buckets: "+d.bucket+" · hover a chart for values"));
+ const grid=mk("div","dgrid");
+ grid.appendChild(dChart("Requests over time",d.t,[{name:"Requests",color:DC[0],vals:d.requests}],{}));
+ grid.appendChild(dChart("Data transfer",d.t,[{name:"Data transfer",color:DC[0],vals:d.bytes}],{fmt:dBytes}));
+ grid.appendChild(dChart("Requests by status code",d.t,d.status.map(([k,v])=>({name:k,color:dColor("status",k),vals:v})),{stack:true}));
+ grid.appendChild(dChart("Requests by cache status",d.t,d.cache.map(([k,v])=>({name:k,color:dColor("cache",k),vals:v})),{stack:true}));
+ if(d.ttfb.length)grid.appendChild(dChart("Edge TTFB percentiles",d.t,d.ttfb.map(([k,v])=>({name:k,color:dColor("ttfb",k),vals:v})),{fmt:dMs,noTotal:true}));
+ w.appendChild(grid);
+ if(d.tops.length){const tg=mk("div","dgrid tops");d.tops.forEach(([t,rows])=>tg.appendChild(dTop(t,rows)));w.appendChild(tg)}
+ return w}
+function cfRules(){cfRun("rules","Cloudflare rule search",{q:g("cf_r_q")})}
+function cfDns(){cfRun("dns","Cloudflare DNS search",{name:g("cf_d_name"),content:g("cf_d_content"),type:g("cf_d_type")})}
+function cfPosture(){cfRun("posture","Cloudflare security posture",{days:g("cf_days")})}
+function cfLb(){cfRun("lb","Cloudflare load balancers & health",{})}
+function cfAudit(){cfRun("audit","Cloudflare audit log",{email:g("cf_a_email"),action:g("cf_a_act"),resource:g("cf_a_res"),top:g("cf_a_n")})}
 async function panLogs(){setBusy("log search (can take up to a minute)");
  const r=await api("/api/panlogs",{id:cur,ip:g("pl_ip"),dest_ip:g("pl_dst"),dest_type:{"normal destination":"normal","DNAT (translated) destination":"dnat"}[g("pl_dtype")]||"either",log_type:g("pl_type"),period:g("pl_period"),count:g("pl_n"),blocked:g("pl_blocked")==="blocked only",allowed:g("pl_blocked")==="allowed only"});show(r,"log search")}
 async function fgLogs(){setBusy("traffic log search");

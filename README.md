@@ -1,12 +1,12 @@
 # ITSec Ops (netsecops)
 
 A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto PAN-OS** and **FortiGate**
-devices from one place. Python 3.8+, standard library only, no dependencies, built with Claude Code.
+devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard library only, no dependencies, built with Claude Code.
 
 ## Features
 - Health checks and curated read-only status queries per vendor
 - "Where does this IP appear?" lookup (F5 pools, nodes, virtuals, data groups, policies; PAN/Forti policy lookup)
-- F5 ASM/WAF request-log search, top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
+- F5 ASM/WAF request-log search (incl. by any HTTP header: value, IP, True-Client-IP, hostname, URL, time, support ID, POST body), top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
 - FortiGate lookups: Virtual IPs (name / external / mapped IP filter), static routes (IP, gateway, interface filter)
 - PAN-OS lookups: destination / static NAT rules (the Virtual IP equivalent), configured static routes, session list
   with source / destination filter (URL category lookup was already available)
@@ -17,6 +17,23 @@ devices from one place. Python 3.8+, standard library only, no dependencies, bui
 - Optional PAN-OS packet capture (packet-diag, explicit tick-box required), downloaded as .pcap
 - Configuration backup (F5: explicit tick-box required, the UCS archive is also kept on the BIG-IP;
   PAN-OS / FortiGate: read-only export)
+- Cloudflare (API token; every lookup runs over all zones the token sees, or one zone, for a time range):
+  - Investigate an IP (security events, traffic, IP Access Rules incl. ranges / ASN / country, IP lists, rules and
+    DNS records that involve it, whether it is a Cloudflare edge address), a hostname (DNS and proxy status,
+    certificates, zone settings, rules, Workers routes, page rules, load balancers, 5xx / 52x origin errors) or a
+    Ray ID (what Cloudflare did with that request)
+  - Security event search (IP, host, path, Ray ID, action, source, rule, country, ASN, user agent, method) and
+    top-N / timeline by action, source, rule, IP, host, path, country, ASN, user agent, colo
+  - HTTP traffic summaries (status codes, origin status, cache, TLS / HTTP version, colo, ...) and sampled requests
+  - Traffic dashboard (optional button): headline tiles with change vs the previous period, requests, data
+    transfer, status codes, cache status and edge TTFB p50 / p95 / p99 over time, and top paths, countries,
+    client IPs, ASNs, hosts and referrers; drawn in the page (no external libraries), with the numbers as tables below
+  - Rule search (text, IP, `$list`, rule or ruleset ID, incl. managed rules a zone deploys), DNS search, security
+    posture (SSL mode, minimum TLS, HTTPS redirect, security level, True-Client-IP header, certificates, DNS-only records),
+    load balancer origin health and health checks, account audit log
+  - Cross-check with a connected F5: a Ray ID is looked up in the ASM log by the `CF-Ray` header, an IP by
+    True-Client-IP, so one lookup shows whether Cloudflare or the F5 blocked a request
+  - The raw box accepts `/client/v4/...` GET paths or GraphQL queries (mutations are refused)
 
 ## Run
 ```
@@ -72,6 +89,25 @@ the machine running this tool.
 | Traffic log search, admin audit | Read on Log & Report |
 | Configuration backup | **super_admin** profile (FortiOS requires it for the backup API) |
 
+
+### Cloudflare
+Create a **custom API token** with read permissions only (Read, never Edit), limited to the zones / accounts you
+work on. Each permission only enables its part; anything missing is reported in the output, not as a failure.
+Permission names below are as the Cloudflare dashboard shows them and may change slightly over time.
+
+| Feature | Token permission (Read) |
+|---|---|
+| Everything (zone list) | Zone: Zone |
+| Security events, traffic summaries, sampled requests, Ray ID | Zone: Analytics |
+| DNS search, hostname / IP investigation | Zone: DNS |
+| Security posture, hostname investigation | Zone: Zone Settings, Zone: SSL and Certificates, Zone: Transform Rules |
+| Rule search, IP / hostname investigation | Zone: Zone WAF, Zone: Firewall Services, Account: Account Rulesets, Account: Account Firewall Access Rules, Account: Account Filter Lists |
+| Hostname investigation (extras) | Zone: Workers Routes, Zone: Page Rules |
+| Load balancers & health checks | Zone: Load Balancers, Zone: Health Checks, Account: Load Balancing: Monitors and Pools |
+| Audit log | Account: Account Settings (audit logs) |
+
+Which analytics datasets exist, and how far back and how wide one query can be, depends on the zone plan.
+For an account-owned token, enter the Account ID when connecting.
 
 ## Disclaimer
 Use only on devices you are authorised to administer. Provided as-is, without warranty; review the code
