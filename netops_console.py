@@ -21,6 +21,8 @@ Design notes
   FortiGate it is a read-only export with no tick-box. Backups are saved in ./captures and downloaded by the browser.
 - EXCEPTION: the PAN-OS packet capture runs <debug><dataplane><packet-diag> commands (needs a tick-box). It
   clears all packet-diag settings before and after, which also ends any capture another admin has running.
+- EXCEPTION: 'Download a file or folder' on F5 reads any path through util/bash (same tick-box); a folder is
+  packed into a .tar.gz in /var/tmp first and removed afterwards. Files holding secrets need a second tick-box.
 - The tool talks to device management APIs over HTTPS from THIS machine.
 - AppSec checks (WAF / profile coverage, SSL posture, ASM request log,
   PAN log search) are read-only.
@@ -715,6 +717,7 @@ CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures
 F5_LOGS = ("ltm", "audit", "apm", "gtm", "tmm", "asm")
 IFACE_RE = re.compile(r'^(?!-)[0-9A-Za-z_.:\-]{1,32}$')   # no leading '-': it would be read as a tcpdump option
 FILE_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,120}\.(pcap|pms|ucs|xml|conf)$')
+DL_RE = re.compile(r'^f5file_[A-Za-z0-9_.\-]{1,200}$')   # files saved by the F5 file download (any extension)
 
 
 def tok_ok(value):
@@ -1881,6 +1884,137 @@ def do_f5_capture(b):
     return result
 
 
+# ---- F5 file download: any file, or a folder as .tar.gz ----------------------
+MAX_F5_FILE = 500 * 1024 * 1024
+# Paths that hold secrets (password hashes, private keys, the master key, encrypted passwords in the config):
+# downloading them needs a second tick-box. Entries ending in '/' are folders.
+F5_SENSITIVE = ("/etc/shadow", "/etc/gshadow", "/config/bigip.conf", "/config/bigip_base.conf",
+                "/config/bigip_user.conf", "/config/BigDB.dat", "/config/ssl/ssl.key/", "/config/filestore/",
+                "/config/bigip/kstore/", "/config/bigip/auth/", "/config/httpd/conf/ssl.key/", "/root/.ssh/",
+                "/home/", "/var/local/ucs/")
+
+
+def f5_sensitive(path, is_dir):
+    if not is_dir:
+        return path.endswith(".key") or any(path.startswith(s) for s in F5_SENSITIVE)
+    d = path.rstrip("/") + "/"
+    return any(s.startswith(d) or d.startswith(s) for s in F5_SENSITIVE)
+
+
+def f5_list_dir(sess, real, t0):
+    """Entries of one BIG-IP folder (folders first), at most 2000."""
+    st, ok, out, data = f5_bash(sess, "find %s -mindepth 1 -maxdepth 1 -printf '%%y|%%s|%%TY-%%Tm-%%Td %%TH:%%TM|%%p\\n' "
+                                      "2>&1 | head -2000" % shlex.quote(real), 60)
+    if not ok:
+        raise ValueError(f5_bash_error(st, data, "folder listing"))
+    kinds = {"d": "folder", "f": "file", "l": "link"}
+    rows = []
+    for ln in out.splitlines():
+        p = ln.split("|", 3)
+        if len(p) == 4 and p[1].isdigit():
+            rows.append({"type": kinds.get(p[0], p[0]), "name": p[3].rsplit("/", 1)[-1],
+                         "size": cf_fmt_bytes(int(p[1])) if p[0] == "f" else "", "modified": p[2], "path": p[3]})
+    rows.sort(key=lambda r: (r["type"] != "folder", r["name"].lower()))
+    return {"ok": True, "status": st, "ms": int((time.time() - t0) * 1000), "request": "bash: find " + real,
+            "verdict": {"label": "%d ITEM(S) IN %s" % (len(rows), real), "kind": "info"},
+            "summary": ["Pick a path from the Path field's list (it now holds these entries) and press Download."]
+                       + (["Only the first 2000 entries are shown."] if len(rows) >= 2000 else []),
+            "data": {"entries": rows}}
+
+
+def do_f5_file(b):
+    """Browse a BIG-IP folder, or copy one file (or a folder as .tar.gz) to this PC through util/bash."""
+    sess, err = _f5_gate(b)
+    if err:
+        return err
+    t0 = time.time()
+    path = str(b.get("path") or "").strip()
+    if not path.startswith("/") or len(path) > 1024 or re.search(r"[\x00-\x1f\x7f]", path):
+        return {"ok": False, "error": "enter an absolute path on the BIG-IP, e.g. /var/log/ltm"}
+    tmp, local, result = None, None, None
+    try:
+        st, ok, out, data = f5_bash(sess, "p=$(readlink -f -- %s) && stat -c '%%F|%%s' -- \"$p\" 2>&1 && echo \"$p\""
+                                    % shlex.quote(path), 30)
+        if not ok:
+            raise ValueError(f5_bash_error(st, data, "file lookup"))
+        lines = [l for l in out.splitlines() if l.strip()]
+        if len(lines) < 2 or "|" not in lines[0]:
+            raise ValueError("%s: %s" % (path, (out.strip() or "no such file or folder")[:200]))
+        kind, real = lines[0].split("|", 1)[0], lines[1].strip()
+        is_dir = kind == "directory"
+        if not is_dir and not kind.startswith("regular"):
+            raise ValueError("%s is a %s, not a file or folder" % (real, kind))
+        if b.get("mode") == "list":
+            audit(sess, "file browser: list " + real)
+            return f5_list_dir(sess, real if is_dir else real.rsplit("/", 1)[0] or "/", t0)
+        if f5_sensitive(real, is_dir) and b.get("sensitive") is not True:
+            raise ValueError("%s holds (or may hold) secrets: password hashes, private keys, the master key or "
+                             "encrypted passwords. Tick 'Allow sensitive files' to download it anyway." % real)
+        src = real
+        if is_dir:
+            parent, name = real.rstrip("/").rsplit("/", 1)
+            if not name:
+                raise ValueError("choose a folder below /, not the whole file system")
+            st, ok, out, data = f5_bash(sess, "du -sb -- %s 2>/dev/null | cut -f1" % shlex.quote(real), 120)
+            if ok and out.strip().isdigit() and int(out.strip()) > MAX_F5_FILE:
+                raise ValueError("%s holds %d MB, over the %d MB limit; download a subfolder or single files" % (
+                    real, int(out.strip()) >> 20, MAX_F5_FILE >> 20))
+            # Pack it detached and poll, so no single REST call has to stay open for the whole tar.
+            tmp = "/var/tmp/itsec_dl_%s.tar.gz" % time.strftime("%Y%m%d-%H%M%S")
+            inner = "tar czf %s -C %s -- %s > %s.log 2>&1; echo $? > %s.rc; chmod 600 %s" % (
+                tmp, shlex.quote(parent or "/"), shlex.quote(name), tmp, tmp, tmp)
+            audit(sess, "file download: packing folder " + real)
+            st, ok, out, data = f5_bash(sess, "setsid nohup sh -c %s > /dev/null 2>&1 < /dev/null &" % shlex.quote(inner), 20)
+            if not ok:
+                raise ValueError(f5_bash_error(st, data, "tar start"))
+            deadline = time.time() + 600
+            while True:
+                time.sleep(3)
+                st, ok, out, data = f5_bash(sess, "cat %s.rc 2>/dev/null && tail -c 400 %s.log" % (tmp, tmp), 20)
+                rc = out.split()[0] if ok and out.split() else ""
+                if rc.isdigit():
+                    break
+                if time.time() > deadline:
+                    raise ValueError("packing %s did not finish within 10 minutes" % real)
+            if rc not in ("0", "1"):   # 1 = a file changed while being read (normal for live logs)
+                raise ValueError("tar failed (exit %s): %s" % (rc, " ".join(out.split()[1:])[:300]))
+            src = tmp
+        os.makedirs(CAPTURE_DIR, exist_ok=True)
+        safe = re.sub(r'[^A-Za-z0-9_.\-]', "_", sess["name"])
+        base = re.sub(r'[^A-Za-z0-9_.\-]', "_", real.rstrip("/").rsplit("/", 1)[-1])[:120] + (".tar.gz" if is_dir else "")
+        local_name = "f5file_%s_%s_%s" % (safe[:40], time.strftime("%Y%m%d-%H%M%S"), base)
+        local = os.path.join(CAPTURE_DIR, local_name)
+        audit(sess, "file download: %s" % real)
+        written = f5_fetch(sess, src, local, MAX_F5_FILE)
+        audit(sess, "file download: %s saved (%d bytes)" % (real, written))
+        result = {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "bash: read " + real,
+                  "download": "/api/capture/" + local_name, "downloads": ["/api/capture/" + local_name],
+                  "verdict": {"label": "%s DOWNLOADED (%s)" % ("FOLDER" if is_dir else "FILE", cf_fmt_bytes(written)),
+                              "kind": "ok"},
+                  "summary": ["BIG-IP %s: %s%s" % ("folder" if is_dir else "file", real,
+                                                    " (resolved from %s)" % path if real != path.rstrip("/") else ""),
+                              "Saved locally: " + local, "Copied in 256 KB blocks over iControl REST; MD5 verified."]
+                             + (["This file can hold secrets: store the copy securely."] if f5_sensitive(real, is_dir)
+                                else []),
+                  "data": {"bigip_path": real, "saved_file": local, "size_bytes": written}}
+    except (ValueError, RuntimeError) as e:
+        result = {"ok": False, "error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        result = {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+    finally:
+        if local and not (result or {}).get("ok"):
+            try:
+                os.remove(local)  # drop a partial download
+            except OSError:
+                pass
+        if tmp:
+            try:
+                f5_bash(sess, "rm -f %s %s.log %s.rc" % (tmp, tmp, tmp), 20)
+            except (urllib.error.URLError, OSError):
+                pass
+    return result
+
+
 # ----------------------------------------------------------------------------
 # AppSec: WAF / security-profile coverage, SSL posture,
 # F5 ASM request log, PAN log search
@@ -2198,6 +2332,34 @@ def asm_row(it):
             "response_code": it.get("responseCode"), "rating": it.get("violationRating")}
 
 
+# Request status names differ by TMOS version: an alerted (illegal but not blocked) request is 'illegal' on some.
+ASM_STATUS = {"blocked": ("blocked",), "alerted": ("alerted", "illegal", "alarmed"), "passed": ("passed", "legal")}
+
+
+def asm_status_ok(it, status):
+    return not status or str(first(it, "requestStatus", "enforcementState") or "").lower() in ASM_STATUS[status]
+
+
+def asm_status_flt(sess, status):
+    """Device-side filter for a request status, in the name this device uses (probed once per session).
+    '' when there is no status or the device accepts none; the caller then matches locally with asm_status_ok."""
+    if not status:
+        return ""
+    cache = sess.setdefault("asm_status_flt", {})
+    if status not in cache:
+        accepted = []
+        for v in ASM_STATUS[status]:
+            f = "requestStatus eq '%s'" % v
+            st, ok, d = rest_get(sess, "/mgmt/tm/asm/events/requests?$filter=%s&$top=1" % urllib.parse.quote(f))
+            if ok and isinstance(d, dict):
+                accepted.append(f)
+                if d.get("items"):   # a name the device accepts but never uses returns nothing
+                    accepted = [f]
+                    break
+        cache[status] = accepted[0] if accepted else ""
+    return cache[status]
+
+
 def asm_http(it):
     """Raw request of a logged entry -> (header lines incl. request line, [(name_lower, value)], body); empty if absent."""
     raw = it.get("rawRequest") or {}
@@ -2232,7 +2394,7 @@ def f5_asm_by_header(sess, b, t0):
     hkey, vq = hname.lower(), hval.lower()
     audit(sess, "ASM request log by header: %s %s %s" % (hname, ("contains '%s'" % hval) if hval else "present",
                                                            status or "any status"))
-    flt = "requestStatus eq '%s'" % status if status else ""
+    flt = asm_status_flt(sess, status)
     base = "/mgmt/tm/asm/events/requests?" + ("$filter=%s&" % urllib.parse.quote(flt) if flt else "")
     order = "$orderby=requestDatetime%20desc&"
     st, ok0, d0 = rest_get(sess, base + order + "$top=1")
@@ -2259,7 +2421,8 @@ def f5_asm_by_header(sess, b, t0):
         prev = fid
         scanned += len(page)
         for i in page:
-            if not asm_recent(i, cutoff) or (hostq and asm_hostname(i) and hostq not in asm_hostname(i).lower()):
+            if not asm_recent(i, cutoff) or not asm_status_ok(i, status) or (
+                    hostq and asm_hostname(i) and hostq not in asm_hostname(i).lower()):
                 continue
             # The list view may omit the raw request; fetch the full record (bounded by time and count).
             if not i.get("rawRequest") and fetched < 1500 and time.time() - t0 < 100 and asm_enrich(sess, i):
@@ -2299,6 +2462,8 @@ def f5_asm_by_header(sess, b, t0):
     notes = ["Header %s %s; scanned %d log entries (%d with raw request data)%s." % (
         hname, ("value contains '%s'" % hval) if hval else "present (any value)", scanned, with_raw,
         ", status " + status if status else "")]
+    if status and not flt:
+        notes.append("The device accepts no status filter, so '%s' was matched locally." % status)
     if cutoff:
         notes.append("Time range: %s (applied to the request time of each entry)." % b.get("within"))
     notes.append("Times are shown in UTC+3." if newest_first else
@@ -2345,7 +2510,7 @@ def f5_asm_top_hosts(sess, b, t0):
     audit(sess, "ASM top hostnames by violations (%s, scan %d)" % (status or "blocked+alerted", scan))
     items, notes, last_path = [], [], ""
     for stx in statuses:
-        flt = urllib.parse.quote("requestStatus eq '%s'" % stx)
+        flt = urllib.parse.quote(asm_status_flt(sess, stx))
         use_f, use_o = True, True
         prev, got, tried = None, 0, []
         for skip in range(0, scan, 200):
@@ -2359,7 +2524,7 @@ def f5_asm_top_hosts(sess, b, t0):
                     ["$top=%d" % top] + (["$skip=%d" % skip] if skip else [])
                 return "/mgmt/tm/asm/events/requests?" + "&".join(q)
             if skip == 0:   # find a query form this TMOS version accepts, simplest-last
-                for uf, uo in ((True, True), (True, False), (False, True), (False, False)):
+                for uf, uo in ((True, True), (True, False), (False, True), (False, False))[0 if flt else 2:]:
                     last_path = build(uf, uo)
                     st, ok, data = rest_get(sess, last_path)
                     if ok and isinstance(data, dict):
@@ -2385,7 +2550,7 @@ def f5_asm_top_hosts(sess, b, t0):
                 reached_old = use_o and len(kept) < len(page)   # newest first: everything after this is older
                 page = kept
             if not use_f:
-                page = [i for i in page if str(i.get("requestStatus") or "").lower() == stx]
+                page = [i for i in page if asm_status_ok(i, stx)]
             items += page
             got += len(page)
             if raw_n < top or reached_old:
@@ -2503,9 +2668,10 @@ def do_f5_asm(b):
                 parts.append("clientIp eq '%s'" % parse_ip(b.get("ip"), "client IP"))
             status = b.get("status") or ""
             if status:
-                if status not in ("blocked", "alerted", "passed"):
+                if status not in ASM_STATUS:
                     raise ValueError("invalid status")
-                parts.append("requestStatus eq '%s'" % status)
+                if asm_status_flt(sess, status):
+                    parts.append(asm_status_flt(sess, status))
             hip = ""
             if str(b.get("header_ip") or "").strip():
                 hip = str(parse_ip(b.get("header_ip"), "True-Client-IP"))
@@ -2516,12 +2682,12 @@ def do_f5_asm(b):
             if hostq and not re.match(r"^[a-z0-9_.*:\-]{1,253}$", hostq):
                 raise ValueError("hostname has characters that are not allowed (letters, digits, . - _ * only)")
             hostq = hostq.replace("*", "")
-            if not parts and not hip and not urlq and not hostq:
+            if not parts and not status and not hip and not urlq and not hostq:
                 raise ValueError("enter a client IP, True-Client-IP, hostname or URL path and/or choose a status")
             flt, top = " and ".join(parts), num(b.get("top"), 1, 200, 50, "max rows")
 
             def hostok(i):
-                return not hostq or hostq in asm_hostname(i).lower()
+                return (not hostq or hostq in asm_hostname(i).lower()) and asm_status_ok(i, status)
 
             def hit0(i):  # local match (no time test), used to verify device-side filters
                 u = str(first(i, "url", "uri") or "")
@@ -2529,7 +2695,7 @@ def do_f5_asm(b):
 
             def hit(i):  # local match while paging
                 return hit0(i) and asm_recent(i, cutoff)
-        if b.get("mode") != "supportid" and (hip or urlq or hostq):
+        if b.get("mode") != "supportid" and (hip or urlq or hostq or (status and not flt)):
             # The device's clientIp is Cloudflare's edge; True-Client-IP lives in the request headers and is not
             # reliably filterable server-side, so page through the log (other filters applied) and match locally.
             base = "/mgmt/tm/asm/events/requests?" + ("$filter=%s&" % urllib.parse.quote(flt) if flt else "")
@@ -2543,7 +2709,7 @@ def do_f5_asm(b):
             cands = [(f, e, hip) for f in ("trueClientIp", "xForwardedForHeaderValue")
                      for e in ("%s eq '%s'", "contains(%s,'%s')")] if hip else \
                     [("url", e, urlq) for e in ("contains(%s,'%s')", "%s eq '%s'")] if urlq else \
-                    [(f, "contains(%s,'%s')", hostq) for f in ("hostname", "host")]
+                    [(f, "contains(%s,'%s')", hostq) for f in ("hostname", "host")] if hostq else []
             for field, expr, val in cands:
                 cand = expr % (field, val)
                 cflt = "%s and %s" % (flt, cand) if flt else cand
@@ -2632,25 +2798,47 @@ def do_f5_asm(b):
             path = "/mgmt/tm/asm/events/requests?$filter=%s&$top=%d" % (urllib.parse.quote(flt), top)
             audit(sess, "ASM request log: " + flt)
             st, ok, data = rest_get(sess, path)
-            if not ok or not isinstance(data, dict):
+            if (not ok or not isinstance(data, dict)) and b.get("mode") == "supportid":
+                data = {}  # the device may reject a supportId filter; the lookups below still find it
+            elif not ok or not isinstance(data, dict):
                 return {"ok": False, "status": st, "error": "request log query failed (HTTP %s). Is ASM / Advanced "
                         "WAF provisioned and does the account have access?" % st}
             items = [i for i in data.get("items", []) if asm_recent(i, cutoff)]
         if b.get("mode") == "supportid":
             # Some TMOS versions ignore $filter on this collection; never trust position, match the ID.
             def has_id(i):
-                return str(i.get("supportId")) == sid or ('"%s"' % sid) in json.dumps(i)
-            seen = [str(i.get("supportId")) for i in items][:5]
+                return sid in (asm_support_id(i), str(i.get("id") or "")) or ('"%s"' % sid) in json.dumps(i)
+            seen = [asm_support_id(i) for i in items][:5]
             same = [i for i in items if has_id(i)]
             if not same:
-                for skip in range(0, 1000, 200):
-                    path = "/mgmt/tm/asm/events/requests?$top=200&$skip=%d" % skip
+                # On this BIG-IP the request's id is its support ID: fetch the record directly.
+                p1 = "/mgmt/tm/asm/events/requests/" + sid
+                s1, ok1, d1 = rest_get(sess, p1)
+                if ok1 and isinstance(d1, dict) and has_id(d1):
+                    same, path, st = [d1], p1, s1
+            if not same:
+                # Scan newest first: the default order is oldest first, so recent requests are never reached.
+                order = "$orderby=requestDatetime%20desc&"
+                s0, ok0, d0 = rest_get(sess, "/mgmt/tm/asm/events/requests?" + order + "$top=1")
+                newest_first = ok0 and isinstance(d0, dict) and bool(d0.get("items"))
+                base = "/mgmt/tm/asm/events/requests?" + (order if newest_first else "")
+                prev_first = None
+                for skip in range(0, 20000, 200):
+                    if time.time() - t0 > 100:
+                        break
+                    path = base + "$top=200&$skip=%d" % skip
                     st, ok, data = rest_get(sess, path)
                     page = data.get("items", []) if ok and isinstance(data, dict) else []
-                    seen = seen or [str(i.get("supportId")) for i in page][:5]
+                    first_id = json.dumps(page[0], sort_keys=True) if page else None
+                    if skip and first_id == prev_first:
+                        break  # device ignores $skip and repeats the first page
+                    prev_first = first_id
+                    seen = seen or [asm_support_id(i) for i in page][:5]
                     same = [i for i in page if has_id(i)]
                     if same or len(page) < 200:
                         break
+                    if cutoff and newest_first and not asm_recent(page[-1], cutoff):
+                        break  # reached entries older than the time range
             outside = [i for i in same if not asm_recent(i, cutoff)]
             items = [i for i in same if asm_recent(i, cutoff)]
         if b.get("mode") != "supportid":
@@ -2746,7 +2934,7 @@ def do_f5_asm(b):
         xff = it.get("xForwardedForHeaderValue") or hdrs.get("x-forwarded-for") or ""
         tci = it.get("trueClientIp") or hdrs.get("true-client-ip") or ""
         status = str(first(it, "requestStatus", "enforcementState") or "").lower()
-        kind = "bad" if "block" in status else "warn" if "alert" in status or violations else "ok"
+        kind = "bad" if "block" in status else "warn" if status in ASM_STATUS["alerted"] or violations else "ok"
         vip_ip = first(it, "destinationIp", "destinationIP", "destIp", "serverIp") or ""
         vip_port = first(it, "destinationPort", "destPort", "serverPort") or ""
         vip = "%s:%s" % (vip_ip, vip_port) if vip_ip and vip_port else str(vip_ip)
@@ -2756,7 +2944,10 @@ def do_f5_asm(b):
         if vs_name:
             vip = ("%s (%s)" % (vip, vs_name)) if vip else str(vs_name)
         data = {"support_id": sid,
+                "status": status,
                 "time": utc3(first(it, "requestDatetime", "occurrenceTime", "dateTime", "time")) or "",
+                "method": str(it.get("method") or (hlines[0].split(" ")[0] if hlines else "")).upper(),
+                "cf_ray": hdrs.get("cf-ray", ""),
                 "hostname": asm_hostname(it) or hdrs.get("host", ""),
                 "uri": str(first(it, "url", "uri") or ""),
                 "source_ip": it.get("clientIp", ""),
@@ -4543,6 +4734,41 @@ def cf_m_requests(sess, b, t0):
                      + cf_gql_notes(zones, res, dropped), {"requests": rows})
 
 
+CF_RAW_SLICE = 86400   # the raw (non-grouped) datasets accept at most a day per query
+
+
+def cf_ray_find(sess, zones, ray, since, until, deadline):
+    """Search one Ray ID a day at a time, newest first, until found, the data runs out or time is up.
+    -> (events oldest first, requests, {zone id: (None, errors)}, dropped fields, note on what was searched)."""
+    iso = lambda x: datetime.datetime.fromtimestamp(x, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lo, hi, slices = to_epoch(since), to_epoch(until), []
+    while hi > lo:
+        slices.append((max(lo, hi - CF_RAW_SLICE), hi))
+        hi -= CF_RAW_SLICE
+    events, reqs, errs, dropped, done = [], [], {}, set(), 0
+    for a, u in slices:
+        if done and time.time() > deadline:
+            break
+        lit = cf_lit({"datetime_geq": iso(a), "datetime_leq": iso(u), "rayName": ray})
+        res, d1 = cf_gql_zones(sess, zones, cf_q_events(lit, 50), CF_EV_FIELDS)
+        res2, d2 = cf_gql_zones(sess, zones, cf_q_requests(lit, 5), CF_RQ_FIELDS)
+        done += 1
+        dropped |= set(d1) | set(d2)
+        events = cf_rows(zones, res, "firewallEventsAdaptive", cf_ev_row, 50)[::-1]
+        reqs = cf_rows(zones, res2, "httpRequestsAdaptive", cf_rq_row, 5)
+        failed = set()
+        for r in (res, res2):
+            for zid, (_, e) in r.items():
+                if e:
+                    errs.setdefault(zid, (None, e))
+                    failed.add(zid)
+        if events or reqs or len(failed) == len(zones):   # found, or every zone refused (e.g. older than kept)
+            break
+    note = "" if len(slices) == 1 else " (searched %d of %d day(s), newest first%s)" % (
+        done, len(slices), ", stopped when found" if events or reqs else "")
+    return events, reqs, errs, sorted(dropped), note
+
+
 def cf_m_ray(sess, b, t0):
     m = CF_RAY_RE.match(str(b.get("ray") or "").strip())
     if not m:
@@ -4551,11 +4777,7 @@ def cf_m_ray(sess, b, t0):
     zones = cf_zones(sess, b.get("zone"))
     since, until, span = cf_window(b)
     audit(sess, "Cloudflare Ray ID lookup " + ray)
-    lit = cf_lit({"datetime_geq": since, "datetime_leq": until, "rayName": ray})
-    res, dropped = cf_gql_zones(sess, zones, cf_q_events(lit, 50), CF_EV_FIELDS)
-    events = cf_rows(zones, res, "firewallEventsAdaptive", cf_ev_row, 50)[::-1]
-    res2, dropped2 = cf_gql_zones(sess, zones, cf_q_requests(lit, 5), CF_RQ_FIELDS)
-    reqs = cf_rows(zones, res2, "httpRequestsAdaptive", cf_rq_row, 5)
+    events, reqs, res, dropped, searched = cf_ray_find(sess, zones, ray, since, until, t0 + 100)
     f5_rows, f5_notes, f5_label = cf_f5_check(b, "ray", ray)
     blocks = [e for e in events if e["action"] in CF_BLOCK]
     chall = [e for e in events if "challenge" in e["action"] and "solved" not in e["action"]]
@@ -4578,16 +4800,321 @@ def cf_m_ray(sess, b, t0):
         label, kind = "FOUND ON F5 ONLY (%s)" % f5_label, "warn"
     else:
         label, kind = "RAY ID %s NOT FOUND" % ray, "info"
-    notes = [cf_scope(sess, zones), "Time range: " + span] + f5_notes
+    notes = [cf_scope(sess, zones), "Time range: " + span + searched] + f5_notes
     if not events and not reqs:
         notes.append("Security events exist only for requests a security feature acted on or logged, and sampled "
-                     "request data does not hold every request. Widen the time range, or pick the zone.")
+                     "request data does not hold every request. Widen the time range (or enter the time the "
+                     "dashboard shows as a custom From / To), or pick the zone.")
+        if len(sess.get("zones") or []) > len(zones) > 1:
+            notes.append("Only the first %d zones were searched; choose the zone of this request." % len(zones))
     if f5_rows is None:
         notes.append("Tip: choose an F5 device under 'Cross-check on F5' to also find this request in the ASM log "
                      "(Cloudflare sends the Ray ID to the origin in the CF-Ray header).")
     return cf_result(t0, "GraphQL firewallEventsAdaptive + httpRequestsAdaptive (rayName %s)" % ray, label, kind,
-                     notes + cf_gql_notes(zones, res, sorted(set(dropped) | set(dropped2))),
+                     notes + cf_gql_notes(zones, res, dropped),
                      {"security_events": events, "request": reqs, "f5_asm_requests": f5_rows or []})
+
+
+# ---- WHOIS (RDAP, with port-43 WHOIS as fallback) --------------------------------
+WHOIS_BOOT = {}   # IANA RDAP bootstrap registries, loaded once per run
+WHOIS_SLD = {"com", "net", "org", "gov", "edu", "co", "ac", "med", "sch", "mil", "ne", "or", "go", "gob"}
+
+
+def web_get_json(url, timeout=12):
+    """GET a public HTTPS JSON document (IANA bootstrap, RDAP), following up to 3 HTTPS redirects (RDAP servers
+    redirect to the registry holding the record) -> (status, data or None)."""
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    for _ in range(4):
+        if not url.startswith("https://"):
+            return 0, None
+        req = urllib.request.Request(url, headers={"Accept": "application/rdap+json, application/json"})
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                st, raw = r.status, r.read(2000000)
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+                url = urllib.parse.urljoin(url, e.headers["Location"])
+                continue
+            return e.code, None
+        try:
+            return st, json.loads(raw)
+        except ValueError:
+            return st, None
+    return 0, None
+
+
+def rdap_base(kind, key):
+    """Authoritative RDAP base URL from IANA's bootstrap: kind 'dns' (key = TLD), 'ipv4' / 'ipv6' (key = address)
+    or 'asn' (key = number); '' when the registry has none."""
+    if kind not in WHOIS_BOOT:
+        st, d = web_get_json("https://data.iana.org/rdap/%s.json" % kind)
+        if not isinstance(d, dict):
+            return ""
+        WHOIS_BOOT[kind] = d.get("services") or []
+    for entries, urls in WHOIS_BOOT[kind]:
+        for e in entries:
+            try:
+                hit = (e.lower() == key if kind == "dns" else
+                       key in ipaddress.ip_network(e, strict=False) if kind.startswith("ipv") else
+                       int(e.split("-")[0]) <= key <= int(e.split("-")[-1]))
+            except ValueError:
+                hit = False
+            if hit:
+                u = next((x for x in urls if x.startswith("https://")), "")
+                return u + ("" if u.endswith("/") or not u else "/")
+    return ""
+
+
+def whois43(query, timeout=8):
+    """Plain WHOIS on TCP 43: IANA names the registry's server, which is then asked -> (server, text)."""
+    def ask(srv, q):
+        if not re.match(r"^[a-z0-9.\-]{1,253}$", srv):
+            raise ValueError("unexpected WHOIS server name %r" % srv)
+        buf = b""
+        with socket.create_connection((srv, 43), timeout=timeout) as s:
+            s.sendall((q + "\r\n").encode("ascii", "ignore"))
+            while len(buf) < 200000:
+                c = s.recv(8192)
+                if not c:
+                    break
+                buf += c
+        return buf.decode("utf-8", "replace")
+    if WHOIS_BOOT.get("tcp43_down", 0) > time.time():
+        raise OSError("TCP 43 outbound is unreachable from this host (remembered for 10 minutes)")
+    try:
+        text = ask("whois.iana.org", query)
+    except OSError:
+        WHOIS_BOOT["tcp43_down"] = time.time() + 600   # firewalled: do not wait for the timeout on every lookup
+        raise
+    m = re.search(r"(?im)^(?:refer|whois):\s*(\S+)", text)
+    if not m:
+        return "whois.iana.org", text
+    server = m.group(1).lower()
+    return server, ask(server, query)
+
+
+def whois_fields(text):
+    """'Key: value' lines of a WHOIS answer -> {lowercase key: 'v1; v2'}, skipping comments and notices."""
+    out = {}
+    for ln in text.splitlines():
+        if ln.lstrip().startswith(("%", "#", ">>>", "NOTICE", "TERMS", "URL of the ICANN")):
+            continue
+        m = re.match(r"^\s*([A-Za-z][A-Za-z0-9 /().\-]{0,40}?)\s*:\s+(\S.*?)\s*$", ln)
+        if m:
+            k = m.group(1).strip().lower()
+            if m.group(2) not in out.setdefault(k, []):
+                out[k].append(m.group(2))
+    return {k: "; ".join(v) for k, v in out.items()}
+
+
+def whois_pick(f, *keys):
+    return next((f[k] for k in keys if f.get(k)), "")
+
+
+def rdap_entities(obj, out=None):
+    """Every entity of an RDAP object, nested ones too -> {role: ['name <email>', ...]}."""
+    out = {} if out is None else out
+    for e in obj.get("entities") or []:
+        if not isinstance(e, dict):
+            continue
+        name = email = ""
+        for p in ((e.get("vcardArray") or [None, []])[1:2] or [[]])[0] or []:
+            if isinstance(p, list) and len(p) >= 4:
+                if p[0] == "fn" and not name:
+                    name = str(p[3]).strip()
+                elif p[0] == "email" and not email:
+                    email = str(p[3]).strip()
+        label = " ".join(x for x in (name or str(e.get("handle") or ""), "<%s>" % email if email else "") if x)
+        for role in e.get("roles") or []:
+            if label and label not in out.setdefault(role, []):
+                out[role].append(label)
+        rdap_entities(e, out)
+    return out
+
+
+def rdap_events(obj):
+    return {str(e.get("eventAction")): utc3(e.get("eventDate")) for e in obj.get("events") or [] if isinstance(e, dict)}
+
+
+def reg_domain(sess, host):
+    """Registered domain of a hostname: its Cloudflare zone if one covers it, else the last two labels
+    (three under a country second level such as com.sa or co.uk)."""
+    z = cf_zone_of_host(sess, host) if sess else None
+    if z:
+        return z["name"]
+    p = host.split(".")
+    return ".".join(p[-3:] if len(p) >= 3 and len(p[-1]) == 2 and p[-2] in WHOIS_SLD else p[-2:])
+
+
+def whois_domain(domain):
+    """Registration data of a domain (RDAP, else WHOIS on port 43) -> dict for display."""
+    base = rdap_base("dns", domain.rsplit(".", 1)[-1])
+    if base:
+        st, d = web_get_json(base + "domain/" + urllib.parse.quote(domain))
+        if isinstance(d, dict) and d.get("objectClassName") == "domain":
+            ev, ents = rdap_events(d), rdap_entities(d)
+            return {"domain": str(d.get("ldhName") or domain).lower(), "source": "RDAP " + base,
+                    "registrar": ", ".join(ents.get("registrar", [])),
+                    "registrant": ", ".join(ents.get("registrant", [])) or "(redacted / not published)",
+                    "created": ev.get("registration", ""), "expires": ev.get("expiration", ""),
+                    "updated": ev.get("last changed", ""), "status": [str(s) for s in d.get("status") or []],
+                    "name_servers": [str(n.get("ldhName") or "").lower() for n in d.get("nameservers") or []
+                                     if isinstance(n, dict)],
+                    "dnssec": "signed" if (d.get("secureDNS") or {}).get("delegationSigned") else "not signed",
+                    "abuse_contact": ", ".join(ents.get("abuse", []))}
+    server, text = whois43(domain)
+    f = whois_fields(text)
+    ns = re.findall(r"(?im)^\s*(?:name ?servers?|nserver)\s*:\s*([a-z0-9][a-z0-9.\-]*\.[a-z]{2,})\.?\s*$", text)
+    if not ns:   # registries that list the name servers on the lines under a 'Name Servers:' heading (e.g. .sa)
+        m = re.search(r"(?is)name ?servers?:\s*\n((?:[ \t]+\S+[^\n]*\n?)+)", text)
+        ns = re.findall(r"(?m)^\s*([a-z0-9.\-]+\.[a-z]{2,})", m.group(1)) if m else []
+    return {"domain": domain, "source": "WHOIS %s (port 43; the registry has no RDAP)" % server,
+            "registrar": whois_pick(f, "registrar", "sponsoring registrar", "registrar name"),
+            "registrant": whois_pick(f, "registrant organization", "registrant", "org", "registrant name"),
+            "created": whois_pick(f, "creation date", "created", "created on", "registered on", "registration date",
+                                  "registered"),
+            "expires": whois_pick(f, "registry expiry date", "expiry date", "expiration date", "expires",
+                                  "expires on", "paid-till", "registrar registration expiration date"),
+            "updated": whois_pick(f, "updated date", "last updated", "last modified", "changed", "updated"),
+            "status": whois_pick(f, "domain status", "status", "state"),
+            "name_servers": sorted({n.lower().rstrip(".") for n in ns}),
+            "whois_text": text.strip()[:8000]}
+
+
+def whois_ip(ip):
+    """Registration data of an IP address (RDAP from its RIR, else WHOIS on port 43) -> dict for display."""
+    base = rdap_base("ipv%d" % ip.version, ip)
+    if base:
+        st, d = web_get_json(base + "ip/" + str(ip))
+        if isinstance(d, dict) and d.get("objectClassName") == "ip network":
+            ev, ents = rdap_events(d), rdap_entities(d)
+            return {"ip": str(ip), "source": "RDAP " + base,
+                    "network_name": d.get("name", ""), "handle": d.get("handle", ""),
+                    "range": "%s - %s" % (d.get("startAddress", "?"), d.get("endAddress", "?")),
+                    "cidr": ["%s/%s" % (c.get("v4prefix") or c.get("v6prefix"), c.get("length"))
+                             for c in d.get("cidr0_cidrs") or [] if isinstance(c, dict)],
+                    "type": d.get("type", ""), "country": d.get("country", ""),
+                    "organisation": ", ".join(ents.get("registrant") or ents.get("administrative") or []),
+                    "abuse_contact": ", ".join(ents.get("abuse", [])),
+                    "registered": ev.get("registration", ""), "updated": ev.get("last changed", ""),
+                    "parent": d.get("parentHandle", ""),
+                    "remarks": " ".join(" ".join(str(x) for x in r.get("description") or [])
+                                        for r in d.get("remarks") or [] if isinstance(r, dict))[:400]}
+    server, text = whois43(str(ip))
+    f = whois_fields(text)
+    return {"ip": str(ip), "source": "WHOIS %s (port 43)" % server,
+            "network_name": whois_pick(f, "netname", "network name", "netname"),
+            "range": whois_pick(f, "inetnum", "inet6num", "netrange", "cidr"),
+            "country": whois_pick(f, "country"),
+            "organisation": whois_pick(f, "org-name", "orgname", "organization", "descr", "owner"),
+            "abuse_contact": whois_pick(f, "abuse-mailbox", "orgabuseemail", "abuse-c", "e-mail"),
+            "whois_text": text.strip()[:8000]}
+
+
+def whois_asn(asn):
+    """Holder of an autonomous system number (RDAP) -> dict for display, {} if unavailable."""
+    base = rdap_base("asn", asn)
+    st, d = web_get_json(base + "autnum/%d" % asn) if base else (0, None)
+    if not isinstance(d, dict) or d.get("objectClassName") != "autnum":
+        return {}
+    ents = rdap_entities(d)
+    return {"asn": "AS%d" % asn, "name": d.get("name", ""), "country": d.get("country", ""),
+            "holder": ", ".join(ents.get("registrant") or ents.get("administrative") or []),
+            "abuse_contact": ", ".join(ents.get("abuse", [])), "source": "RDAP " + base}
+
+
+def whois_safe(fn, arg):
+    try:
+        return fn(arg)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"error": "WHOIS lookup failed: %s (RDAP needs HTTPS to the registries; the fallback needs TCP 43 "
+                         "outbound)" % getattr(e, "reason", e)}
+
+
+def whois_domain_cf(sess, dom):
+    """Domain WHOIS; when the registry cannot be reached (no RDAP for the TLD and TCP 43 blocked, e.g. .sa),
+    fall back to what Cloudflare's zone record holds about the registration."""
+    w = whois_safe(whois_domain, dom)
+    z = next((x for x in (sess or {}).get("zones") or [] if x["name"] == dom), None) if w.get("error") else None
+    if not z:
+        return w
+    st, ok, d = cf_get(sess, "/zones/" + z["id"])
+    r = (d.get("result") or {}) if ok else {}
+    if not r:
+        return w
+    return {"domain": dom, "source": "Cloudflare zone record (registry WHOIS unreachable: %s)" % w["error"][21:],
+            "registrar": r.get("original_registrar") or "", "original_dns_host": r.get("original_dnshost") or "",
+            "name_servers": r.get("name_servers") or [], "original_name_servers": r.get("original_name_servers") or [],
+            "zone_added_to_cloudflare": utc3(r.get("created_on")), "zone_activated": utc3(r.get("activated_on")),
+            "zone_status": r.get("status", "")}
+
+
+def whois_findings(w, warn_days):
+    """Findings from a domain's registration data: expiry, registry holds, missing transfer lock."""
+    f, dom = [], w.get("domain", "")
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(w.get("expires") or ""))
+    if m:
+        left = (datetime.date(*map(int, m.groups())) - datetime.date.today()).days
+        if left < 0:
+            f.append(finding("high", dom, "Domain registration expired %d day(s) ago" % -left))
+        elif left <= warn_days:
+            f.append(finding("high" if left <= 14 else "medium", dom, "Domain registration expires in %d day(s)" % left,
+                             "Renew it at the registrar (%s)." % (w.get("registrar") or "?")))
+    st = " ".join(w["status"]) if isinstance(w.get("status"), list) else str(w.get("status") or "")
+    st = st.lower().replace(" ", "")
+    if re.search(r"hold|redemption|pendingdelete", st):
+        f.append(finding("high", dom, "Domain status is %s" % st, "The domain may stop resolving."))
+    elif st and "transferprohibited" not in st and "rdap" in str(w.get("source", "")).lower():
+        f.append(finding("low", dom, "No transfer lock (clientTransferProhibited) on the domain",
+                         "Ask the registrar to lock it against unauthorised transfers."))
+    return f
+
+
+def cf_m_whois(sess, b, t0):
+    """WHOIS of a hostname's registered domain and / or an IP: owner, registrar, dates, name servers, abuse."""
+    ipv, host = str(b.get("ip") or "").strip(), str(b.get("host") or "").strip().lower().rstrip(".")
+    if not ipv and not host:
+        raise ValueError("enter an IP and / or a hostname")
+    warn_days = num(b.get("days"), 1, 365, 30, "certificate warning days")
+    data, notes, parts, findings = {}, [], [], []
+    if host:
+        if "*" in host or not CF_HOSTNAME_RE.match(host):
+            raise ValueError("enter a hostname, e.g. app.example.com")
+        dom = reg_domain(sess, host)
+        audit(sess, "WHOIS domain " + dom)
+        w = data["whois_domain"] = whois_domain_cf(sess, dom)
+        if w.get("error"):
+            notes.append("%s: %s" % (dom, w["error"]))
+        else:
+            findings += whois_findings(w, warn_days)
+            parts.append("%s · registrar %s%s" % (dom, w.get("registrar") or "?",
+                                                  " · expires " + w["expires"] if w.get("expires") else ""))
+            if dom != host:
+                notes.append("%s is under the registered domain %s." % (host, dom))
+    if ipv:
+        ip = parse_ip(ipv, "IP address")
+        if not ip.is_global:
+            notes.append("%s is a private / reserved address: it has no public registration." % ip)
+        else:
+            audit(sess, "WHOIS IP %s" % ip)
+            w = data["whois_ip"] = whois_safe(whois_ip, ip)
+            if w.get("error"):
+                notes.append("%s: %s" % (ip, w["error"]))
+            else:
+                parts.append("%s · %s (%s)" % (ip, w.get("organisation") or w.get("network_name") or "?",
+                                               w.get("country") or "?"))
+            if any(ip in n for n in cf_edge_nets(sess) if n.version == ip.version):
+                notes.append("%s is a Cloudflare edge address; the real client is in True-Client-IP." % ip)
+    if findings:
+        data = dict({"findings": findings}, **data)
+    label, kind = cf_sev_verdict(findings, "")
+    return cf_result(t0, "WHOIS (RDAP / port 43)", "WHOIS · " + " · ".join(parts) + (" · " + label if label else "")
+                     if parts else "WHOIS · NOTHING FOUND", kind if parts else "info",
+                     ["HIGH: %s (%s)" % (f["issue"], f["object"]) for f in findings if f["severity"] == "high"] + notes,
+                     data)
 
 
 def cf_m_ip(sess, b, t0):
@@ -4661,6 +5188,16 @@ def cf_m_ip(sess, b, t0):
     if f5_rows is not None:
         data["f5_asm_requests_true_client_ip"] = f5_rows
     notes += f5_notes
+    if ip.is_global:   # who holds the address (and the client's ASN, from the events)
+        w = data["whois_ip"] = whois_safe(whois_ip, ip)
+        notes.append("WHOIS: " + (w.get("error") or "%s, %s (%s)%s." % (
+            w.get("organisation") or "?", w.get("network_name") or "?", w.get("country") or "?",
+            ", abuse " + w["abuse_contact"] if w.get("abuse_contact") else "")))
+        asns = [int(v[2:]) for k, v in extra if k == "asn" and v[2:].isdigit()]
+        if asns:
+            a = whois_safe(whois_asn, asns[0])
+            if a and not a.get("error"):
+                data["whois_asn"] = a
     if dns:
         notes.append("%s is the origin for %d DNS record(s); %d of them are proxied." % (
             ip, len(dns), sum(1 for r in dns if r["proxied"])))
@@ -4785,6 +5322,13 @@ def cf_m_host(sess, b, t0):
         notes.append("No requests for this hostname in the range.")
     if errs:
         notes.append("Some parts could not be read (token permission or plan): " + " | ".join(errs[:5]))
+    w = data["whois_domain"] = whois_domain_cf(sess, zn)
+    if w.get("error"):
+        notes.append("WHOIS %s: %s" % (zn, w["error"]))
+    else:
+        findings += whois_findings(w, warn_days)
+        notes.append("WHOIS %s: registrar %s, expires %s, name servers %s." % (
+            zn, w.get("registrar") or "?", w.get("expires") or "?", ", ".join(w.get("name_servers") or []) or "?"))
     label, kind = cf_sev_verdict(findings, "NO ISSUES FOUND")
     data = dict({"findings": findings}, **data)
     return cf_result(t0, "Cloudflare hostname investigation " + host, "%s · %s" % (host, label), kind,
@@ -5234,10 +5778,633 @@ def cf_m_dashboard(sess, b, t0):
     return r
 
 
+CF_Q_EDGE = "edgeTimeToFirstByteMsP50 edgeTimeToFirstByteMsP95 edgeTimeToFirstByteMsP99"
+CF_Q_ORIGIN = "originResponseDurationMsP50 originResponseDurationMsP95 originResponseDurationMsP99"
+CF_ORIGIN_PHASES = (("originDNSResponseTimeMs", "dns_ms"), ("originTCPHandshakeDurationMs", "tcp_ms"),
+                    ("originTLSHandshakeDurationMs", "tls_ms"), ("originResponseHeaderReceiveDurationMs", "origin_headers_ms"))
+
+
+def cf_parse_url(u):
+    """'https://host/path?q' or 'host/path' -> (host, path, query)."""
+    u = str(u or "").strip()
+    if not u:
+        raise ValueError("enter a URL, e.g. https://app.example.com/api/login")
+    p = urllib.parse.urlsplit(u if re.match(r"^[a-z][a-z0-9+.\-]*://", u, re.I) else "https://" + u)
+    host, path = (p.hostname or "").lower(), p.path or "/"
+    if not host or "*" in host or not CF_HOSTNAME_RE.match(host):
+        raise ValueError("the URL has no valid hostname")
+    if not CF_TEXT_RE.match(path):
+        raise ValueError("the URL path has characters that are not allowed (no quotes or backslashes)")
+    return host, path, p.query
+
+
+def cf_m_url(sess, b, t0):
+    """Edge TTFB and origin response time for one URL (exact path, prefix or contains): percentiles, timeline,
+    breakdowns by status / cache / colo / method / path, and the slowest sampled requests."""
+    host, path, query = cf_parse_url(b.get("url"))
+    match = str(b.get("match") or "exact").strip()
+    if match not in ("exact", "starts with", "contains"):
+        raise ValueError("invalid path match")
+    zone = cf_zone_of_host(sess, host)
+    if not zone:
+        raise ValueError("no zone visible to this token covers %s" % host)
+    since, until, span = cf_window(b)
+    flt = cf_filters({k: b.get(k) for k in ("ip", "status", "cache")}, "http", since, until)
+    flt["clientRequestHTTPHost"] = host
+    flt[{"exact": "clientRequestPath", "starts with": "clientRequestPath_like",
+         "contains": "clientRequestPath_like"}[match]] = {"exact": path, "starts with": path + "%",
+                                                          "contains": "%" + path + "%"}[match]
+    limit = num(b.get("top"), 1, 500, 50, "slowest requests")
+    secs = to_epoch(until) - to_epoch(since)
+    dim, bucket = (("datetimeMinute", "1 minute") if secs <= 10800 else ("datetimeFiveMinutes", "5 minutes")
+                   if secs <= 86400 else ("datetimeHour", "1 hour") if secs <= 604800 else ("date", "1 day (UTC dates)"))
+    audit(sess, "Cloudflare URL timing %s%s (%s)" % (host, path, match))
+    G, lit = "httpRequestsAdaptiveGroups", cf_lit(flt)
+
+    def metrics(f):
+        q = " ".join(x for x in (CF_Q_EDGE, CF_Q_ORIGIN) if x in f)
+        a = " ".join(x for x in ("edgeTimeToFirstByteMs", "originResponseDurationMs") if x in f)
+        return "count%s%s" % (" quantiles{%s}" % q if q else "", " avg{%s}" % a if a else "")
+
+    def sel(f):
+        m = metrics(f)
+        parts = ["tot:%s(filter:%s,limit:1){%s}" % (G, lit, m),
+                 "ts:%s(filter:%s,limit:5000,orderBy:[%s_ASC]){%s dimensions{%s}}" % (G, lit, dim, m, dim)]
+        for alias, dims, n in (("bs", "edgeResponseStatus originResponseStatus", 30), ("bc", "cacheStatus", 20),
+                               ("bl", "coloCode", 15), ("bm", "clientRequestHTTPMethodName", 10),
+                               ("bp", "clientRequestPath", 25)):
+            if alias != "bp" or match != "exact":
+                parts.append("%s:%s(filter:%s,limit:%d,orderBy:[count_DESC]){%s dimensions{%s}}" % (alias, G, lit, n, m, dims))
+        return " ".join(parts)
+    res, dropped = cf_gql_zones(sess, [zone], sel, (CF_Q_EDGE, CF_Q_ORIGIN, "edgeTimeToFirstByteMs", "originResponseDurationMs"))
+    zd = res.get(zone["id"], (None, []))[0] or {}
+    tot = (zd.get("tot") or [{}])[0]
+    total = int(tot.get("count") or 0)
+
+    def ms(v):
+        return int(round(float(v))) if v not in (None, "") else ""
+
+    def stats(g):
+        q, a = g.get("quantiles") or {}, g.get("avg") or {}
+        return [("edge_p50_ms", ms(q.get("edgeTimeToFirstByteMsP50"))), ("edge_p95_ms", ms(q.get("edgeTimeToFirstByteMsP95"))),
+                ("edge_p99_ms", ms(q.get("edgeTimeToFirstByteMsP99"))), ("origin_p50_ms", ms(q.get("originResponseDurationMsP50"))),
+                ("origin_p95_ms", ms(q.get("originResponseDurationMsP95"))),
+                ("origin_p99_ms", ms(q.get("originResponseDurationMsP99"))),
+                ("edge_avg_ms", ms(a.get("edgeTimeToFirstByteMs"))), ("origin_avg_ms", ms(a.get("originResponseDurationMs")))]
+
+    def breakdown(alias, cols):
+        rows = []
+        for g in zd.get(alias) or []:
+            d, n = g.get("dimensions") or {}, int(g.get("count") or 0)
+            st = dict(stats(g))
+            rows.append(dict([(c, d.get(k) if d.get(k) not in (None, "") else "-") for k, c in cols] +
+                             [("requests", n), ("share", "%.1f%%" % (100.0 * n / total) if total else "")] +
+                             [(k, st[k]) for k in ("edge_avg_ms", "edge_p95_ms", "origin_avg_ms", "origin_p95_ms") if st[k] != ""]))
+        return rows
+    s = dict(stats(tot))
+    data = {"url_timing": dict([("url", "%s%s%s" % (host, path, " (%s)" % match if match != "exact" else "")),
+                                ("requests", total)] +
+                               [(k.replace("edge_", "edge_TTFB_")[:-3], "%s ms" % v) for k, v in stats(tot) if v != ""])}
+    if s["edge_p50_ms"] != "" and s["origin_p50_ms"] != "":
+        data["url_timing"]["not_origin_time_p50"] = "%d ms of the edge TTFB is spent outside the origin" % max(
+            0, s["edge_p50_ms"] - s["origin_p50_ms"])
+    keys = [str((g.get("dimensions") or {}).get(dim)) for g in zd.get("ts") or []]
+    tsd = [dict(stats(g), requests=int(g.get("count") or 0)) for g in zd.get("ts") or []]
+    labels = [k if dim == "date" else utc3(k) for k in keys]
+    charts = []
+    series = [[lbl, [r[k] or 0 for r in tsd]] for lbl, k in (("Edge TTFB p50", "edge_p50_ms"), ("Edge TTFB p95", "edge_p95_ms"),
+                                                              ("Origin p50", "origin_p50_ms"), ("Origin p95", "origin_p95_ms"))
+              if any(r[k] != "" for r in tsd)]
+    if series:
+        charts.append({"title": "Edge TTFB vs origin response time", "t": labels, "fmt": "ms", "series": series})
+    charts.append({"title": "Requests", "t": labels, "fmt": "num", "series": [["Requests", [r["requests"] for r in tsd]]]})
+    data["timeline"] = [dict([("time", lbl), ("requests", r["requests"])] + [(k, r[k]) for k in
+                             ("edge_p50_ms", "edge_p95_ms", "origin_p50_ms", "origin_p95_ms", "edge_avg_ms", "origin_avg_ms") if r[k] != ""])
+                        for lbl, r in zip(labels, tsd)]
+    data["by_status"] = breakdown("bs", (("edgeResponseStatus", "edge_status"), ("originResponseStatus", "origin_status")))
+    data["by_cache_status"] = breakdown("bc", (("cacheStatus", "cache"),))
+    data["by_colo"] = breakdown("bl", (("coloCode", "colo"),))
+    data["by_method"] = breakdown("bm", (("clientRequestHTTPMethodName", "method"),))
+    if match != "exact":
+        data["by_path"] = breakdown("bp", (("clientRequestPath", "path"),))
+    # Slowest individual (sampled) requests, with the origin time split into DNS / TCP / TLS / response headers.
+    rq_opt = ("rayName", "clientIP", "clientCountryName", "clientRequestHTTPMethodName", "clientRequestPath",
+              "clientRequestQuery", "edgeResponseStatus", "originResponseStatus", "cacheStatus", "edgeTimeToFirstByteMs",
+              "originResponseDurationMs") + tuple(k for k, _ in CF_ORIGIN_PHASES) + ("coloCode", "upperTierColoName", "originIP")
+    sorted_by = "origin response time"
+    r2, d2 = cf_gql_zones(sess, [zone], lambda f: "httpRequestsAdaptive(filter:%s,limit:%d,orderBy:[originResponseDurationMs_DESC]){datetime %s}"
+                          % (lit, limit, " ".join(f)), rq_opt)
+    if not (r2.get(zone["id"], (None, []))[0] or {}).get("httpRequestsAdaptive") and r2.get(zone["id"], (None, []))[1]:
+        sorted_by = "origin response time, among the newest 500 sampled requests (the API could not sort by it)"
+        r2, d2 = cf_gql_zones(sess, [zone], lambda f: "httpRequestsAdaptive(filter:%s,limit:500,orderBy:[datetime_DESC]){datetime %s}"
+                              % (lit, " ".join(f)), rq_opt)
+    slow = []
+    for e in (r2.get(zone["id"], (None, []))[0] or {}).get("httpRequestsAdaptive") or []:
+        slow.append(dict([("time", utc3(e.get("datetime"))), ("cf_zone", zone["name"]), ("client_ip", e.get("clientIP", "")),
+                          ("country", e.get("clientCountryName", "")), ("method", e.get("clientRequestHTTPMethodName", "")),
+                          ("url", cf_url(e)), ("edge_status", e.get("edgeResponseStatus", "")),
+                          ("origin_status", e.get("originResponseStatus") or ""), ("cache", e.get("cacheStatus", "")),
+                          ("edge_ttfb_ms", e.get("edgeTimeToFirstByteMs", "")), ("origin_ms", e.get("originResponseDurationMs", ""))] +
+                         [(c, e.get(k, "")) for k, c in CF_ORIGIN_PHASES] +
+                         [("colo", e.get("coloCode", "")), ("upper_tier", e.get("upperTierColoName") or ""),
+                          ("origin_ip", e.get("originIP", "")), ("ray_id", e.get("rayName", ""))]))
+    slow.sort(key=lambda r: -(float(r["origin_ms"] or 0)))
+    data["slowest_requests"] = slow[:limit]
+    notes = ["Zone: %s. Time range: %s; buckets of %s." % (zone["name"], span, bucket),
+             "Edge TTFB = from Cloudflare receiving the request to sending the first byte to the client (includes the wait "
+             "for the origin). Origin response time = how long Cloudflare waited for the origin (e.g. the F5) to answer; it "
+             "is 0 for cache hits, so see 'by cache status' for misses and dynamic requests on their own.",
+             "Slowest requests: sampled requests sorted by %s." % sorted_by]
+    if query:
+        notes.append("The query string (?%s) is not used to filter; all queries of this path are included." % query[:80])
+    for k, c in CF_ORIGIN_PHASES:
+        if k in d2:
+            notes.append("The origin DNS / TCP / TLS / header timings are not offered for this zone or plan.")
+            break
+    notes += cf_gql_notes([zone], res, [x for x in dropped]) + cf_gql_notes([zone], r2, [x for x in d2 if x not in dict(CF_ORIGIN_PHASES)])
+    e95, o95 = s["edge_p95_ms"], s["origin_p95_ms"]
+    e5 = sum(r["requests"] for r in data["by_status"] if str(r.get("edge_status", "")).startswith("5"))
+    if not total:
+        label, kind = "NO REQUESTS FOR %s%s IN THIS RANGE" % (host, path), "info"
+    else:
+        label = "%s%s · %s REQUESTS · EDGE TTFB p95 %s · ORIGIN p95 %s" % (
+            host, path, "{:,}".format(total), "%s ms" % e95 if e95 != "" else "n/a", "%s ms" % o95 if o95 != "" else "n/a")
+        kind = ("bad" if (o95 != "" and o95 >= 5000) or e5 * 20 >= total else
+                "warn" if (o95 != "" and o95 >= 1000) or (e95 != "" and e95 >= 1500) else "ok")
+        if e5:
+            notes.insert(0, "%d request(s) (%.1f%%) ended in a 5xx error." % (e5, 100.0 * e5 / total))
+    order = ("url_timing", "slowest_requests", "by_status", "by_cache_status", "by_path", "by_colo", "by_method", "timeline")
+    data = {k: data[k] for k in order if k in data}
+    r = cf_result(t0, "GraphQL httpRequestsAdaptiveGroups + httpRequestsAdaptive (%s%s)" % (host, path), label, kind, notes, data)
+    r["charts"] = charts
+    return r
+
+
+def cf_epoch3(s):
+    """'YYYY-MM-DD HH:MM:SS' shown in UTC+3 -> epoch; None if it does not parse."""
+    try:
+        return datetime.datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=CF_TZ).timestamp()
+    except ValueError:
+        return None
+
+
+def cf_lookback_for(t):
+    """The narrowest F5 time range that still reaches back to epoch t (plus 5 minutes)."""
+    age = time.time() - t + 300
+    fits = [(s, k) for k, s in LOOKBACK.items() if s and s >= age]
+    return min(fits)[1] if fits else "any time"
+
+
+def fg_trace_logs(fg, src, vdom, dst, srcip, t_center, window, max_pages=5):
+    """FortiGate forward-traffic sessions to dst (optionally from srcip) within +-window s of t_center, paging back
+    from the newest entries. -> (entries, notes, oldest epoch read) or (None, [error], None)."""
+    conds = [("dstip", dst)] + ([("srcip", srcip)] if srcip else [])
+    rows, notes, oldest, prev = [], [], None, None
+    for page in range(max_pages):
+        q = [("start", str(page * 1000)), ("rows", "1000")] + [("filter", "%s==%s" % c) for c in conds]
+        if vdom:
+            q.append(("vdom", vdom))
+        st, ok, data = rest_get(fg, "/api/v2/log/%s/traffic/forward?%s" % (src, urllib.parse.urlencode(q)))
+        res = data.get("results") if ok and isinstance(data, dict) else None
+        if res is None:
+            return None, ["FortiGate log query failed (HTTP %s). Check that logging to '%s' is enabled, the token has "
+                          "Log & Report read access and the VDOM is right." % (st, src)], None
+        res = [e for e in as_list(res) if isinstance(e, dict)]
+        fid = json.dumps(res[0], sort_keys=True) if res else None
+        if page and fid == prev:
+            notes.append("The FortiGate ignored paging, so only its newest 1000 matching entries were read.")
+            break
+        prev = fid
+        eps = [fg_event_epoch(e) for e in res]
+        for e, ep in zip(res, eps):
+            if ep is not None and abs(ep - t_center) <= window and all(ip_matches(e.get(f), v) for f, v in conds):
+                rows.append((ep, e))
+        known = [x for x in eps if x]
+        if known:
+            oldest = min(known + ([oldest] if oldest else []))
+        if len(res) < 1000 or (known and min(known) < t_center - window):
+            break
+    return rows, notes, oldest
+
+
+def cf_m_trace(sess, b, t0, ray=None, f5_hint=None, ident=""):
+    """Follow one request through Cloudflare -> FortiGate -> F5 ASM and say where it stopped. By Ray ID, or from
+    cf_trace_pivot / cf_m_trace_client with the Ray ID found another way ('' if none) and the F5 entry known."""
+    if ray is None:
+        m = CF_RAY_RE.match(str(b.get("ray") or "").strip())
+        if not m:
+            raise ValueError("Ray ID must be 16 hex characters, optionally with the -ABC colo suffix")
+        ray = m.group(1).lower()
+    ident = ident or "Ray ID %s" % ray
+    window = num(b.get("window"), 10, 900, 120, "time window (seconds)")
+    fg_id, f5_id = b.get("fg"), b.get("f5")
+    fg = SESSIONS.get(fg_id) if fg_id else None
+    f5 = SESSIONS.get(f5_id) if f5_id else None
+    if fg_id and (not fg or fg["vendor"] != "fortigate"):
+        raise ValueError("the FortiGate chosen for the trace is no longer connected")
+    if f5_id and (not f5 or f5["vendor"] != "f5"):
+        raise ValueError("the F5 chosen for the trace is no longer connected")
+    fg_src = b.get("fg_source") or "disk"
+    if fg_src not in FG_LOG_SOURCES:
+        raise ValueError("invalid FortiGate log source")
+    fg_vdom = pstr(b.get("fg_vdom"), "VDOM")
+    origin_override = str(parse_ip(b.get("origin_ip"), "origin IP")) if str(b.get("origin_ip") or "").strip() else ""
+    audit(sess, "trace " + ident)
+    notes, data, hops = [], {}, []
+    # 1. Cloudflare
+    cf = cf_m_ray(sess, dict(b, ray=ray, f5=""), t0) if ray else {
+        "summary": ["No Ray ID for this request (no CF-Ray header in the F5 log, nothing matching in Cloudflare's "
+                    "sampled data), so the Cloudflare hop is unknown."]}
+    cfd = cf.get("data") or {}
+    events, reqs = cfd.get("security_events") or [], cfd.get("request") or []
+    req = reqs[0] if reqs else {}
+    notes += [s for s in cf.get("summary") or [] if not s.startswith("Tip:")]
+    t_req = cf_epoch3(req.get("time") or (events[-1]["time"] if events else "") or (f5_hint or {}).get("time", ""))
+    host = req.get("host") or (events[0]["host"] if events else "")
+    cf_block = next((e for e in events if e["action"] in CF_BLOCK), None)
+    cf_chal = next((e for e in events if "challenge" in e["action"] and "solved" not in e["action"]), None)
+    # A security event that only logged / skipped the request still proves Cloudflare saw it (and let it through),
+    # even when the sampled request record is missing; it carries the client, URL and statuses too.
+    ev = events[0] if events else {}
+    seen = req or ev
+    ev_status = str(ev.get("edge_origin_status") or "").split("/")
+    edge = str(req.get("edge_status") or (ev_status[0] if ev else ""))
+    origin_st = str(req.get("origin_status") or (ev_status[1] if len(ev_status) > 1 else ""))
+    rule_txt = lambda e: "%s by %s rule %s%s" % (e["action"], e["source"], e["rule_id"],
+                                                 " (%s)" % e["description"] if e["description"] else "")
+    if cf_block or cf_chal:
+        cf_res = rule_txt(cf_block or cf_chal)
+    elif req and edge.startswith("52") and len(edge) == 3:
+        cf_res = "edge HTTP %s · Cloudflare got no valid answer from the origin (after %s ms)" % (edge, req.get("ttfb_ms", "?"))
+    elif req:
+        cf_res = "passed · edge HTTP %s, origin HTTP %s, edge TTFB %s ms, origin %s ms" % (
+            req.get("edge_status"), req.get("origin_status") or "-", req.get("ttfb_ms", "?"), req.get("origin_ms", "?"))
+    elif ev:
+        cf_res = "passed (not blocked) · %s%s" % (rule_txt(ev), "; edge HTTP %s" % edge if edge else "")
+    else:
+        cf_res = "not found in Cloudflare data (sampled; widen the time range)"
+    hops.append({"hop": "1 · Cloudflare", "seen_at": seen.get("time", ""),
+                 "result": cf_res, "details": " ".join(x for x in (
+                     "client %s" % seen.get("client_ip") if seen.get("client_ip") else "",
+                     "%s %s%s" % (seen.get("method", ""), host, seen.get("url", "")) if seen else "",
+                     "colo %s" % seen["colo"] if seen.get("colo") else "") if x)})
+    # 2. F5 ASM (via the CF-Ray header, or the entry already found), before the FortiGate so its client IP can pin
+    # the exact FortiGate session.
+    f5_rows, f5_ip, f5_blocked, viol = [], "", False, []
+    if f5:
+        within = cf_lookback_for(t_req) if t_req else cf_f5_within(b)
+        if f5_hint:
+            r5 = {"ok": True, "data": {"requests": [{k: v for k, v in f5_hint.items() if k != "violations"}]}}
+            viol = f5_hint.get("violations") or []
+        elif not ray:
+            r5 = {"ok": True, "data": {}}
+        else:
+            try:
+                r5 = f5_asm_by_header(f5, {"header_name": "CF-Ray", "header_value": ray, "within": within, "top": 5,
+                                           "scan": 3000}, time.time())
+            except (ValueError, urllib.error.URLError, OSError) as e:
+                r5 = {"ok": False, "error": str(getattr(e, "reason", e))}
+        if r5.get("ok"):
+            f5_rows = (r5.get("data") or {}).get("requests") or []
+            notes += ["F5: " + s for s in (r5.get("summary") or [])[:2]]
+        else:
+            notes.append("F5 %s lookup failed: %s" % (f5["name"], r5.get("error")))
+        if f5_rows:
+            x = f5_rows[0]
+            f5_ip, f5_blocked = str(x.get("ip") or ""), "block" in str(x.get("status", "")).lower()
+            if x.get("support_id") and f5_blocked and not viol:
+                try:
+                    d5 = do_f5_asm({"id": f5_id, "mode": "supportid", "support_id": x["support_id"], "within": "any time"})
+                    viol = (d5.get("data") or {}).get("violations") or [] if d5.get("ok") else []
+                except (ValueError, urllib.error.URLError, OSError):
+                    viol = []
+            hops.append({"hop": "3 · F5 ASM (%s)" % f5["name"], "seen_at": x.get("time", ""),
+                         "result": "%s · support ID %s" % (str(x.get("status") or "?"), x.get("support_id") or "-"),
+                         "details": "from %s (True-Client-IP %s) %s %s%s%s" % (
+                             f5_ip or "?", x.get("true_client_id") or "-", x.get("method", ""), x.get("hostname", ""),
+                             x.get("url", ""), "; " + "; ".join(v.get("violation", "") for v in viol[:3]) if viol else "")})
+        else:
+            hops.append({"hop": "3 · F5 ASM (%s)" % f5["name"], "seen_at": "", "result": "not found",
+                         "details": "no ASM log entry with CF-Ray %s (%s)" % (ray, within)})
+    else:
+        hops.append({"hop": "3 · F5 ASM", "seen_at": "", "result": "not checked",
+                     "details": "choose an F5 under 'Cross-check on F5'"})
+    if f5_rows:   # Cloudflare's sampled data may lack the request; the F5 log has its time and host
+        t_req = t_req or cf_epoch3(f5_rows[0].get("time"))
+        host = host or str(f5_rows[0].get("hostname") or "")
+        if ray and not seen:   # the request certainly passed Cloudflare, so a wider time range would not help
+            hops[0]["result"] = ("Ray ID %s passed Cloudflare (it reached the F5) but is not in Cloudflare's data: no "
+                                 "security rule acted on or logged it, and it was not in the sampled requests" % ray)
+            notes = [s for s in notes if not s.startswith("Security events exist only")]
+    # Origin IP Cloudflare connected to: from the request, an override, or the hostname's DNS record.
+    origin = origin_override or str(req.get("origin_ip") or "")
+    if fg and not origin and host:   # only the FortiGate lookup needs it
+        z = cf_zone_of_host(sess, host)
+        if z:
+            recs, _, _ = cf_list(sess, "/zones/%s/dns_records?name=%s" % (z["id"], urllib.parse.quote(host)), per_page=20, max_pages=1)
+            origin = next((str(r.get("content")) for r in recs if r.get("type") in ("A", "AAAA")), "")
+            if origin:
+                notes.append("Origin IP %s taken from the DNS record of %s." % (origin, host))
+    # 3. FortiGate sessions from Cloudflare to the origin IP around the request time.
+    fg_hits, fg_how = [], ""
+    if fg and origin and t_req:
+        dst = ipaddress.ip_address(origin)
+        src_ip = ipaddress.ip_address(f5_ip) if f5_ip and re.match(r"^[0-9a-fA-F:.]+$", f5_ip) else None
+        try:
+            got, fn, oldest = fg_trace_logs(fg, fg_src, fg_vdom, dst, src_ip, t_req, window)
+        except (urllib.error.URLError, OSError) as e:
+            got, fn, oldest = None, ["FortiGate request failed: %s" % getattr(e, "reason", e)], None
+        notes += fn
+        if got is not None:
+            nets = cf_edge_nets(sess)
+            if src_ip:
+                fg_how = "exact: the Cloudflare edge IP the F5 logged (%s) + time" % src_ip
+            else:
+                got = [(ep, e) for ep, e in got if any(ip_matches(e.get("srcip"), n_) for n_ in nets)]
+                fg_how = "approximate: any Cloudflare edge IP to %s within ±%ds" % (dst, window)
+            fg_hits = sorted(got, key=lambda x: abs(x[0] - t_req))
+            if oldest and oldest > t_req - window and not fg_hits:
+                notes.append("FortiGate: its log entries read only reach back to %s, after the request; older sessions "
+                             "were not covered." % utc3(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(oldest))))
+    fg_rows = [{"time": utc3(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ep))), "offset_s": int(round(ep - t_req)),
+                "source": "%s:%s" % (e.get("srcip", ""), e.get("srcport", "")),
+                "destination": "%s:%s" % (e.get("dstip", ""), e.get("dstport", "")),
+                "dnat": "%s:%s" % (e.get("tranip"), e.get("tranport")) if e.get("tranip") not in (None, "", "0.0.0.0") else "",
+                "action": e.get("action", ""), "policy": " / ".join(str(x) for x in (e.get("policyid"), e.get("policyname")) if x),
+                "duration_s": e.get("duration", ""), "sent_bytes": e.get("sentbyte", ""), "received_bytes": e.get("rcvdbyte", "")}
+               for ep, e in fg_hits[:50]]
+    fg_deny = [r for r in fg_rows if r["action"].lower() in ("deny", "blocked")]
+    fg_bad = [r for r in fg_rows if r["action"].lower() in ("timeout", "server-rst", "client-rst", "ip-conn")]
+    if not fg:
+        hop2 = None   # no FortiGate chosen: the trace is Cloudflare -> F5 -> origin
+    elif not origin:
+        hop2 = ("not checked", "origin IP unknown (not in the sampled request, no A record); enter it as Origin IP")
+    elif not t_req:
+        hop2 = ("not checked", "request time unknown (Ray ID not found at Cloudflare)")
+    elif not fg_rows:
+        hop2 = ("no matching session", "no forward-traffic log to %s within ±%ds (is 'log all sessions' on for that policy?)"
+                % (origin, window))
+    else:
+        acts = collections.Counter(r["action"] for r in fg_rows)
+        hop2 = ("%d session(s): %s" % (len(fg_rows), ", ".join("%s %d" % kv for kv in acts.most_common())),
+                "%s; closest %+ds, policy %s" % (fg_how, fg_rows[0]["offset_s"], fg_rows[0]["policy"] or "?"))
+    if hop2:
+        hops.insert(1, {"hop": "2 · FortiGate (%s)" % fg["name"], "seen_at": fg_rows[0]["time"] if fg_rows else "",
+                        "result": hop2[0], "details": hop2[1]})
+    # 4. Origin / application, as seen by Cloudflare.
+    if not (cf_block or cf_chal) and (fg_deny or f5_blocked):
+        # Cloudflare's "origin" is the F5 virtual server, so its status is the F5 blocking page, not the app.
+        hops.append({"hop": "4 · Origin / app", "seen_at": "", "result": "not reached",
+                     "details": "denied at the FortiGate" if fg_deny else "blocked by F5 ASM" + (
+                         "; the HTTP %s Cloudflare saw is the F5 blocking page" % (origin_st or edge) if origin_st or edge
+                         else "")})
+    elif seen and not (cf_block or cf_chal):
+        hops.append({"hop": "4 · Origin / app", "seen_at": "", "result": "origin HTTP %s" % (origin_st or "none"),
+                     "details": ("origin response %s ms" % req.get("origin_ms", "?") if req else "from the Cloudflare security event")
+                     + (" (Cloudflare got no valid answer)" if edge.startswith("52") else "")})
+    # Verdict: where did the request stop?
+    e52 = edge.startswith("52") and len(edge) == 3
+    if cf_block:
+        label, kind = "STOPPED AT CLOUDFLARE · %s" % cf_res, "bad"
+    elif cf_chal:
+        label, kind = "CHALLENGED AT CLOUDFLARE · %s" % cf_res, "warn"
+    elif fg_deny:
+        label, kind = "STOPPED AT FORTIGATE · denied by policy %s" % (fg_deny[0]["policy"] or "?"), "bad"
+    elif f5_blocked:
+        label, kind = "STOPPED AT F5 ASM · support ID %s%s" % (f5_rows[0].get("support_id"), " (%s)" % viol[0].get("violation")
+                                                                if viol else ""), "bad"
+    elif e52 and fg_bad and not f5_rows:
+        label, kind = "CONNECTION FAILED BETWEEN FORTIGATE AND F5 · FortiGate %s (Cloudflare HTTP %s)" % (fg_bad[0]["action"], edge), "bad"
+    elif e52 and f5_rows:
+        label, kind = "REACHED F5, ORIGIN DID NOT ANSWER IN TIME · Cloudflare HTTP %s" % edge, "bad"
+    elif e52:
+        label, kind = "CLOUDFLARE COULD NOT REACH THE ORIGIN · HTTP %s%s" % (
+            edge, ""), "bad"
+    elif seen and edge.startswith("5"):
+        label, kind = "ORIGIN / APP ERROR · origin HTTP %s" % (origin_st or edge), "bad"
+    elif seen and edge.startswith("4"):
+        label, kind = "APP ANSWERED %s · nothing blocked on the way" % edge, "warn"
+    elif req:
+        label, kind = "SUCCEEDED END TO END · edge HTTP %s in %s ms" % (edge, req.get("ttfb_ms", "?")), "ok"
+    elif ev:
+        label = "PASSED CLOUDFLARE (%s only, not blocked)%s%s" % (
+            ev["action"], " · F5 ASM %s (support ID %s)" % (f5_rows[0].get("status", ""), f5_rows[0].get("support_id"))
+            if f5_rows else "", " · edge HTTP %s" % edge if edge else "")
+        kind = "ok" if edge[:1] in ("2", "3") else "info"
+    elif f5_rows:
+        label, kind = "NOT IN CLOUDFLARE DATA, FOUND ON F5 · %s" % f5_rows[0].get("status", ""), "warn"
+    else:
+        label, kind = "%s NOT FOUND" % ident.upper(), "info"
+    hops.sort(key=lambda h: h["hop"])
+    for i, h in enumerate(hops):   # number the hops actually shown
+        h["hop"] = "%d · %s" % (i + 1, h["hop"].split(" · ", 1)[1])
+    data["trace"] = hops
+    if events:
+        data["cloudflare_security_events"] = events
+    if reqs:
+        data["cloudflare_request"] = reqs
+    if fg_rows:
+        data["fortigate_sessions"] = fg_rows
+    if f5_rows:
+        data["f5_asm_request"] = f5_rows
+    if viol:
+        data["f5_violations"] = viol
+    notes.insert(0, "Matching: Cloudflare ↔ F5 %s%s." % (
+        "via the F5 entry found first" if f5_hint else "by the CF-Ray header (exact)",
+        "; FortiGate by " + (fg_how or "Cloudflare edge IP + origin IP + time") if fg else ""))
+    return cf_result(t0, "Trace %s: Cloudflare → %sF5" % (ident, "FortiGate → " if fg else ""), label, kind, notes, data)
+
+
+def cf_iso(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def cf_trace_window(t, pad=600):
+    """Custom From / To (UTC+3 form values) pad seconds around epoch t, to pin lookups to one request."""
+    f = lambda x: datetime.datetime.fromtimestamp(x, CF_TZ).strftime("%Y-%m-%d %H:%M")
+    return {"since": f(t - pad), "until": f(min(t + pad, time.time() + 60))}
+
+
+def cf_closest(rows, t):
+    """The row whose time is nearest epoch t; the first (newest) when t is None."""
+    if not rows:
+        return None
+    return rows[0] if t is None else min(rows, key=lambda r: abs((cf_epoch3(r.get("time")) or 0) - t))
+
+
+def cf_client_find(sess, zones, ip, host, path, since, until, like):
+    """Cloudflare's records of one client (optionally host and path, exact or contains), newest first
+    -> (security events, sampled requests, {zone id: (None, errors)}, dropped fields)."""
+    lit = cf_lit({"datetime_geq": since, "datetime_leq": until, "clientIP": ip, "clientRequestHTTPHost": host,
+                  ("clientRequestPath_like" if like else "clientRequestPath"): ("%" + path + "%" if like else path)
+                  if path else ""})
+    res, d1 = cf_gql_zones(sess, zones, cf_q_events(lit, 50), CF_EV_FIELDS)
+    res2, d2 = cf_gql_zones(sess, zones, cf_q_requests(lit, 50), CF_RQ_FIELDS)
+    errs = {zid: v for r in (res, res2) for zid, v in r.items() if v[1]}
+    return (cf_rows(zones, res, "firewallEventsAdaptive", cf_ev_row, 50),
+            cf_rows(zones, res2, "httpRequestsAdaptive", cf_rq_row, 50), errs, sorted(set(d1) | set(d2)))
+
+
+def f5_trace_hint(f5_id, sid):
+    """F5 ASM entry of a support ID as a trace row (with its violations) -> (row or None, lookup result)."""
+    d5 = do_f5_asm({"id": f5_id, "mode": "supportid", "support_id": sid, "within": "any time"})
+    d = d5.get("data") or {}
+    if not d5.get("ok") or not d.get("support_id"):
+        return None, d5
+    return {"time": d.get("time", ""), "status": d.get("status", ""), "support_id": sid, "ip": d.get("source_ip", ""),
+            "true_client_id": d.get("true_client_id", ""), "method": d.get("method", ""),
+            "hostname": d.get("hostname", ""), "url": d.get("uri", ""), "cf_ray": d.get("cf_ray", ""),
+            "violations": d.get("violations") or []}, d5
+
+
+def cf_pin_zone(sess, b, host, notes):
+    """With no zone chosen, search only the zone of the request's hostname: 'all zones' is capped and may skip it."""
+    z = cf_zone_of_host(sess, str(host or "")) if host and not str(b.get("zone") or "").strip() else None
+    if not z:
+        return b
+    notes.append("Cloudflare searched in zone %s (the zone of %s)." % (z["name"], host))
+    return dict(b, zone=z["name"])
+
+
+def cf_trace_pivot(sess, b, t0, hint, ident, notes):
+    """Trace from a known F5 entry: its CF-Ray header gives the Ray ID; without one, Cloudflare's data is searched
+    for the same client, host and path nearest the F5 time."""
+    window = num(b.get("window"), 10, 900, 120, "time window (seconds)")
+    b = cf_pin_zone(sess, b, hint.get("hostname"), notes)
+    t = cf_epoch3(hint["time"])
+    m = CF_RAY_RE.match(str(hint.get("cf_ray") or "").strip())
+    ray = m.group(1).lower() if m else ""
+    try:
+        tci = str(ipaddress.ip_address(str(hint.get("true_client_id") or "").strip()))
+    except ValueError:
+        tci = ""
+    if ray:
+        notes.append("Ray ID %s taken from the CF-Ray header in the F5 log (exact)." % ray)
+    elif t and tci:
+        zones = cf_zones(sess, b.get("zone"))
+        path = str(hint.get("url") or "").split("?")[0]
+        ev, rq, errs, dropped = cf_client_find(sess, zones, tci, str(hint.get("hostname") or "").lower(), path,
+                                               cf_iso(t - window), cf_iso(t + window), False)
+        cands = [r for r in rq + ev if r.get("ray_id")]
+        best = cf_closest(cands, t)
+        if best:
+            ray = best["ray_id"].lower()
+            notes.append("No CF-Ray header in the F5 log; Ray ID %s is Cloudflare's request from %s to %s%s nearest "
+                         "the F5 time (%+ds, %d candidate(s) within ±%ds). Approximate: check the time and URL."
+                         % (ray, tci, best.get("host", ""), best.get("url", ""),
+                            int((cf_epoch3(best["time"]) or t) - t), len({r["ray_id"] for r in cands}), window))
+        else:
+            notes.append("No CF-Ray header in the F5 log, and Cloudflare's sampled data has no request from %s to "
+                         "%s%s within ±%ds of the F5 time." % (tci, hint.get("hostname", ""), path, window))
+        notes += cf_gql_notes(zones, errs, dropped)
+    else:
+        notes.append("No CF-Ray header in the F5 log and no True-Client-IP to search Cloudflare by. Make the logging "
+                     "profile store request headers to get the exact Ray ID.")
+    r = cf_m_trace(sess, dict(b, **cf_trace_window(t)) if t else b, t0, ray=ray, f5_hint=hint, ident=ident)
+    r["summary"] = notes + r.get("summary", [])
+    return r
+
+
+def cf_m_trace_sid(sess, b, t0):
+    """Trace a request from the F5 support ID on its block page: the F5 entry (kept in full, not sampled) gives the
+    time, Cloudflare edge IP, True-Client-IP and CF-Ray header that pin the other hops."""
+    sid = str(b.get("support_id") or "").strip()
+    if not SUPPORT_ID_RE.match(sid):
+        raise ValueError("support ID must be 5-25 digits")
+    f5 = SESSIONS.get(b.get("f5") or "")
+    if not f5 or f5["vendor"] != "f5":
+        raise ValueError("choose the F5 device under 'Cross-check on F5' to trace by support ID")
+    hint, d5 = f5_trace_hint(b["f5"], sid)
+    if not d5.get("ok"):
+        return d5
+    if not hint:
+        return cf_result(t0, "F5 ASM support ID %s" % sid, (d5.get("verdict") or {}).get("label", ""), "info",
+                         d5.get("summary") or [], {})
+    return cf_trace_pivot(sess, b, t0, hint, "support ID %s" % sid, ["Started from F5 support ID %s." % sid])
+
+
+def cf_m_trace_client(sess, b, t0):
+    """Trace a request that has no ID: by client IP (plus host / path) around a time, in Cloudflare's sampled data,
+    else in the F5 log by True-Client-IP. Traces the candidate nearest the time and lists the others."""
+    ip = str(parse_ip(b.get("ip"), "client IP"))
+    host = str(b.get("host") or "").strip().lower()
+    if host and ("*" in host or not CF_HOSTNAME_RE.match(host)):
+        raise ValueError("enter an exact hostname (letters, digits, . - _ only)")
+    path = cf_text(b.get("path"), "path")
+    window = num(b.get("window"), 10, 900, 120, "time window (seconds)")
+    at, t = str(b.get("at") or "").strip(), None
+    if at:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                t = datetime.datetime.strptime(at, fmt).replace(tzinfo=CF_TZ).timestamp()
+                break
+            except ValueError:
+                pass
+        if t is None:
+            raise ValueError("request time must look like 2026-11-02 08:48 (UTC+3)")
+        since, until, span = cf_iso(t - window), cf_iso(t + 60 + window), "±%ds around %s (UTC+3)" % (window, at)
+    else:
+        since, until, span = cf_window(b)
+        if to_epoch(until) - to_epoch(since) > CF_RAW_SLICE:
+            since = cf_iso(to_epoch(until) - CF_RAW_SLICE)
+            span = "the last 24 hours of the scope range (enter a request time to search another moment)"
+    what = "%s%s%s" % (ip, " → " + host if host else "", " path contains " + path if path else "")
+    audit(sess, "trace by client " + what)
+    notes = ["Started from client %s, %s." % (what, span)]
+    b = cf_pin_zone(sess, b, host, notes)
+    zones = cf_zones(sess, b.get("zone"))
+    ev, rq, errs, dropped = cf_client_find(sess, zones, ip, host, path, since, until, True)
+    notes += cf_gql_notes(zones, errs, dropped)
+    cands = {}
+    for r in rq + ev:
+        if r.get("ray_id") and r["ray_id"] not in cands:
+            cands[r["ray_id"]] = {"time": r["time"], "ray_id": r["ray_id"], "method": r.get("method", ""),
+                                  "host": r.get("host", ""), "url": r.get("url", ""),
+                                  "cloudflare": r.get("action") or "edge %s / origin %s" % (
+                                      r.get("edge_status", ""), r.get("origin_status") or "-")}
+    cands = sorted(cands.values(), key=lambda r: r["time"], reverse=True)
+    best, f5_cands = cf_closest(cands, t), []
+    if best:
+        notes.append("%d Cloudflare request(s) matched; traced Ray ID %s, the %s. Trace another one by its Ray ID."
+                     % (len(cands), best["ray_id"], "nearest the time given" if t else "newest"))
+        r = cf_m_trace(sess, dict(b, **cf_trace_window(cf_epoch3(best["time"]) or time.time())), t0,
+                       ray=best["ray_id"].lower(), ident="client %s (Ray ID %s)" % (ip, best["ray_id"]))
+    elif b.get("f5"):
+        notes.append("Nothing in Cloudflare's sampled data; searched the F5 log by True-Client-IP %s instead." % ip)
+        try:
+            r5 = do_f5_asm({"id": b["f5"], "mode": "search", "header_ip": ip, "url": path, "hostname": host, "top": 50,
+                            "within": cf_lookback_for(t) if t else cf_f5_within(b)})
+        except (ValueError, urllib.error.URLError, OSError) as e:
+            r5 = {"ok": False, "error": str(getattr(e, "reason", e))}
+        f5_cands = [x for x in (r5.get("data") or {}).get("requests") or [] if x.get("support_id") and (
+            t is None or abs((cf_epoch3(x.get("time")) or 0) - t) <= window + 60)]
+        b5 = cf_closest(f5_cands, t)
+        hint = f5_trace_hint(b["f5"], b5["support_id"])[0] if b5 else None
+        if hint:
+            notes.append("%d F5 request(s) matched; traced support ID %s, the %s." % (
+                len(f5_cands), b5["support_id"], "nearest the time given" if t else "newest"))
+            r = cf_trace_pivot(sess, b, t0, hint, "client %s (support ID %s)" % (ip, b5["support_id"]), [])
+        else:
+            notes.append("F5: " + ((r5.get("verdict") or {}).get("label") or r5.get("error") or "no match")
+                         + ("" if t is None else " within ±%ds of %s" % (window, at)) + ".")
+            r = cf_result(t0, "Trace client %s" % what, "NO REQUEST FROM %s FOUND" % ip, "info", [], {})
+    else:
+        notes.append("Nothing in Cloudflare's sampled data. Choose an F5 under 'Cross-check on F5' to search its log "
+                     "(it keeps every logged request, not a sample).")
+        r = cf_result(t0, "Trace client %s" % what, "NO REQUEST FROM %s FOUND" % ip, "info", [], {})
+    r["summary"] = notes + r.get("summary", [])
+    if cands:
+        r["data"]["candidates_cloudflare"] = cands[:50]
+    if f5_cands:
+        r["data"]["candidates_f5"] = f5_cands[:50]
+    return r
+
+
 CF_MODES = {"events": cf_m_events, "event_top": lambda s, b, t: cf_m_groups(s, b, t, "ev"),
             "traffic": lambda s, b, t: cf_m_groups(s, b, t, "http"), "requests": cf_m_requests, "ray": cf_m_ray,
             "ip": cf_m_ip, "host": cf_m_host, "rules": cf_m_rules, "dns": cf_m_dns, "posture": cf_m_posture,
-            "lb": cf_m_lb, "audit": cf_m_audit, "dashboard": cf_m_dashboard}
+            "lb": cf_m_lb, "audit": cf_m_audit, "dashboard": cf_m_dashboard, "url": cf_m_url, "trace": cf_m_trace,
+            "trace_sid": cf_m_trace_sid, "trace_client": cf_m_trace_client, "whois": cf_m_whois}
 
 
 def do_cf(b):
@@ -5286,12 +6453,14 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_capture(self, name):
         name = urllib.parse.unquote(name)
         path = os.path.join(CAPTURE_DIR, name)
-        if not FILE_RE.fullmatch(name) or not os.path.isfile(path):
+        dl = bool(DL_RE.fullmatch(name))
+        if not (FILE_RE.fullmatch(name) or dl) or not os.path.isfile(path):
             return self._send(404, {"error": "not found"})
         self.send_response(200)
-        self.send_header("Content-Type", "application/vnd.tcpdump.pcap" if name.endswith(".pcap") else
-                         "text/plain" if name.endswith((".pms", ".conf")) else "application/octet-stream")
-        self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+        self.send_header("Content-Type", "application/octet-stream" if dl else "application/vnd.tcpdump.pcap"
+                         if name.endswith(".pcap") else "text/plain" if name.endswith((".pms", ".conf"))
+                         else "application/octet-stream")
+        self.send_header("Content-Disposition", 'attachment; filename="%s"' % (name[len("f5file_"):] if dl else name))
         self.send_header("Content-Length", str(os.path.getsize(path)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -5345,7 +6514,7 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/api/connect": do_connect, "/api/run": do_run,
                   "/api/raw": do_raw, "/api/disconnect": do_disconnect,
                   "/api/ipcheck": do_ipcheck, "/api/f5host": do_f5_host, "/api/f5logs": do_f5_logs,
-                  "/api/f5capture": do_f5_capture, "/api/profile/save": do_profile_save,
+                  "/api/f5capture": do_f5_capture, "/api/f5file": do_f5_file, "/api/profile/save": do_profile_save,
                   "/api/profile/delete": do_profile_delete, "/api/health": do_health,
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
                   "/api/fglogs": do_fg_logs, "/api/adminaudit": do_admin_audit, "/api/f5sync": do_f5_sync, "/api/pancapture": do_pan_capture,
@@ -5692,8 +6861,9 @@ function secNode(s){const w=mk("div","rsec");
  return w}
 function renderOut(){const box=$("#pretty");box.textContent="";if(!last)return;
  if(last.error){box.appendChild(mk("div","bad",last.error));return}
- box.classList.toggle("tall",!!last.dashboard);
+ box.classList.toggle("tall",!!(last.dashboard||last.charts));
  if(last.dashboard)box.appendChild(dashNode(last.dashboard));  // charts first; the tables below are the table view
+ if(Array.isArray(last.charts)&&last.charts.length)box.appendChild(chartsNode(last.charts));
  buildSections(last.data).forEach(s=>box.appendChild(secNode(s)));
  if(!box.childNodes.length)box.appendChild(mk("div","nv","Nothing to show for this check."));
  // Blocked / denied traffic in red: table rows with a deny-type cell, and log lines whose action precedes " -> ".
@@ -5762,7 +6932,17 @@ function renderF5(){const box=$("#f5tools");box.innerHTML="";const d=dev();if(!d
  '<p class="muted" style="margin:6px 0 0">0.0:nnn = all VLANs, 0.0:nnnp = also the peer (server-side) flow of each connection.</p>'+
  '<div class="chk"><input type="checkbox" id="tc_pms"><span>Also extract the TLS keys to a .pms file with tshark (f5ethtrailer.tls.keylog) and download both. Implies --f5 ssl.</span></div>'+
  '<div class="chk"><input type="checkbox" id="tc_ssl"><span>Include TLS session keys (--f5 ssl) so Wireshark can decrypt. The saved file can expose decrypted traffic; handle it as sensitive.</span></div>'+
- '<div style="margin-top:8px"><button class="primary" onclick="f5Capture()">Capture &amp; download</button></div></div>'}
+ '<div style="margin-top:8px"><button class="primary" onclick="f5Capture()">Capture &amp; download</button></div>'+
+ '<div class="grp">Download a file or folder from the BIG-IP</div><div class="row3">'+
+ '<div><label>Path on the BIG-IP (file or folder)</label><input id="fd_path" list="fd_paths" placeholder="/var/log/ltm"><datalist id="fd_paths"></datalist></div></div>'+
+ '<div class="chk"><input type="checkbox" id="fd_sens"><span>Allow sensitive files (password hashes, private keys, master key, bigip.conf, UCS archives). Protect the copy on this PC.</span></div>'+
+ '<div class="row" style="margin-top:8px"><button onclick="f5Files(\'list\')">List folder</button><button class="primary" onclick="f5Files(\'get\')">Download</button></div>'+
+ '<p class="muted" style="margin:6px 0 0">List folder fills the Path field\'s drop-down with that folder\'s entries. A folder downloads as .tar.gz. Up to 500 MB, read in 256 KB blocks over iControl REST (no SSH needed) and checked with MD5. Every download is in the audit log.</p></div>'}
+async function f5Files(m){const p=g("fd_path");setBusy(m==="list"?"listing "+p:"downloading "+p+" (large files take a while)");
+ const r=await api("/api/f5file",{id:cur,ack:$("#f5ack").checked,mode:m,path:p,sensitive:$("#fd_sens").checked});
+ show(r,m==="list"?"BIG-IP folder":"BIG-IP file download");
+ if(r&&r.ok&&m==="list"){const dl=$("#fd_paths");if(dl)dl.innerHTML=(r.data.entries||[]).map(e=>'<option value="'+esc(e.path)+'">').join("")}
+ if(r&&r.ok&&r.download){const a=document.createElement("a");a.href=r.download+"?t="+T;a.click()}}
 async function f5Logs(){setBusy("log search");
  const r=await api("/api/f5logs",{id:cur,ack:$("#f5ack").checked,ip:g("lg_ip"),log:g("lg_log"),lines:g("lg_n"),within:g("lg_w"),rotated:$("#lg_rot").checked});show(r,"log search")}
 async function f5Capture(){setBusy("packet capture (up to "+g("tc_dur")+"s, then download)");
@@ -5869,12 +7049,21 @@ function renderCf(){const box=$("#cftools");box.innerHTML="";const d=dev();if(!d
   f5.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+'</option>').join("")+'</select></div></div>'+
   '<p class="muted" style="margin:8px 0 0">How far back you can query, and which datasets exist, depends on the zone plan. Times are shown in UTC+3.'+
   (f5.length?'':' Connect an F5 device to cross-check Ray IDs and IPs against the ASM request log.')+'</p></div>';
+ h+='<div class="card"><h3>WHOIS · IP and domain registration</h3><div class="row3">'+
+  fld("cf_w_ip","IP address","198.51.100.9")+fld("cf_w_host","Domain or hostname","app.example.com")+
+  '</div><div style="margin-top:8px"><button class="primary" onclick="cfWhois()">WHOIS lookup</button></div>'+
+  '<p class="muted" style="margin:8px 0 0">IP: network, range, owner organisation, country, abuse contact (RDAP from the regional registry). Domain: registrar, registrant, created / expiry dates, status, name servers, DNSSEC. Fill one or both.</p></div>';
  h+='<div class="card"><h3>Investigate · everything Cloudflare knows</h3><div class="row3">'+
   fld("cf_ip","Client or origin IP","198.51.100.9")+fld("cf_host","Hostname","app.example.com")+fld("cf_ray","Ray ID","8d3c1a2b3c4d5e6f-FRA")+
-  fld("cf_days","Cert warning (days)","30","30")+'</div><div class="row" style="margin-top:8px;flex-wrap:wrap">'+
+  fld("cf_days","Cert warning (days)","30","30")+fld("cf_win","Trace window ± seconds","120","120")+'</div><div class="row" style="margin-top:8px;flex-wrap:wrap">'+
   '<button class="primary" onclick="cfIp()">Investigate IP</button><button class="primary" onclick="cfHost()">Investigate hostname</button>'+
-  '<button class="primary" onclick="cfRay()">Look up Ray ID</button></div>'+
+  '<button class="primary" onclick="cfRay()">Look up Ray ID</button><button class="primary" onclick="cfTrace()">Trace Ray ID: Cloudflare → F5</button></div>'+
   '<p class="muted" style="margin:8px 0 0">IP: security events, traffic, IP Access Rules, IP lists, rules and DNS records that involve it. Hostname: DNS, proxy status, certificates, settings, rules, Workers, page rules, load balancers, errors. Ray ID: what Cloudflare did with that one request (plus the F5 ASM entry via the CF-Ray header).</p></div>';
+ h+='<div class="card"><h3>URL response time · edge vs origin</h3><div class="row3">'+
+  fld("cf_u_url","URL","https://app.example.com/api/login")+sel("cf_u_match","Path match",["exact","starts with","contains"],"exact")+
+  sel("cf_u_st","Edge status",CF_ST,"")+fld("cf_u_cache","Cache status (optional)","miss, dynamic")+fld("cf_u_ip","Client IP (optional)","198.51.100.9")+
+  fld("cf_u_n","Slowest requests to list","50","50")+'</div><div style="margin-top:8px"><button class="primary" onclick="cfUrl()">Look up URL timing</button></div>'+
+  '<p class="muted" style="margin:8px 0 0">Edge TTFB and origin (e.g. F5) response time: p50 / p95 / p99, a timeline, breakdowns by status, cache, colo and method, and the slowest requests with DNS / TCP / TLS / header timings to the origin. Uses the scope time range.</p></div>';
  h+='<div class="card"><h3>Security events · WAF, rate limiting, bots, IP rules</h3><div class="row3">'+
   fld("cf_e_ip","Client IP","198.51.100.9")+fld("cf_e_host","Host (* wildcard)","app.example.com")+fld("cf_e_path","Path contains","/login")+
   fld("cf_e_ray","Ray ID","8d3c1a2b3c4d5e6f")+sel("cf_e_act","Action",CF_ACT,"")+
@@ -5905,14 +7094,40 @@ async function cfRun(mode,label,extra){setBusy(label+(g("cf_f5")&&(mode==="ip"||
 function cfIp(){cfRun("ip","Cloudflare IP investigation",{ip:g("cf_ip")})}
 function cfHost(){cfRun("host","Cloudflare hostname investigation",{host:g("cf_host"),days:g("cf_days")})}
 function cfRay(){cfRun("ray","Cloudflare Ray ID lookup",{ray:g("cf_ray")})}
-function cfEvF(){return {ip:g("cf_e_ip"),host:g("cf_e_host"),path:g("cf_e_path"),ray:g("cf_e_ray"),action:g("cf_e_act"),source:g("cf_e_src"),
+function cfWhois(){cfRun("whois","WHOIS",{ip:g("cf_w_ip"),host:g("cf_w_host"),days:g("cf_days")})}
+function cfTraceBy(m,label,extra){setBusy(label+": Cloudflare → F5 (can take a few minutes)");
+ api("/api/cf",Object.assign({id:cur,mode:m,zone:g("cf_zone"),within:g("cf_w"),since:g("cf_since"),until:g("cf_until"),
+  f5:g("cf_f5"),window:g("cf_win")},extra)).then(r=>show(r,label))}
+function cfTrace(){cfTraceBy("trace","Ray ID trace",{ray:g("cf_ray")})}function cfEvF(){return {ip:g("cf_e_ip"),host:g("cf_e_host"),path:g("cf_e_path"),ray:g("cf_e_ray"),action:g("cf_e_act"),source:g("cf_e_src"),
  rule:g("cf_e_rule"),country:g("cf_e_cc"),asn:g("cf_e_asn"),ua:g("cf_e_ua"),method:g("cf_e_m")}}
 function cfEvents(){cfRun("events","Cloudflare security events",Object.assign(cfEvF(),{top:g("cf_e_n")}))}
 function cfEventTop(){cfRun("event_top","Cloudflare top security events",Object.assign(cfEvF(),{by:g("cf_e_by"),top:g("cf_e_top")}))}
 function cfHtF(){return {host:g("cf_t_host"),ip:g("cf_t_ip"),path:g("cf_t_path"),status:g("cf_t_st"),cache:g("cf_t_cache")}}
 function cfTraffic(){cfRun("traffic","Cloudflare traffic summary",Object.assign(cfHtF(),{by:g("cf_t_by"),top:g("cf_t_top")}))}
 function cfRequests(){cfRun("requests","Cloudflare sampled requests",Object.assign(cfHtF(),{ray:g("cf_t_ray"),top:g("cf_t_n")}))}
-function cfDash(){cfRun("dashboard","Cloudflare traffic dashboard",cfHtF())}
+// Dashboard drill-down: filters added by clicking the dashboard (kept until the Traffic dashboard button is pressed).
+let dashX={};
+function cfDash(x){dashX=x||{};
+ const f=Object.keys(dashX).filter(k=>k!=="until").map(k=>k==="since"?dashX.since+" → "+dashX.until+" (UTC+3)":k+" "+dashX[k]);
+ cfRun("dashboard","Cloudflare traffic dashboard"+(f.length?" · "+f.join(" · "):""),Object.assign(cfHtF(),dashX))}
+function dashDrill(k,v){cfDash(Object.assign({},dashX,{[k]:v}))}
+function setRun(id,v,fn){const i=$("#"+id);if(i){i.value=v;fn()}}
+const DTOP_ACT={"Top client IPs":["Investigate this IP",n=>setRun("cf_ip",n,cfIp)],
+ "Top hosts":["Investigate this hostname",n=>setRun("cf_host",n,cfHost)],
+ "Top paths":["Filter the dashboard to this path",n=>dashDrill("path",n)],
+ "Top countries":["Filter the dashboard to this country",n=>dashDrill("country",n)],
+ "Top ASNs":["Filter the dashboard to this ASN",n=>dashDrill("asn",(String(n).match(/^AS(\d+)/)||[])[1]||n)],
+ "Top referrers":["WHOIS this domain",n=>{const i=$("#cf_w_ip");if(i)i.value="";setRun("cf_w_host",n,cfWhois)}]};
+const DBUCKET={"1 minute":60,"5 minutes":300,"1 hour":3600};
+function u3(ms){return new Date(ms+108e5).toISOString().slice(0,16).replace("T"," ")}
+function dashPick(label,bucket){const secs=DBUCKET[bucket],t=Date.parse(String(label).slice(0,16).replace(" ","T")+":00+03:00");
+ if(!secs||isNaN(t))return;const since=u3(t),until=u3(t+secs*1e3);
+ if(secs===60)cfRun("requests","Cloudflare sampled requests · "+since+" → "+until+" (UTC+3)",Object.assign(cfHtF(),dashX,{since,until,top:g("cf_t_n")}));
+ else cfDash(Object.assign({},dashX,{since,until}))}
+function cfUrl(){cfRun("url","Cloudflare URL response time",{url:g("cf_u_url"),match:g("cf_u_match"),status:g("cf_u_st"),cache:g("cf_u_cache"),ip:g("cf_u_ip"),top:g("cf_u_n")})}
+function chartsNode(list){const grid=mk("div","dgrid");grid.style.marginBottom="16px";
+ list.forEach(c=>grid.appendChild(dChart(c.title,c.t,c.series.map(([n,v],i)=>({name:n,color:DC[i],vals:v})),
+  {fmt:DFMT[c.fmt]||dNum,noTotal:c.fmt!=="num"})));return grid}
 // ---- Cloudflare traffic dashboard: inline SVG charts (palette validated for the dark chart surface) ----
 const DC=["#3987e5","#d95926","#199e70","#c98500","#d55181","#008300"],DOTHER="#8f8cb8";
 const DKEYS={status:["2xx","3xx","4xx","5xx","1xx"],cache:["hit","miss","dynamic","bypass","none","expired"],ttfb:["p50","p95","p99"]};
@@ -5949,13 +7164,17 @@ function dChart(title,labels,series,o){
     s+='<rect x="'+x+'" y="'+y1.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(0,seg-gap).toFixed(1)+'" fill="'+sr.color+'"/>';base+=v})}}
  else series.forEach(sr=>{const pts=sr.vals.map((v,i)=>(L+step*i+step/2).toFixed(1)+","+y(v||0).toFixed(1)).join(" ");
   s+='<polyline points="'+pts+'" fill="none" stroke="'+sr.color+'" stroke-width="2" stroke-linejoin="round"/>'});
- for(let i=0;i<n;i++){const tip=labels[i]+"\n"+series.map(sr=>sr.name+": "+fmt(sr.vals[i]||0)).join("\n");
-  s+='<rect class="hv" x="'+(L+step*i).toFixed(1)+'" y="'+T+'" width="'+Math.max(step,1).toFixed(1)+'" height="'+ph+'"><title>'+esc(tip)+'</title></rect>'}
- const box=mk("div");box.innerHTML=s+'</svg>';card.appendChild(box);return card}
+ for(let i=0;i<n;i++){const tip=labels[i]+"\n"+series.map(sr=>sr.name+": "+fmt(sr.vals[i]||0)).join("\n")+(o.pick?"\n"+o.pickTip:"");
+  s+='<rect class="hv" data-i="'+i+'" x="'+(L+step*i).toFixed(1)+'" y="'+T+'" width="'+Math.max(step,1).toFixed(1)+'" height="'+ph+'"'+
+   (o.pick?' style="cursor:pointer"':'')+'><title>'+esc(tip)+'</title></rect>'}
+ const box=mk("div");box.innerHTML=s+'</svg>';card.appendChild(box);
+ if(o.pick)box.querySelectorAll("rect.hv").forEach(r=>r.onclick=()=>o.pick(labels[+r.dataset.i]));
+ return card}
 function dTop(title,rows){const card=mk("div","dcard");card.appendChild(mk("div","sec",title));
- const g=mk("div","dtop"),m=Math.max(...rows.map(r=>r[1]),1),ipList=title==="Top client IPs";
- rows.forEach(([name,v])=>{const nm=mk("div","dn"+(ipList?" lnk":""),name);nm.title=ipList?"Investigate "+name:name;
-  if(ipList)nm.onclick=()=>{const i=$("#cf_ip");if(i){i.value=name;cfIp()}};
+ const g=mk("div","dtop"),m=Math.max(...rows.map(r=>r[1]),1),act=DTOP_ACT[title];
+ rows.forEach(([name,v])=>{const ok=act&&name!==""&&name!=null&&!/^(unknown|none|null)$/i.test(name);
+  const nm=mk("div","dn"+(ok?" lnk":""),name);nm.title=ok?act[0]+": "+name:name;
+  if(ok)nm.onclick=()=>act[1](name);
   const bar=mk("div","db"),fill=mk("span");fill.style.width=(100*v/m).toFixed(1)+"%";bar.appendChild(fill);
   g.appendChild(nm);g.appendChild(bar);g.appendChild(mk("div","dvv",dNum(v)))});card.appendChild(g);return card}
 function dashNode(d){const w=mk("div","dash");
@@ -5963,13 +7182,18 @@ function dashNode(d){const w=mk("div","dash");
   const v=mk("div","dv",t.value==null?"n/a":DFMT[t.fmt](t.value));
   if(t.value!=null&&t.prev){const c=100*(t.value-t.prev)/t.prev;v.appendChild(mk("span","dc",(c>=0?"↗ ":"↘ ")+Math.abs(c).toFixed(1)+"%"))}
   x.appendChild(v);const sp=mk("div");sp.innerHTML=dSpark(t.spark||[]);x.appendChild(sp);tiles.appendChild(x)});
- w.appendChild(tiles);w.appendChild(mk("div","muted","↗ / ↘ = change vs the previous period of the same length · buckets: "+d.bucket+" · hover a chart for values"));
+ w.appendChild(tiles);
+ const sec=DBUCKET[d.bucket],pk=sec?{pick:l=>dashPick(l,d.bucket),pickTip:sec===60?"Click: sampled requests in this minute":"Click: zoom in to this "+d.bucket}:{};
+ const hint=mk("div","muted","↗ / ↘ = change vs the previous period of the same length · buckets: "+d.bucket+" · hover a chart for values"+
+  (sec?", click a column to "+(sec===60?"list its sampled requests":"zoom in"):"")+" · click a top-list entry to look it up or filter by it");
+ if(Object.keys(dashX).length){const c=mk("span","lnk"," · clear filters");c.style.cursor="pointer";c.style.color="var(--mint)";c.onclick=()=>cfDash();hint.appendChild(c)}
+ w.appendChild(hint);
  const grid=mk("div","dgrid");
- grid.appendChild(dChart("Requests over time",d.t,[{name:"Requests",color:DC[0],vals:d.requests}],{}));
- grid.appendChild(dChart("Data transfer",d.t,[{name:"Data transfer",color:DC[0],vals:d.bytes}],{fmt:dBytes}));
- grid.appendChild(dChart("Requests by status code",d.t,d.status.map(([k,v])=>({name:k,color:dColor("status",k),vals:v})),{stack:true}));
- grid.appendChild(dChart("Requests by cache status",d.t,d.cache.map(([k,v])=>({name:k,color:dColor("cache",k),vals:v})),{stack:true}));
- if(d.ttfb.length)grid.appendChild(dChart("Edge TTFB percentiles",d.t,d.ttfb.map(([k,v])=>({name:k,color:dColor("ttfb",k),vals:v})),{fmt:dMs,noTotal:true}));
+ grid.appendChild(dChart("Requests over time",d.t,[{name:"Requests",color:DC[0],vals:d.requests}],Object.assign({},pk)));
+ grid.appendChild(dChart("Data transfer",d.t,[{name:"Data transfer",color:DC[0],vals:d.bytes}],Object.assign({fmt:dBytes},pk)));
+ grid.appendChild(dChart("Requests by status code",d.t,d.status.map(([k,v])=>({name:k,color:dColor("status",k),vals:v})),Object.assign({stack:true},pk)));
+ grid.appendChild(dChart("Requests by cache status",d.t,d.cache.map(([k,v])=>({name:k,color:dColor("cache",k),vals:v})),Object.assign({stack:true},pk)));
+ if(d.ttfb.length)grid.appendChild(dChart("Edge TTFB percentiles",d.t,d.ttfb.map(([k,v])=>({name:k,color:dColor("ttfb",k),vals:v})),Object.assign({fmt:dMs,noTotal:true},pk)));
  w.appendChild(grid);
  if(d.tops.length){const tg=mk("div","dgrid tops");d.tops.forEach(([t,rows])=>tg.appendChild(dTop(t,rows)));w.appendChild(tg)}
  return w}

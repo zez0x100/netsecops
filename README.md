@@ -14,6 +14,9 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
   FortiGate and the F5/FortiGate admin audit (PAN-OS has its own time-range selector)
 - Optional F5 active tools (log search, tcpdump ( with the ability to extract the pms by utilizing tshark with f5 filters and save the output in .pms,
   both pcap and pms will be downloaded to the project folder and a copy is kept on the BIG-IP in /var/tmp, readable by root only)
+- F5 file download (same tick-box): list a BIG-IP folder, download any file (or a folder as .tar.gz) up to 500 MB
+  over iControl REST, MD5-checked; files holding secrets (password hashes, keys, master key, bigip.conf, UCS) need
+  a second tick-box
 - Optional PAN-OS packet capture (packet-diag, explicit tick-box required), downloaded as .pcap
 - Configuration backup (F5: explicit tick-box required, the UCS archive is also kept on the BIG-IP;
   PAN-OS / FortiGate: read-only export)
@@ -25,9 +28,20 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
   - Security event search (IP, host, path, Ray ID, action, source, rule, country, ASN, user agent, method) and
     top-N / timeline by action, source, rule, IP, host, path, country, ASN, user agent, colo
   - HTTP traffic summaries (status codes, origin status, cache, TLS / HTTP version, colo, ...) and sampled requests
+  - URL response time: edge TTFB and origin response time (p50 / p95 / p99, average) for a URL (exact path, prefix
+    or contains), a timeline, breakdowns by status, cache, colo, method and path, and the slowest requests with
+    DNS / TCP / TLS / response-header timings to the origin
+  - Ray ID trace across Cloudflare → F5 → origin: the Cloudflare request and security events and the F5 ASM entry
+    found by the `CF-Ray` header (support ID, violations), with a verdict on where it stopped (a request blocked by
+    the F5 is shown as not reaching the origin: the HTTP 200 Cloudflare saw is the F5 blocking page)
+  - WHOIS for an IP (network, range, owner, country, abuse contact, ASN holder) and a domain (registrar, dates,
+    status, name servers, DNSSEC), via RDAP with port-43 WHOIS as fallback; also part of the IP and hostname
+    investigations, with findings for domain expiry, registry holds and a missing transfer lock
   - Traffic dashboard (optional button): headline tiles with change vs the previous period, requests, data
     transfer, status codes, cache status and edge TTFB p50 / p95 / p99 over time, and top paths, countries,
-    client IPs, ASNs, hosts and referrers; drawn in the page (no external libraries), with the numbers as tables below
+    client IPs, ASNs, hosts and referrers; drawn in the page (no external libraries), with the numbers as tables below.
+    Click to drill in: an IP or host opens its investigation, a path / country / ASN filters the dashboard, a
+    referrer runs WHOIS, a chart column zooms to that time (1-minute columns list the sampled requests)
   - Rule search (text, IP, `$list`, rule or ruleset ID, incl. managed rules a zone deploys), DNS search, security
     posture (SSL mode, minimum TLS, HTTPS redirect, security level, True-Client-IP header, certificates, DNS-only records),
     load balancer origin health and health checks, account audit log
