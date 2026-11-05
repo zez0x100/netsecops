@@ -120,9 +120,6 @@ CATALOG = {
          "handler": "pan_nat_rules",
          "params": [P("filter", "Name, public IP or translated IP", "203.0.113.10", required=False),
                     P("vsys", "vsys", "vsys1", "vsys1")]},
-        {"id": "polmatch", "group": "Policy", "label": "Security policy match (test)", "cmd": "<test><security-policy-match><source>{src}</source><destination>{dst}</destination><destination-port>{port}</destination-port><protocol>{proto}</protocol></security-policy-match></test>",
-         "params": [P("src", "Source IP", "10.1.1.10"), P("dst", "Destination IP", "10.2.2.20"),
-                    P("port", "Dest port", "443", "443"), P("proto", "Protocol #", "6 = TCP", "6")]},
         {"id": "urlcat", "group": "Policy", "label": "URL category lookup", "cmd": "<test><url>{url}</url></test>",
          "params": [P("url", "URL or domain", "www.example.com/path")]},
     ],
@@ -142,10 +139,6 @@ CATALOG = {
         {"id": "polstats", "group": "Policy", "label": "Firewall policy hit counts", "path": "/api/v2/monitor/firewall/policy"},
         {"id": "sessions", "group": "Sessions", "label": "Session list (IPv4)", "path": "/api/v2/monitor/firewall/session?count={count}&ip_version=ipv4",
          "params": [P("count", "Max rows", "20", "20")]},
-        {"id": "pollookup", "group": "Policy", "label": "Policy lookup", "path": "/api/v2/monitor/firewall/policy-lookup?srcintf={srcintf}&sourceip={src}&dest={dst}&protocol={proto}&destport={port}",
-         "params": [P("srcintf", "Source interface", "port1"), P("src", "Source IP", "10.1.1.10"),
-                    P("dst", "Destination IP", "10.2.2.20"), P("proto", "Protocol", "tcp", "tcp"),
-                    P("port", "Dest port", "443", "443")]},
     ],
     "cloudflare": [
         {"id": "verify", "group": "Account", "label": "API token status (user-owned tokens)", "path": "/client/v4/user/tokens/verify"},
@@ -1211,16 +1204,30 @@ def pan_lookup(sess, ip, vsys, flow, refs=True):
         if flow["port"]:
             cmd += "<destination-port>%d</destination-port>" % flow["port"]
         cmd += "<protocol>%s</protocol></security-policy-match></test>" % xml_escape(flow["proto"])
-        root = pan_xml(sess, {"type": "op", "cmd": cmd}, 30)
-        e = root.find(".//rules/entry") if root is not None else None
+        st, raw = http(sess, "POST", "/api/", {"X-PAN-KEY": sess["key"],
+                       "Content-Type": "application/x-www-form-urlencoded"},
+                       urllib.parse.urlencode({"type": "op", "cmd": cmd}).encode(), 30)
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            root = None
+        err = None if root is not None and root.get("status") == "success" else \
+            " ".join(t.strip() for t in root.itertext() if t.strip())[:300] if root is not None else "HTTP %s" % st
+        e = root.find(".//rules/entry") if not err else None
         res["flow_test"] = {}
-        if root is None:
-            notes.append("security-policy-match test failed or was rejected; no verdict.")
+        if err:
+            verdict = {"label": "POLICY LOOKUP FAILED", "kind": "warn"}
+            notes.append("security-policy-match was rejected: %s. Check the zone names, and that the API admin may "
+                         "run operational commands." % err)
         elif e is None:
-            verdict = {"label": "NO RULE RETURNED for this flow", "kind": "info"}
+            verdict = {"label": "NO RULE MATCHED (the default intrazone / interzone rule applies)", "kind": "warn"}
         else:
             act = (e.findtext("action") or "").strip().lower()
-            name = e.get("name")
+            # Older PAN-OS answers '<entry>rule-name; index: 5</entry>' instead of a name attribute.
+            name = e.get("name") or (e.text or "").split(";")[0].strip()
+            if not act and name:
+                act = next(((r.findtext("action") or "").strip().lower() for _, r in pan_rules(sess, vsys)
+                            if r.get("name") == name), "")
             res["flow_test"]["matched_rule"] = x2o(e)
             if act == "allow":
                 verdict = {"label": "ALLOWED by rule '%s'" % name, "kind": "ok"}
@@ -1311,7 +1318,11 @@ def fg_lookup(sess, ip, vdom, flow, refs=True):
         r0 = data.get("results") if isinstance(data, dict) else None
         r0 = r0[0] if isinstance(r0, list) and r0 else r0
         if not ok or not isinstance(r0, dict):
-            notes.append("policy-lookup failed (HTTP %s); endpoint/parameters vary by FortiOS version." % st)
+            verdict = {"label": "POLICY LOOKUP FAILED (HTTP %s)" % st, "kind": "warn"}
+            notes.append("policy-lookup failed (HTTP %s)%s. Check the ingress interface name and VDOM; the token "
+                         "needs read access to Firewall policy." % (
+                             st, ": " + str(data.get("cli_error") or data.get("error") or "")[:200]
+                             if isinstance(data, dict) and (data.get("cli_error") or data.get("error")) else ""))
         else:
             pid = r0.get("policy_id")
             if pid:
@@ -1335,6 +1346,166 @@ def fg_lookup(sess, ip, vdom, flow, refs=True):
     if verdict is None:
         verdict = {"label": "%d POLICY(IES) REFERENCE THIS IP" % len(rules), "kind": "info"}
     return res, summary, verdict
+
+
+# ---- Policy search by name (PAN-OS security rules, FortiGate firewall policies) ----
+POLICY_Q_RE = re.compile(r"^[^\x00-\x1f\x7f'\"<>\\]{1,100}$")
+
+
+def epoch_utc3(t):
+    try:
+        return utc3(datetime.datetime.fromtimestamp(int(t), datetime.timezone.utc).isoformat()) if int(t) > 0 else "never"
+    except (TypeError, ValueError):
+        return ""
+
+
+def pan_objects(sess, vsys):
+    """name -> value of address, address-group, service and service-group objects (shared, then the vsys)."""
+    objs = {}
+    for xp in ("/config/shared", pan_base(vsys)):
+        for tag in ("address", "address-group", "service", "service-group"):
+            node = pan_section(sess, xp, tag)
+            for e in (node.findall("entry") if node is not None else []):
+                v = ""
+                if tag == "address":
+                    v = next((e.findtext(t).strip() for t in ("ip-netmask", "ip-range", "fqdn", "ip-wildcard")
+                              if e.findtext(t)), "")
+                elif tag == "address-group":
+                    v = ("group: " + ", ".join(pan_members(e.find("static")))) if e.find("static") is not None else \
+                        "dynamic: " + (e.findtext("dynamic/filter") or "").strip()
+                elif tag == "service":
+                    v = next(("%s/%s" % (p, e.findtext("protocol/%s/port" % p) or "")
+                              for p in ("tcp", "udp", "sctp") if e.find("protocol/" + p) is not None), "")
+                else:
+                    v = "group: " + ", ".join(pan_members(e.find("members")))
+                objs[e.get("name")] = v
+    return objs
+
+
+def pan_policy_search(sess, q, vsys):
+    objs, rows, pos = pan_objects(sess, vsys), [], collections.Counter()
+    for scope, e in pan_rules(sess, vsys):
+        pos[scope] += 1
+        name = e.get("name") or ""
+        if q.lower() not in name.lower():
+            continue
+        m = lambda t: pan_members(e.find(t))
+        res = lambda t: ["%s = %s" % (x, objs[x]) if objs.get(x) else x for x in m(t)]
+        prof = e.find("profile-setting")
+        profiles = []
+        if prof is not None and prof.find("group") is not None:
+            profiles = ["group: " + ", ".join(pan_members(prof.find("group")))]
+        elif prof is not None and prof.find("profiles") is not None:
+            profiles = ["%s: %s" % (c.tag, ", ".join(pan_members(c))) for c in prof.find("profiles")]
+        rows.append({"rule": name, "scope": scope, "position": pos[scope], "action": e.findtext("action") or "",
+                     "enabled": "no" if (e.findtext("disabled") or "no") == "yes" else "yes",
+                     "from_zone": m("from"), "to_zone": m("to"),
+                     "source": res("source"), "negate_source": e.findtext("negate-source") or "no",
+                     "source_user": m("source-user"), "destination": res("destination"),
+                     "negate_destination": e.findtext("negate-destination") or "no",
+                     "application": m("application"), "service": res("service"), "url_category": m("category"),
+                     "security_profiles": profiles, "log_at_session_end": e.findtext("log-end") or "yes",
+                     "tags": m("tag"), "description": (e.findtext("description") or "").strip()})
+    notes = []
+    if rows:   # hit counts are kept per vsys rule base
+        lst = "".join("<member>%s</member>" % xml_escape(r["rule"]) for r in rows[:50])
+        root = pan_xml(sess, {"type": "op", "cmd": "<show><rule-hit-count><vsys><vsys-name><entry name='%s'><rule-base>"
+                              "<entry name='security'><rules><list>%s</list></rules></entry></rule-base></entry>"
+                              "</vsys-name></vsys></rule-hit-count></show>" % (xml_escape(vsys), lst)}, 30)
+        hits = {h.get("name"): h for h in (root.findall(".//rules/entry") if root is not None else [])}
+        for r in rows:
+            h = hits.get(r["rule"])
+            if h is not None:
+                r["hit_count"] = (h.findtext("hit-count") or "").strip()
+                r["last_hit"] = epoch_utc3(h.findtext("last-hit-timestamp"))
+        if root is None:
+            notes.append("Hit counts could not be read (show rule-hit-count needs PAN-OS 8.1+).")
+    notes.append("Searched the firewall's running config (vsys %s, shared pre / post rules). Rules pushed from "
+                 "Panorama that are not in the running config are not listed." % vsys)
+    return rows, notes
+
+
+def fg_policy_search(sess, q, vdom):
+    pols = fg_cmdb(sess, "policy", vdom)
+    if pols is None:
+        raise ValueError("could not read the firewall policies (check the token's profile and the VDOM)")
+    vq = "?vdom=" + urllib.parse.quote(vdom) if vdom else ""
+    objs = {}
+    for kind, path in (("addr", "/api/v2/cmdb/firewall/address"), ("grp", "/api/v2/cmdb/firewall/addrgrp"),
+                       ("svc", "/api/v2/cmdb/firewall.service/custom"), ("sgrp", "/api/v2/cmdb/firewall.service/group")):
+        st, ok, d = rest_get(sess, path + vq)
+        for o in as_list(d.get("results")) if ok and isinstance(d, dict) else []:
+            if kind == "addr":
+                t = o.get("type", "ipmask")
+                v = o.get("subnet") if t == "ipmask" else "%s-%s" % (o.get("start-ip"), o.get("end-ip")) \
+                    if t == "iprange" else o.get(t) or t
+            elif kind == "svc":
+                v = " ".join(x for x in ("tcp/" + o["tcp-portrange"] if o.get("tcp-portrange") else "",
+                                         "udp/" + o["udp-portrange"] if o.get("udp-portrange") else "") if x) \
+                    or str(o.get("protocol") or "")
+            else:
+                v = "group: " + ", ".join(m.get("name") for m in as_list(o.get("member")))
+            objs[o.get("name")] = str(v or "")
+    st, ok, d = rest_get(sess, "/api/v2/monitor/firewall/policy" + vq)
+    stats = {s.get("policyid"): s for s in as_list(d.get("results"))} if ok and isinstance(d, dict) else {}
+    names = lambda x: [i.get("name") for i in as_list(x)]
+    res = lambda x: ["%s = %s" % (n, objs[n]) if objs.get(n) else n for n in names(x)]
+    rows = []
+    for i, p in enumerate(pols, 1):
+        if not (q.lower() in str(p.get("name") or "").lower() or (q.isdigit() and str(p.get("policyid")) == q)):
+            continue
+        s = stats.get(p.get("policyid")) or {}
+        rows.append({"policyid": p.get("policyid"), "name": p.get("name") or "", "position": i,
+                     "action": p.get("action"), "enabled": "yes" if p.get("status", "enable") == "enable" else "no",
+                     "srcintf": names(p.get("srcintf")), "dstintf": names(p.get("dstintf")),
+                     "source": res(p.get("srcaddr")), "negate_source": p.get("srcaddr-negate", "disable"),
+                     "destination": res(p.get("dstaddr")), "negate_destination": p.get("dstaddr-negate", "disable"),
+                     "users_groups": names(p.get("users")) + names(p.get("groups")),
+                     "internet_service": names(p.get("internet-service-name")), "service": res(p.get("service")),
+                     "schedule": p.get("schedule"), "nat": p.get("nat"),
+                     "security_profiles": ["%s: %s" % (k, p[k]) for k in ("av-profile", "webfilter-profile", "ips-sensor",
+                                           "application-list", "ssl-ssh-profile", "dnsfilter-profile") if p.get(k)],
+                     "log_traffic": p.get("logtraffic"), "hit_count": s.get("hit_count", ""),
+                     "last_used": epoch_utc3(s["last_used"]) if "last_used" in s else "",
+                     "active_sessions": s.get("active_sessions", ""), "comments": p.get("comments") or ""})
+    notes = ["Position = order in the policy list (FortiOS evaluates top-down)." +
+             ("" if stats else " Hit counts could not be read (monitor API).")]
+    return rows, notes
+
+
+def do_policy_search(b):
+    """Security rules (PAN-OS) or firewall policies (FortiGate) whose name contains the text (or the FortiGate ID)."""
+    sess = SESSIONS.get(b.get("id"))
+    if not sess or sess["vendor"] not in ("paloalto", "fortigate"):
+        return {"ok": False, "error": "connect a Palo Alto or FortiGate device first"}
+    t0 = time.time()
+    q = str(b.get("name") or "").strip()
+    if not POLICY_Q_RE.match(q):
+        return {"ok": False, "error": "enter a policy name (or part of it)%s, without quotes or < >" % (
+            " or a policy ID" if sess["vendor"] == "fortigate" else "")}
+    try:
+        audit(sess, "policy search '%s'" % q)
+        if sess["vendor"] == "paloalto":
+            rows, notes = pan_policy_search(sess, q, pstr(b.get("vsys"), "vsys") or "vsys1")
+            key = lambda r: "%s (%s, position %s)" % (r["rule"], r["scope"], r["position"])
+        else:
+            rows, notes = fg_policy_search(sess, q, pstr(b.get("vdom"), "VDOM"))
+            key = lambda r: "Policy %s %s(position %s)" % (r["policyid"], "'%s' " % r["name"] if r["name"] else "",
+                                                           r["position"])
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+    # A few matches read best one by one; many as a table.
+    data = {key(r): r for r in rows} if len(rows) <= 5 else {"policies": rows}
+    off = [r for r in rows if r["enabled"] == "no"]
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "policy search " + q,
+            "verdict": {"label": ("%d POLICY(IES) MATCH '%s'" % (len(rows), q)) + (" · %d DISABLED" % len(off) if off else "")
+                        if rows else "NO POLICY NAME CONTAINS '%s'" % q, "kind": "info" if rows else "warn"},
+            "summary": ["%s: action %s%s%s" % (key(r), r["action"], "" if r["enabled"] == "yes" else ", DISABLED",
+                                                ", hits %s" % r["hit_count"] if r.get("hit_count") not in (None, "") else "")
+                        for r in rows[:10]] + notes,
+            "data": data}
 
 
 def fg_names(x):
@@ -1789,7 +1960,9 @@ def do_f5_capture(b):
         audit(sess, "tcpdump %s on %s (%ds)%s%s" % (flt, iface, dur, ssl_opt, " + tshark keylog" if want_pms else ""))
         # Run detached and poll, so no single REST call has to stay open for the whole capture.
         tlog, tdone = keep + ".log", keep + ".done"
-        inner = "timeout -k 5 %d tcpdump -ni %s -s %d -c %d%s -w %s %s > %s 2>&1; chmod 600 %s 2>&1" % (
+        # SIGINT (as Ctrl-C) is tcpdump's clean stop: it flushes the file and prints the packet counts.
+        # -U writes each packet at once, so nothing is lost even if it has to be killed.
+        inner = "timeout -s INT -k 5 %d tcpdump -U -ni %s -s %d -c %d%s -w %s %s > %s 2>&1; chmod 600 %s 2>&1" % (
             dur, iface, snap, cnt, ssl_opt, keep, flt, tlog, keep)
         if want_pms:
             # One keylog line per entry (tshark joins several per frame with commas), duplicates dropped.
@@ -1801,8 +1974,8 @@ def do_f5_capture(b):
         st, ok, out, data = f5_bash(sess, script, 20)
         if not ok:
             raise ValueError(f5_bash_error(st, data, "tcpdump start"))
-        poll = ("if [ -e %s ]; then echo FINISHED; cat %s; ls -l %s 2>&1; "
-                "echo PMS_BYTES=$(wc -c < %s 2>/dev/null); fi") % (tdone, tlog, keep, keep_pms)
+        poll = ("if [ -e %s ]; then echo FINISHED; cat %s; echo PCAP_BYTES=$(stat -c %%s %s 2>/dev/null); "
+                "echo PMS_BYTES=$([ -e %s ] && wc -c < %s); fi") % (tdone, tlog, keep, keep_pms, keep_pms)
         deadline = time.time() + dur + 45
         while True:
             time.sleep(3)
@@ -1815,8 +1988,19 @@ def do_f5_capture(b):
                     keep, tlog), 20)
                 raise ValueError("capture did not finish within %d s. On the BIG-IP: %s" % (
                     dur + 45, " | ".join(l.strip() for l in diag.splitlines() if l.strip())[:600] or "no output"))
-        if os.path.basename(keep) not in out or "No such file" in out or "cannot access" in out:
-            raise ValueError("capture produced no file. tcpdump output: " + out.strip()[:400])
+        tlines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith(("FINISHED", "PCAP_", "PMS_"))]
+        pm = re.search(r"PCAP_BYTES=(\d+)", out)
+        if not pm:
+            raise ValueError("capture produced no file. tcpdump output: " + " | ".join(tlines)[:400])
+        cm = re.search(r"(\d+) packets? captured", out)
+        if int(pm.group(1)) <= 24 or (cm and cm.group(1) == "0"):   # 24 bytes = pcap header only
+            f5_bash(sess, "rm -f %s %s" % (keep, keep_pms), 20)
+            raise ValueError(
+                "no packets matched '%s' on %s in %d s, so there is nothing to download. Check that: the traffic ran "
+                "during the capture; the IP is the one the BIG-IP sees (behind Cloudflare the client side shows a "
+                "Cloudflare edge IP, not the real client: filter on the virtual server IP or the pool member "
+                "instead); 0.0:nnnp is used to also see the server side; this unit is the active one. tcpdump: %s" % (
+                    flt, iface, dur, " | ".join(tlines)[:300] or "no output"))
         os.makedirs(CAPTURE_DIR, exist_ok=True)
         safe = re.sub(r'[^A-Za-z0-9_.\-]', "_", sess["name"])
         base = "%s_%s_%s" % (safe, str(ip).replace(":", "-"), time.strftime("%Y%m%d-%H%M%S"))
@@ -6514,7 +6698,7 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/api/connect": do_connect, "/api/run": do_run,
                   "/api/raw": do_raw, "/api/disconnect": do_disconnect,
                   "/api/ipcheck": do_ipcheck, "/api/f5host": do_f5_host, "/api/f5logs": do_f5_logs,
-                  "/api/f5capture": do_f5_capture, "/api/f5file": do_f5_file, "/api/profile/save": do_profile_save,
+                  "/api/f5capture": do_f5_capture, "/api/f5file": do_f5_file, "/api/policy": do_policy_search, "/api/profile/save": do_profile_save,
                   "/api/profile/delete": do_profile_delete, "/api/health": do_health,
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
                   "/api/fglogs": do_fg_logs, "/api/adminaudit": do_admin_audit, "/api/f5sync": do_f5_sync, "/api/pancapture": do_pan_capture,
@@ -6910,6 +7094,19 @@ function renderIp(){const box=$("#iplookup");box.innerHTML="";const d=dev();if(!
   h+=v==="paloalto"?fld("ip_vsys","vsys","vsys1","vsys1"):fld("ip_vdom","VDOM (optional)","root");
  }
  h+='</div><div style="margin-top:10px"><button class="primary" onclick="ipLookup()">Check</button></div></div>';
+ if(v!=="f5"){const pan=v==="paloalto";
+  h+='<div class="card"><h3>Policy lookup · find a '+(pan?"security rule":"firewall policy")+' by name, or which one allows or blocks a flow</h3>'+
+   '<div class="grp">By name</div><div class="row3">'+fld("pm_name",pan?"Rule name (or part of it)":"Policy name (or part of it) or policy ID",pan?"allow-web":"web-in or 12")+'</div>'+
+   '<div style="margin-top:10px"><button class="primary" onclick="policyByName()">Find policy</button></div>'+
+   '<div class="grp">By flow</div><div class="row3">'+
+   fld("pm_src","Source IP","198.51.100.9")+fld("pm_dst","Destination IP","203.0.113.10")+fld("pm_port","Destination port (optional)","443")+
+   '<div><label>Protocol</label><select id="pm_proto"><option>tcp</option><option>udp</option><option>icmp</option></select></div>'+
+   (pan?fld("pm_from","From zone (optional)","untrust")+fld("pm_to","To zone (optional)","trust")+fld("pm_vsys","vsys","vsys1","vsys1")
+       :fld("pm_if","Ingress interface (required)","port1")+fld("pm_vdom","VDOM (optional)","root"))+
+   '</div><div style="margin-top:10px"><button class="primary" onclick="policyLookup()">Look up policy</button></div>'+
+   '<p class="muted" style="margin:8px 0 0">'+(pan?"Runs 'test security-policy-match' (as Device &gt; Test Policy Match), so it also covers Panorama-pushed rules. Zones narrow the match; leave them blank to let the firewall evaluate all rules.":
+    "Runs FortiOS policy lookup (as Policy &amp; Objects &gt; Policy Lookup). The ingress interface is the one the first packet arrives on, e.g. port1 or a VLAN interface.")+
+   ' Read-only: nothing is changed on the device.</p></div>'}
  if(v==="f5")h+='<div class="card"><h3>Hostname lookup · virtual server and local traffic policy</h3><div class="row3">'+fld("fh_host","Hostname","app.example.com")+
   '</div><div style="margin-top:10px"><button class="primary" onclick="f5Host()">Find virtual server / policy</button></div></div>';
  box.innerHTML=h}
@@ -6917,6 +7114,12 @@ async function f5Host(){setBusy("hostname lookup");
  const r=await api("/api/f5host",{id:cur,hostname:g("fh_host")});show(r,"hostname lookup")}
 async function ipLookup(){setBusy("IP lookup");
  const r=await api("/api/ipcheck",{id:cur,ip:g("ip_ip"),mode:"refs",vsys:g("ip_vsys"),vdom:g("ip_vdom")});show(r,"IP lookup")}
+async function policyByName(){setBusy("policy search");
+ const r=await api("/api/policy",{id:cur,name:g("pm_name"),vsys:g("pm_vsys"),vdom:g("pm_vdom")});show(r,"policy search")}
+async function policyLookup(){if(!g("pm_src").trim()||!g("pm_dst").trim())return show({ok:false,error:"enter both the source and the destination IP"},"policy lookup");
+ setBusy("policy lookup");
+ const r=await api("/api/ipcheck",{id:cur,mode:"verdict",ip:g("pm_src"),peer:g("pm_dst"),role:"source",port:g("pm_port"),proto:g("pm_proto"),
+  from:g("pm_from"),to:g("pm_to"),vsys:g("pm_vsys"),srcintf:g("pm_if"),vdom:g("pm_vdom")});show(r,"policy lookup")}
 function renderF5(){const box=$("#f5tools");box.innerHTML="";const d=dev();if(!d||d.vendor!=="f5")return;
  box.innerHTML='<div class="card warnbox"><h3>F5 active tools · run shell commands on the BIG-IP</h3>'+
  '<p class="muted" style="margin:0 0 8px">Uses POST /mgmt/tm/util/bash (Administrator role). Commands are fixed templates and only validated values are inserted. tcpdump adds CPU load, and captures may contain sensitive data.</p>'+

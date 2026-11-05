@@ -5,7 +5,11 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
 
 ## Features
 - Health checks and curated read-only status queries per vendor
-- "Where does this IP appear?" lookup (F5 pools, nodes, virtuals, data groups, policies; PAN/Forti policy lookup)
+- "Where does this IP appear?" lookup (F5 pools, nodes, virtual servers, data groups, policies; PAN/Forti rules
+  that reference the IP)
+- PAN-OS / FortiGate policy lookup: find a rule by name (or FortiGate policy ID) with its position, action,
+  objects resolved to their values, security profiles and hit count; or which rule allows or blocks a flow
+  (source, destination, port, protocol; zones on PAN-OS, ingress interface on FortiGate)
 - F5 ASM/WAF request-log search (incl. by any HTTP header: value, IP, True-Client-IP, hostname, URL, time, support ID, POST body), top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
 - FortiGate lookups: Virtual IPs (name / external / mapped IP filter), static routes (IP, gateway, interface filter)
 - PAN-OS lookups: destination / static NAT rules (the Virtual IP equivalent), configured static routes, session list
