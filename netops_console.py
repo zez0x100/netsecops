@@ -98,6 +98,9 @@ CATALOG = {
     ],
     "paloalto": [
         {"id": "sysinfo", "group": "Device", "label": "System info", "cmd": "<show><system><info/></system></show>"},
+        {"id": "resutil", "group": "Device", "label": "Resource utilization (management / dataplane CPU, memory, sessions, packet buffers, disk)",
+         "handler": "pan_resources",
+         "params": [P("range", "Time range: 1h-24h, 1d-7d or 1w-13w", "3d", "1h", required=False)]},
         {"id": "resources", "group": "Device", "label": "System resources (top)", "cmd": "<show><system><resources/></system></show>"},
         {"id": "jobs", "group": "Device", "label": "Jobs (all)", "cmd": "<show><jobs><all/></jobs></show>"},
         {"id": "ha", "group": "HA", "label": "HA state", "cmd": "<show><high-availability><state/></high-availability></show>"},
@@ -126,6 +129,9 @@ CATALOG = {
     "fortigate": [
         {"id": "status", "group": "Device", "label": "System status", "path": "/api/v2/monitor/system/status"},
         {"id": "license", "group": "Device", "label": "License status", "path": "/api/v2/monitor/license/status"},
+        {"id": "resutil", "group": "Resources", "label": "Resource utilization (CPU, memory / conserve mode, disk, sessions, setup rate)",
+         "handler": "fg_resources",
+         "params": [P("range", "Time range: up to 24h charted; longer adds conserve-mode history", "3d", "1h", required=False)]},
         {"id": "resources", "group": "Resources", "label": "Resource usage (CPU/mem/sessions)", "path": "/api/v2/monitor/system/resource/usage"},
         {"id": "ha", "group": "HA", "label": "HA peers", "path": "/api/v2/monitor/system/ha-peer"},
         {"id": "hachk", "group": "HA", "label": "HA checksums", "path": "/api/v2/monitor/system/ha-checksums"},
@@ -1777,7 +1783,522 @@ def pan_sessions(sess, v):
     return pan_result(cmd, data, t0, ok, status)
 
 
-PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_routes, "pan_sessions": pan_sessions}
+# ---- Resource utilization (PAN-OS / FortiGate): CPU, memory, sessions, buffers, disk, with thresholds ---------
+def ru_sev(v, hi, med):
+    return None if v is None else "high" if v >= hi else "medium" if v >= med else None
+
+
+def ru_tile(label, v, sub="", hi=90, med=80, fmt="pct", spark=None):
+    sev = ru_sev(v, hi, med) if fmt == "pct" else None
+    return {"label": label, "value": None if v is None else round(float(v), 1), "fmt": fmt, "sub": sub,
+            "kind": {"high": "bad", "medium": "warn"}.get(sev, ""), "spark": spark or []}
+
+
+def ru_float(v):
+    try:
+        return float(str(v).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return None
+
+
+def ru_result(t0, request, tiles, charts, findings, data, notes, label):
+    findings.sort(key=lambda f: SEV_ORDER.get(f["severity"], 9))
+    hi = [f for f in findings if f["severity"] == "high"]
+    kind = "bad" if hi else "info" if any(f["severity"] == "medium" for f in findings) else "ok"
+    out = collections.OrderedDict([("findings", findings)])
+    out.update(data)
+    out["notes"] = [n for n in notes if n]
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": request,
+            "verdict": {"label": label, "kind": kind},
+            "summary": ["%s: %s (%s)" % (f["severity"].upper(), f["issue"], f["object"]) for f in findings[:10]] or
+                       ["No resource above its warning threshold."],
+            "data": out, "tiles": tiles, "charts": charts}
+
+
+RU_RANGE_RE = re.compile(r"^(\d{1,3})\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?|w|weeks?)$")
+RU_UNIT_S = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def ru_range(v):
+    """'3d', '24h', '2 weeks' ... -> seconds."""
+    m = RU_RANGE_RE.match(str(v or "1h").strip().lower())
+    if not m or int(m.group(1)) < 1:
+        raise ValueError("time range must look like 30m, 6h, 3d or 2w")
+    return int(m.group(1)) * RU_UNIT_S[m.group(2)[0]]
+
+
+def ru_span(secs):
+    """'last 3 days', 'last 24 hours', 'last 2 weeks': the largest unit that gives a whole number of at least 2."""
+    if secs == 3600:
+        return "last hour"
+    for s_, name in ((604800, "week"), (86400, "day"), (3600, "hour"), (60, "minute")):
+        if secs % s_ == 0 and secs // s_ >= 2:
+            return "last %d %ss" % (secs // s_, name)
+    return "last %d s" % secs
+
+
+def ru_labels(n, step):
+    """Labels for the last n buckets of `step` seconds (oldest first), on this PC's clock."""
+    now = int(time.time() // step * step)
+    fmt = {60: "%H:%M", 3600: "%m-%d %H:00", 86400: "%Y-%m-%d", 604800: "%Y-%m-%d"}.get(step, "%m-%d %H:%M")
+    return [time.strftime(fmt, time.localtime(now - step * (n - 1 - i))) for i in range(n)]
+
+
+# PAN-OS resource monitor history: (granularity, seconds per value, most values kept)
+PAN_RM_GRAN = (("minute", 60, 60), ("hour", 3600, 24), ("day", 86400, 7), ("week", 604800, 13))
+
+
+def pan_rm_pick(secs):
+    """The finest resource-monitor granularity that covers `secs` -> (granularity, step, number of values)."""
+    for g, step, most in PAN_RM_GRAN:
+        if secs <= step * most:
+            return g, step, max(1, -(-secs // step))
+    raise ValueError("PAN-OS keeps dataplane history for at most 13 weeks (60 minutes per minute, 24 hours per hour, "
+                     "7 days per day, 13 weeks per week)")
+
+
+def pan_top_parse(text):
+    """Management-plane 'show system resources' (Linux top) -> cpu %, memory %, load, uptime, top processes."""
+    out = {}
+    m = re.search(r"load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)", text)
+    if m:
+        out["load"] = [float(x) for x in m.groups()]
+    m = re.search(r"\bup\s+(.+?),\s+\d+\s+users?", text)
+    if m:
+        out["uptime"] = m.group(1).strip()
+    m = re.search(r"Cpu\(s\):(.*)", text)
+    if m:
+        f = {k: float(v) for v, k in re.findall(r"([\d.]+)\s*%?\s*(us|sy|ni|id|wa|hi|si|st)\b", m.group(1))}
+        if "id" in f:
+            out["cpu"] = max(0.0, 100.0 - f["id"])
+            out["cpu_parts"] = f
+    m = re.search(r"^\s*(KiB|MiB|GiB)?\s*Mem\s*:(.*)$", text, re.M)
+    if m:
+        f = {k: float(v) for v, k in re.findall(r"([\d.]+)k?\s+(total|free|used|buff/cache|buffers|cached)", m.group(2))}
+        if f.get("total"):
+            used = f.get("used", 0.0)
+            if "buff/cache" not in f:   # older top: 'used' includes buffers and the page cache
+                c = re.search(r"Swap:.*?([\d.]+)k?\s+cached", text)
+                used -= f.get("buffers", 0.0) + (float(c.group(1)) if c else 0.0)
+            gib = {"KiB": 1048576.0, "MiB": 1024.0, "GiB": 1.0}[m.group(1) or "KiB"]
+            out.update(mem=100.0 * max(used, 0.0) / f["total"], mem_total_gib=f["total"] / gib,
+                       mem_used_gib=max(used, 0.0) / gib)
+    lines = text.splitlines()
+    hdr = next((i for i, l in enumerate(lines) if re.match(r"^\s*PID\s+USER\b", l)), None)
+    if hdr is not None:
+        cols = lines[hdr].split()
+        procs = []
+        for l in lines[hdr + 1:]:
+            parts = l.split(None, len(cols) - 1)
+            if len(parts) == len(cols):
+                procs.append(dict(zip(cols, parts)))
+        procs.sort(key=lambda p: ru_float(p.get("%CPU")) or 0, reverse=True)
+        out["procs"] = [{"pid": p.get("PID"), "process": p.get("COMMAND"), "user": p.get("USER"),
+                         "cpu_pct": p.get("%CPU"), "mem_pct": p.get("%MEM"), "resident": p.get("RES")}
+                        for p in procs[:10]]
+    return out
+
+
+def pan_dp_parse(data, gran="minute"):
+    """'show running resource-monitor <gran>' -> per data processor: cores (values oldest first) and utilization."""
+    res = data.get("result") if isinstance(data, dict) else None
+    dps = ((res if isinstance(res, dict) else {}).get("resource-monitor") or {}).get("data-processors") or {}
+    vals = lambda s: [acc_int(x) for x in str(acc_scalar(s) or "").split(",") if x.strip() != ""][::-1]
+    out = []
+    for dp, d in sorted(dps.items()) if isinstance(dps, dict) else []:
+        mn = (d if isinstance(d, dict) else {}).get(gran) or {}
+        cores = [(str(e.get("coreid")), vals(e.get("value"))) for e in as_list((mn.get("cpu-load-average") or {}).get("entry"))
+                 if isinstance(e, dict)]
+        peak = [(str(e.get("coreid")), vals(e.get("value"))) for e in as_list((mn.get("cpu-load-maximum") or {}).get("entry"))
+                if isinstance(e, dict)]
+        util = collections.OrderedDict((str(e.get("name")), vals(e.get("value")))
+                                       for e in as_list((mn.get("resource-utilization") or {}).get("entry")) if isinstance(e, dict))
+        out.append({"dp": dp, "cores": cores, "peak": peak, "util": util})
+    return out
+
+
+def pan_disk_parse(text):
+    rows = []
+    for l in text.splitlines():
+        m = re.match(r"^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)%\s+(\S+)\s*$", l.strip())
+        if m:
+            rows.append({"mounted_on": m.group(6), "filesystem": m.group(1), "size": m.group(2), "used": m.group(3),
+                         "available": m.group(4), "use_pct": int(m.group(5))})
+    return rows
+
+
+def pan_resources(sess, v):
+    t0 = time.time()
+    secs = ru_range(v.get("range"))
+    gran, step, nb = pan_rm_pick(secs)
+    span = ru_span(nb * step)
+    per = "per-%s averages" % gran
+    cmds = collections.OrderedDict([
+        ("mgmt", "<show><system><resources/></system></show>"),
+        ("dp", "<show><running><resource-monitor><%s><last>%d</last></%s></resource-monitor></running></show>" % (gran, nb, gran)),
+        ("sess", "<show><session><info/></session></show>"),
+        ("disk", "<show><system><disk-space/></system></show>")])
+    with concurrent.futures.ThreadPoolExecutor(4) as ex:
+        futs = {k: ex.submit(pan_op, sess, c) for k, c in cmds.items()}
+    got, notes = {}, []
+    for k, f in futs.items():
+        try:
+            st, ok, data = f.result()
+        except (urllib.error.URLError, OSError) as e:
+            st, ok, data = 0, False, str(getattr(e, "reason", e))
+        if ok:
+            got[k] = data
+        else:
+            notes.append("%s: no answer (HTTP %s) %s" % (cmds[k], st, str(data)[:200]))
+    if not got:
+        return {"ok": False, "error": "no resource command answered. " + " ".join(notes)}
+    tiles, charts, findings, data = [], [], [], collections.OrderedDict()
+    text = lambda d: str(acc_scalar((d or {}).get("result")) or "")
+    rows = []
+
+    def row(resource, current, detail="", hi=None, med=None, obj=None, issue=None):
+        sev = ru_sev(current, hi, med) if hi is not None else None
+        rows.append({"resource": resource, "current": "" if current is None else
+                     ("%.1f%%" % current if hi is not None else current), "detail": detail,
+                     "status": {"high": "HIGH", "medium": "warning"}.get(sev, "ok") if hi is not None else ""})
+        if sev:
+            findings.append(finding(sev, obj or resource, issue or "%s at %.1f%%" % (resource, current), detail))
+    top = pan_top_parse(text(got.get("mgmt"))) if "mgmt" in got else {}
+    if top.get("cpu") is not None:
+        p = top.get("cpu_parts", {})
+        row("Management CPU", top["cpu"], "user %.1f%% · system %.1f%% · iowait %.1f%% (one sample)" % (
+            p.get("us", 0), p.get("sy", 0), p.get("wa", 0)), 90, 80)
+        tiles.append(ru_tile("Management CPU", top["cpu"], "now (one sample)"))
+    if top.get("mem") is not None:
+        d = "%.1f of %.1f GiB used, excluding cache" % (top["mem_used_gib"], top["mem_total_gib"])
+        row("Management memory", top["mem"], d, 95, 90)
+        tiles.append(ru_tile("Management memory", top["mem"], d, 95, 90))
+    if top.get("load"):
+        rows.append({"resource": "Management load average", "current": " / ".join("%.2f" % x for x in top["load"]),
+                     "detail": "1 / 5 / 15 minutes", "status": ""})
+    if top.get("uptime"):
+        rows.append({"resource": "Uptime", "current": top["uptime"], "detail": "", "status": ""})
+
+    for dp in pan_dp_parse(got.get("dp"), gran) if "dp" in got else []:
+        cores = [(c, vals) for c, vals in dp["cores"] if vals]
+        active = [(c, vals) for c, vals in cores if any(vals)] or cores
+        if active:
+            n = min(len(vals) for _, vals in active)
+            avg = [sum(vals[-n:][i] for _, vals in active) / float(len(active)) for i in range(n)]
+            busiest = max(active, key=lambda cv: cv[1][-1])
+            cur, mean, pk = avg[-1], sum(avg) / n, max(avg)
+            pk_cores = [x for _, x in dp["peak"] if x and any(x)]   # cpu-load-maximum: each core's highest value per bucket
+            m_ = min([n] + [len(x) for x in pk_cores])
+            pmax = [max(x[-m_:][i] for x in pk_cores) for i in range(m_)] if pk_cores else []
+            row("Dataplane CPU (%s)" % dp["dp"], cur, "average of %d active cores, %s · %s: mean %.1f%%, highest %s %.1f%%%s · "
+                "busiest core in the latest %s: %s at %d%%" % (
+                    len(active), per, span, mean, gran, pk,
+                    ", highest single-core maximum %d%%" % max(pmax) if pmax else "", gran, busiest[0], busiest[1][-1]),
+                90, 80, issue="Dataplane CPU %s at %.1f%% (latest %s)" % (dp["dp"], cur, gran))
+            if ru_sev(cur, 90, 80) is None and pk >= (95 if gran == "minute" else 85):
+                findings.append(finding("medium", "Dataplane CPU (%s)" % dp["dp"],
+                                        "Dataplane CPU averaged %.1f%% over one %s in the %s" % (pk, gran, span)))
+            tiles.append(ru_tile("Dataplane CPU %s" % dp["dp"], cur, "%s: mean %.0f%% · highest %s %.0f%%" % (span, mean, gran, pk),
+                                 spark=avg))
+            charts.append({"title": "Dataplane CPU %s · %s · %s (%%)" % (dp["dp"], span, per), "t": ru_labels(n, step),
+                           "fmt": "pct", "series": [["Average of active cores", [round(x, 1) for x in avg]],
+                                                    ["Busiest core (%s)" % busiest[0], busiest[1][-n:]]] +
+                                                   ([["Highest core maximum", [0] * (n - m_) + pmax]] if pmax else [])})
+            data["dataplane_cores_%s" % dp["dp"]] = [
+                {"core": c, "now_pct": vals[-1], "mean_pct": round(sum(vals) / float(len(vals)), 1), "peak_pct": max(vals),
+                 "note": "" if any(vals) else "idle all period (reserved / not used for traffic); left out of the average"}
+                for c, vals in cores]
+        lim = {"session": (90, 80), "packet buffer": (80, 50), "packet descriptor": (80, 50),
+               "packet descriptor (on-chip)": (80, 50)}
+        series = []
+        for name, vals in dp["util"].items():
+            if not vals:
+                continue
+            hi, med = lim.get(name.lower(), (90, 80))
+            row("%s (%s)" % (name.capitalize(), dp["dp"]), float(vals[-1]),
+                "latest %s · %s: mean %.1f%%, highest %s %d%%" % (gran, span, sum(vals) / float(len(vals)), gran, max(vals)),
+                hi, med)
+            if name.lower() in lim:
+                series.append([name, vals])
+            if name.lower() == "packet buffer":
+                tiles.append(ru_tile("Packet buffer %s" % dp["dp"], vals[-1], "highest %s %d%% (%s)" % (gran, max(vals), span),
+                                     80, 50, spark=vals))
+        if series:
+            n = min(len(s[1]) for s in series)
+            charts.append({"title": "Dataplane resources %s · %s · %s (%%)" % (dp["dp"], span, per), "t": ru_labels(n, step),
+                           "fmt": "pct",
+                           "series": [[s[0], s[1][-n:]] for s in series]})
+    if "dp" in got and not any(r["resource"].startswith("Dataplane CPU") for r in rows):
+        notes.append("The resource monitor returned no dataplane CPU data (some VM / Panorama models have none).")
+
+    si = (got.get("sess") or {}).get("result") if "sess" in got else None
+    if isinstance(si, dict):
+        si = acc_flat(si)
+        act, mx = ru_float(si.get("num-active")), ru_float(si.get("num-max"))
+        if act is not None and mx:
+            pct = 100.0 * act / mx
+            row("Session table", pct, "{:,} of {:,} sessions (TCP {} · UDP {} · ICMP {})".format(
+                int(act), int(mx), si.get("num-tcp", "?"), si.get("num-udp", "?"), si.get("num-icmp", "?")), 90, 80)
+            tiles.append(ru_tile("Session table", pct, "{:,} of {:,}".format(int(act), int(mx))))
+        for k, lbl in (("cps", "Connections per second"), ("kbps", "Throughput (kbps)"), ("pps", "Packets per second")):
+            if si.get(k) not in (None, ""):
+                rows.append({"resource": lbl, "current": si[k], "detail": "", "status": ""})
+                tiles.append(ru_tile(lbl, ru_float(si[k]), "now", fmt="num"))
+    disks = pan_disk_parse(text(got.get("disk"))) if "disk" in got else []
+    for d in disks:
+        sev = ru_sev(d["use_pct"], 90, 80)
+        d["status"] = {"high": "HIGH", "medium": "warning"}.get(sev, "ok")
+        if sev:
+            findings.append(finding(sev, "Disk %s" % d["mounted_on"], "Disk %s is %d%% full" % (d["mounted_on"], d["use_pct"]),
+                                    "%s used of %s, %s free" % (d["used"], d["size"], d["available"])))
+    if disks:
+        worst = max(disks, key=lambda d: d["use_pct"])
+        tiles.append(ru_tile("Fullest disk", worst["use_pct"], worst["mounted_on"]))
+    data = collections.OrderedDict([("utilization", rows)] + list(data.items()))
+    if top.get("procs"):
+        data["top_processes_management_plane"] = top["procs"]
+    if disks:
+        data["disk"] = disks
+    notes.insert(0, "Dataplane history: %s, %s from the resource monitor (the latest bucket is still filling). Management "
+                    "CPU / memory, the session table, CPS / throughput and disk are current values: PAN-OS keeps no history "
+                    "of them in the API." % (span, per))
+    if secs != nb * step:
+        notes.insert(0, "Asked for %s; shown: %s (whole %ss)." % (ru_span(secs), span, gran))
+    notes.append("Thresholds: CPU / sessions warn at 80%, high at 90%; packet buffers / descriptors warn at 50%, high at 80%; "
+                 "management memory warn at 90%, high at 95% (cache excluded); disk warn at 80%, high at 90%.")
+    pick = lambda pre: next((r["current"] for r in rows if r["resource"].startswith(pre)), "n/a")
+    label = "MGMT CPU %s · DP CPU %s · MGMT MEM %s · SESSIONS %s · PKT BUFFER %s · %s" % (
+        pick("Management CPU"), pick("Dataplane CPU"), pick("Management memory"), pick("Session table"), pick("Packet buffer"),
+        span.upper())
+    return ru_result(t0, " + ".join(cmds[k] for k in cmds), tiles, charts, findings, data, notes, label)
+
+
+FG_RES_LABELS = collections.OrderedDict([
+    ("cpu", ("CPU", "pct")), ("mem", ("Memory", "pct")), ("disk", ("Log disk", "pct")),
+    ("session", ("Sessions (IPv4)", "num")), ("session6", ("Sessions (IPv6)", "num")),
+    ("setuprate", ("Session setup rate /s (IPv4)", "num")), ("setuprate6", ("Session setup rate /s (IPv6)", "num")),
+    ("npu_session", ("NPU sessions (IPv4)", "num")), ("npu_session6", ("NPU sessions (IPv6)", "num")),
+    ("nturbo_session", ("nTurbo sessions", "num")), ("disk_lograte", ("Disk log rate /s", "num")),
+    ("faz_lograte", ("FortiAnalyzer log rate /s", "num")), ("forticloud_lograte", ("FortiCloud log rate /s", "num")),
+    ("gtp_tunnel", ("GTP tunnels", "num")), ("gtp_tunnel_setup_rate", ("GTP tunnel setup rate /s", "num"))])
+
+
+def fg_hist(item, interval):
+    """(points oldest first [(epoch, value)], average, max) from a resource/usage 'historical' block."""
+    h = (item or {}).get("historical") if isinstance(item, dict) else None
+    if not isinstance(h, dict) or not h:
+        return [], None, None
+    h = h.get(interval) or next(iter(h.values()))
+    pts = []
+    for p in (h.get("values") if isinstance(h, dict) else None) or []:
+        if isinstance(p, (list, tuple)) and len(p) >= 2 and ru_float(p[1]) is not None:
+            pts.append((to_epoch(p[0]) or 0, ru_float(p[1])))
+        elif isinstance(p, dict) and ru_float(first(p, "value", "v")) is not None:
+            pts.append((to_epoch(first(p, "timestamp", "time", "t")) or 0, ru_float(first(p, "value", "v"))))
+    pts.sort(key=lambda x: x[0])
+    return pts, ru_float(h.get("average")) if isinstance(h, dict) else None, ru_float(h.get("max")) if isinstance(h, dict) else None
+
+
+# FortiOS resource/usage history windows (the longest is 24 hours)
+FG_RES_INTERVALS = (("1-min", 60), ("10-min", 600), ("30-min", 1800), ("1-hour", 3600), ("12-hour", 43200),
+                    ("24-hour", 86400))
+
+
+def fg_conserve_events(sess, secs):
+    """Memory conserve-mode enter / leave events from the system event log within the last `secs` seconds."""
+    cutoff, notes = time.time() - secs, []
+    for src in ("disk", "memory"):
+        res = None
+        for q in ([("rows", "1000"), ("filter", "msg=@conserve")], [("rows", "1000")]):
+            st, ok, data = rest_get(sess, "/api/v2/log/%s/event/system?%s" % (src, urllib.parse.urlencode(q)))
+            res = data.get("results") if ok and isinstance(data, dict) else None
+            if isinstance(res, list):
+                if len(q) == 1:
+                    notes.append("The event log filter was not accepted; matched 'conserve' locally in the newest 1000 "
+                                 "system events (%s), which may not reach back over the whole range." % src)
+                break
+        if not isinstance(res, list):
+            continue
+        rows, oldest = [], None
+        for e in (acc_flat(x) for x in res if isinstance(x, dict)):
+            ep = fg_event_epoch(e)
+            if ep is not None:
+                oldest = ep if oldest is None else min(oldest, ep)
+                if ep < cutoff:
+                    continue
+            msg = str(first(e, "msg", "logdesc"))
+            if "conserve" not in (msg + " " + str(e.get("logdesc") or "")).lower():
+                continue
+            low = msg.lower()
+            rows.append({"time": ("%s %s" % (e.get("date") or "", e.get("time") or "")).strip(),
+                         "event": "entered" if "enter" in low else "left" if ("leave" in low or "exit" in low) else "",
+                         "message": msg, "level": e.get("level", ""), "_t": ep or 0})
+        rows.sort(key=lambda r: r["_t"])
+        for r in rows:
+            r.pop("_t", None)
+        if len(res) >= 1000 and oldest is not None and oldest > cutoff:
+            notes.append("1000 system events were read (%s) and they only reach back to %s; older conserve-mode events "
+                         "in the range are not shown." % (src, time.strftime("%Y-%m-%d %H:%M", time.localtime(oldest))))
+        return rows, src, notes
+    return None, None, notes + ["Could not read the system event log (disk or memory); needs Log & Report read access."]
+
+
+def fg_resources(sess, v):
+    t0 = time.time()
+    secs = ru_range(v.get("range"))
+    interval, isecs = next((x for x in FG_RES_INTERVALS if x[1] >= secs), FG_RES_INTERVALS[-1])
+    span = ru_span(isecs)
+    paths = collections.OrderedDict([
+        ("usage", "/api/v2/monitor/system/resource/usage?interval=%s" % interval),
+        ("perf", "/api/v2/monitor/system/performance/status"),
+        ("glob", "/api/v2/cmdb/system/global"),
+        ("status", "/api/v2/monitor/system/status")])
+    with concurrent.futures.ThreadPoolExecutor(5) as ex:
+        futs = {k: ex.submit(rest_get, sess, p) for k, p in paths.items()}
+        f_cons = ex.submit(fg_conserve_events, sess, secs)
+    got, notes = {}, []
+    for k, f in futs.items():
+        try:
+            st, ok, data = f.result()
+        except (urllib.error.URLError, OSError) as e:
+            st, ok, data = 0, False, str(getattr(e, "reason", e))
+        if ok and isinstance(data, dict):
+            got[k] = data.get("results") if data.get("results") is not None else data
+        elif k in ("usage", "perf"):
+            notes.append("GET %s: HTTP %s (not available on this FortiOS version or no access)" % (paths[k], st))
+    if "usage" not in got:   # older FortiOS may not accept the interval parameter
+        st, ok, data = rest_get(sess, "/api/v2/monitor/system/resource/usage")
+        if ok and isinstance(data, dict):
+            got["usage"] = data.get("results")
+    if "usage" not in got and "perf" not in got:
+        return {"ok": False, "error": "no resource endpoint answered. Does the API admin profile have read access to "
+                                      "System? " + " ".join(notes)}
+    tiles, charts, findings, rows = [], [], [], []
+    g = got.get("glob") if isinstance(got.get("glob"), dict) else {}
+    red = ru_float(g.get("memory-use-threshold-red")) or 88.0
+    extreme = ru_float(g.get("memory-use-threshold-extreme")) or 95.0
+    green = ru_float(g.get("memory-use-threshold-green")) or 82.0
+    usage = got.get("usage") if isinstance(got.get("usage"), dict) else {}
+    series_pct, t_labels = [], []
+    tfmt = "%H:%M" if isecs <= 3600 else "%m-%d %H:%M"
+    for key, item in usage.items():
+        item0 = item[0] if isinstance(item, list) and item else item
+        if not isinstance(item0, dict):
+            continue
+        cur = ru_float(item0.get("current"))
+        pts, avg, mx = fg_hist(item0, interval)
+        label, fmt = FG_RES_LABELS.get(key, (key.replace("_", " ").capitalize(), "num"))
+        detail = "%s: average %s, max %s" % (span,
+            "n/a" if avg is None else ("%.1f%%" % avg if fmt == "pct" else "{:,.0f}".format(avg)),
+            "n/a" if mx is None else ("%.1f%%" % mx if fmt == "pct" else "{:,.0f}".format(mx))) if (avg is not None or mx is not None) else ""
+        status = ""
+        if key == "mem" and cur is not None:
+            sev = "high" if cur >= red else "medium" if cur >= green else None
+            status = {"high": "HIGH", "medium": "warning"}.get(sev, "ok")
+            if cur >= extreme:
+                findings.append(finding("high", "Memory", "Memory at %.0f%%: at or above the extreme conserve-mode threshold "
+                                        "(%.0f%%); new sessions are being dropped" % (cur, extreme)))
+            elif cur >= red:
+                findings.append(finding("high", "Memory", "Memory at %.0f%%: at or above the red threshold (%.0f%%); the "
+                                        "FortiGate enters conserve mode and stops proxy / UTM inspection of new sessions" % (cur, red)))
+            elif cur >= green:
+                findings.append(finding("medium", "Memory", "Memory at %.0f%%: above the green threshold (%.0f%%); if conserve "
+                                        "mode was entered it has not left it yet, and it is close to the red threshold (%.0f%%)"
+                                        % (cur, green, red)))
+            detail = (detail + "; " if detail else "") + "conserve mode at %.0f%% (red), extreme at %.0f%%, leaves at %.0f%% (green)" % (
+                red, extreme, green)
+            tiles.append({"label": "Memory", "value": round(cur, 1), "fmt": "pct", "sub": "conserve mode at %.0f%%" % red,
+                          "kind": {"high": "bad", "medium": "warn"}.get(sev, ""), "spark": [p[1] for p in pts]})
+        elif fmt == "pct" and cur is not None:
+            hi, med = (90, 80)
+            sev = ru_sev(cur, hi, med)
+            status = {"high": "HIGH", "medium": "warning"}.get(sev, "ok")
+            if sev:
+                findings.append(finding(sev, label, "%s at %.1f%%" % (label, cur), detail))
+            elif key == "cpu" and mx is not None and mx >= 95:
+                findings.append(finding("medium", label, "CPU peaked at %.0f%% in the %s" % (mx, span), detail))
+            tiles.append(ru_tile(label, cur, detail, spark=[p[1] for p in pts]))
+        elif cur is not None and key in ("session", "setuprate", "disk_lograte", "faz_lograte", "npu_session"):
+            if cur or key in ("session", "setuprate"):
+                tiles.append(ru_tile(label, cur, detail, fmt="num", spark=[p[1] for p in pts]))
+        rows.append({"resource": label, "current": "" if cur is None else ("%.1f%%" % cur if fmt == "pct" else "{:,.0f}".format(cur)),
+                     "detail": detail, "status": status})
+        if fmt == "pct" and len(pts) > 1:
+            series_pct.append([label, [round(p[1], 1) for p in pts]])
+            if len(pts) > len(t_labels):
+                t_labels = [time.strftime(tfmt, time.localtime(p[0])) if p[0] else "" for p in pts]
+        if key in ("session", "setuprate") and len(pts) > 1:
+            charts.append({"title": "%s · %s" % (label, span), "fmt": "num",
+                           "t": [time.strftime(tfmt, time.localtime(p[0])) if p[0] else "" for p in pts],
+                           "series": [[label, [p[1] for p in pts]]]})
+    if series_pct:
+        n = min(len(s[1]) for s in series_pct)
+        charts.insert(0, {"title": "CPU / memory / log disk · %s (%%)" % span, "fmt": "pct", "t": t_labels[-n:],
+                          "series": [[s[0], s[1][-n:]] for s in series_pct]})
+    try:
+        cons, cons_src, cons_notes = f_cons.result()
+    except (ValueError, urllib.error.URLError, OSError) as e:
+        cons, cons_src, cons_notes = None, None, ["Could not read the system event log: %s" % getattr(e, "reason", e)]
+    notes.extend(cons_notes)
+    if cons is not None:
+        entered = sum(1 for r in cons if r["event"] == "entered")
+        tiles.append({"label": "Conserve-mode entries", "value": entered, "fmt": "num", "sub": ru_span(secs),
+                      "kind": "bad" if entered else "", "spark": []})
+        rows.append({"resource": "Memory conserve mode", "current": "%d entr%s" % (entered, "y" if entered == 1 else "ies"),
+                     "detail": "%s, from the system event log (%s)" % (ru_span(secs), cons_src),
+                     "status": "HIGH" if entered else "ok"})
+        if entered:
+            findings.append(finding("high", "Memory", "Entered memory conserve mode %d time(s) in the %s" % (entered, ru_span(secs)),
+                                    "latest: %s" % next((r["time"] for r in reversed(cons) if r["event"] == "entered"), "")))
+    data = collections.OrderedDict([("utilization", rows)])
+    if cons:
+        data["conserve_mode_events"] = cons
+    perf = got.get("perf") if isinstance(got.get("perf"), dict) else {}
+    cpu = perf.get("cpu") if isinstance(perf.get("cpu"), dict) else {}
+    cores = [c for c in as_list(cpu.get("cores")) if isinstance(c, dict)]
+    if cores:
+        data["cpu_cores"] = [{"core": i, "used_pct": round(100 - (ru_float(c.get("idle")) or 0), 1),
+                              "user_pct": c.get("user"), "system_pct": c.get("system"), "iowait_pct": c.get("iowait"),
+                              "irq_pct": c.get("irq"), "softirq_pct": c.get("softirq")} for i, c in enumerate(cores)]
+        busy = max(data["cpu_cores"], key=lambda c: c["used_pct"])
+        if busy["used_pct"] >= 95 and len(cores) > 1:
+            findings.append(finding("medium", "CPU core %s" % busy["core"], "One CPU core at %.0f%%" % busy["used_pct"],
+                                    "a single busy core can bottleneck a process (e.g. IPS engine, WAD) while the average looks fine"))
+        if not any(r["resource"] == "CPU" for r in rows) and cpu.get("idle") is not None:
+            cur = 100 - (ru_float(cpu.get("idle")) or 0)
+            rows.insert(0, {"resource": "CPU", "current": "%.1f%%" % cur, "detail": "from performance status",
+                            "status": {"high": "HIGH", "medium": "warning"}.get(ru_sev(cur, 90, 80), "ok")})
+            tiles.insert(0, ru_tile("CPU", cur))
+    mem = perf.get("mem") if isinstance(perf.get("mem"), dict) else {}
+    if ru_float(mem.get("total")):
+        tot, used = ru_float(mem.get("total")), ru_float(mem.get("used")) or 0
+        scale = 1073741824.0 if tot > 1e8 else 1048576.0 if tot > 1e5 else 1024.0   # bytes / KiB / MiB
+        rows.append({"resource": "Memory size", "current": "%.1f GiB" % (tot / scale),
+                     "detail": "used %.1f GiB · freeable %.1f GiB" % (used / scale, (ru_float(mem.get("freeable")) or 0) / scale),
+                     "status": ""})
+    st = got.get("status") if isinstance(got.get("status"), dict) else {}
+    if st.get("model_name") or st.get("hostname"):
+        notes.insert(0, "Device: %s" % " ".join(str(x) for x in (st.get("hostname"), st.get("model_name"),
+                                                                    st.get("model_number") or st.get("model")) if x))
+    notes.append("Thresholds: CPU / log disk warn at 80%%, high at 90%%; memory warn at the green conserve-mode threshold "
+                 "(%.0f%%), high at the red one (%.0f%%), read from 'config system global'." % (green, red))
+    if "glob" not in got:
+        notes.append("Could not read config system global; default conserve-mode thresholds were used.")
+    if secs > isecs:
+        notes.insert(0, "FortiOS keeps resource history for at most 24 hours, so the charts and averages cover the %s. "
+                        "Conserve-mode events cover the whole %s (system event log). For longer CPU / memory history use "
+                        "FortiAnalyzer or SNMP monitoring." % (span, ru_span(secs)))
+    else:
+        notes.insert(0, "Charts and averages: the %s (FortiOS '%s' history)." % (span, interval))
+    pick = lambda name: next((r["current"] for r in rows if r["resource"] == name), "n/a")
+    label = "CPU %s · MEMORY %s · LOG DISK %s · SESSIONS %s · CONSERVE MODE %s · %s" % (
+        pick("CPU"), pick("Memory"), pick("Log disk"), pick("Sessions (IPv4)"), pick("Memory conserve mode").upper(),
+        ru_span(secs).upper())
+    return ru_result(t0, " + ".join("GET " + p for p in paths.values()), tiles, charts, findings, data, notes, label)
+
+
+PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_routes, "pan_sessions": pan_sessions,
+                "pan_resources": pan_resources, "fg_resources": fg_resources}
 
 
 def do_ipcheck(b):
@@ -3442,8 +3963,11 @@ def do_fg_logs(b):
 ADMIN_NAME_RE = re.compile(r'^[A-Za-z0-9_.@\\\- ]{1,64}$')
 
 
-def pan_log_rows(sess, lt, query, n):
-    root = pan_xml(sess, {"type": "log", "log-type": lt, "query": query, "nlogs": str(n), "dir": "backward"})
+def pan_log_rows(sess, lt, query, n, skip=0):
+    params = {"type": "log", "log-type": lt, "query": query, "nlogs": str(n), "dir": "backward"}
+    if skip:
+        params["skip"] = str(skip)
+    root = pan_xml(sess, params)
     job = (root.findtext(".//job") or "").strip() if root is not None else ""
     if not job:
         raise ValueError("%s log query was rejected (does the API admin role have log access?)" % lt)
@@ -3458,6 +3982,414 @@ def pan_log_rows(sess, lt, query, n):
             raise ValueError("%s log query did not finish within 60 s (job %s)" % (lt, job))
         time.sleep(1)
     return [e for e in (x2o(x) for x in r.findall(".//log/logs/entry")) if isinstance(e, dict)]
+
+
+# ---- ACC: Application Command Center-style activity dashboard (PAN-OS / FortiGate) ---------------------------
+# Built from the firewall's own logs with read-only log queries. Filters are pushed into the device query where the
+# log API supports it and are always applied again locally, so a filter the device ignores cannot widen the result.
+ACC_VAL_RE = re.compile(r"^[A-Za-z0-9_.:/@\\\- ]{1,80}$")
+# filter key -> (label, PAN-OS query term, FortiGate log field)
+ACC_FILTERS = collections.OrderedDict([
+    ("src", ("Source IP", "(addr.src in {v})", "srcip")),
+    ("dst", ("Destination IP", "(addr.dst in {v})", "dstip")),
+    ("app", ("Application", "(app eq '{v}')", "app")),
+    ("user", ("User", "(user.src eq '{v}')", "user")),
+    ("rule", ("Rule / policy", "(rule eq '{v}')", "policyid")),
+    ("from_zone", ("Source zone / interface", "(zone.src eq '{v}')", "srcintf")),
+    ("to_zone", ("Destination zone / interface", "(zone.dst eq '{v}')", "dstintf")),
+    ("port", ("Destination port", "(port.dst eq {v})", "dstport")),
+])
+ACC_REC_KEY = {"from_zone": "from", "to_zone": "to"}
+ACC_PERIODS = collections.OrderedDict([("last-15-minutes", 900), ("last-hour", 3600), ("last-6-hrs", 21600),
+                                       ("last-12-hrs", 43200), ("last-24-hrs", 86400), ("last-7-days", 604800)])
+ACC_BUCKETS = ((60, "1 minute"), (300, "5 minutes"), (900, "15 minutes"), (1800, "30 minutes"), (3600, "1 hour"),
+               (10800, "3 hours"), (21600, "6 hours"), (43200, "12 hours"), (86400, "1 day"))
+ACC_SEVERITIES = ("critical", "high", "medium", "low", "informational")
+PAN_ALLOW_ACTIONS = ("", "allow", "alert")
+FG_PASS_ACTIONS = ("", "detected", "pass_session", "passthrough", "monitored", "allowed", "accept", "pass", "log-only")
+FG_ACC_LOGS = (("traffic", "traffic/forward"), ("threat", "utm/ips"), ("virus", "utm/virus"), ("url", "utm/webfilter"))
+ACC_DEADLINE = 150   # seconds for all log reads of one ACC run
+
+
+def acc_filters(b):
+    raw = b.get("filters") if isinstance(b.get("filters"), dict) else {}
+    out = collections.OrderedDict()
+    for k, (label, _, _) in ACC_FILTERS.items():
+        v = str(raw.get(k) or "").strip()
+        if not v:
+            continue
+        if k in ("src", "dst"):
+            out[k] = parse_ip_or_net(v, label)
+        elif k == "port":
+            out[k] = num(v, 0, 65535, 0, label)
+        elif not ACC_VAL_RE.match(v):
+            raise ValueError("invalid characters in: " + label)
+        else:
+            out[k] = v
+    return out
+
+
+def acc_drill_ok(k, v):
+    """True if v can be used as filter k (so a dashboard click never sends a value the filter would refuse)."""
+    v = str(v or "").strip()
+    if not v or not k:
+        return False
+    if k in ("src", "dst"):
+        try:
+            ipaddress.ip_address(v)
+            return True
+        except ValueError:
+            return False
+    if k == "port":
+        return v.isdigit() and int(v) <= 65535
+    return bool(ACC_VAL_RE.match(v))
+
+
+def acc_keep(r, flt):
+    for k, want in flt.items():
+        if k in ("src", "dst"):
+            if not ip_matches(r.get(k), want):
+                return False
+        elif k == "rule":
+            if str(want).lower() not in (str(r.get("rule_v") or "").lower(), str(r.get("rule_name") or "").lower()):
+                return False
+        elif str(r.get(ACC_REC_KEY.get(k, k)) or "").strip().lower() != str(want).lower():
+            return False
+    return True
+
+
+def acc_int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def acc_host(url):
+    u = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", str(url or "").strip().strip('"'), flags=re.I)
+    return re.sub(r":\d+$", "", u.split("/")[0].split("?")[0]).lower()
+
+
+def acc_sev(v):
+    v = str(v or "").strip().lower()
+    return "informational" if v in ("info", "information") else v
+
+
+def acc_scalar(v):
+    """A log field as plain text. PAN-OS fields with XML attributes arrive as dicts
+    (e.g. <srcloc cc="US">United States</srcloc> -> {"@cc": "US", "#text": "United States"})."""
+    if isinstance(v, dict):
+        if v.get("#text") not in (None, ""):
+            return acc_scalar(v["#text"])
+        vals = [acc_scalar(x) for x in v.values()]
+        return next((x for x in vals if x not in (None, "")), "")
+    if isinstance(v, list):
+        return ", ".join(str(acc_scalar(x)) for x in v if acc_scalar(x) not in (None, ""))
+    return v
+
+
+def acc_flat(e):
+    return {k: acc_scalar(v) for k, v in e.items()}
+
+
+def acc_pan_rec(lt, e):
+    e = acc_flat(e)
+    act = str(e.get("action") or "").lower()
+    rule = str(e.get("rule") or "")
+    r = {"t": to_epoch(first(e, "receive_time", "time_generated")), "src": e.get("src") or "", "dst": e.get("dst") or "",
+         "port": str(e.get("dport") or ""), "app": e.get("app") or "", "user": e.get("srcuser") or "",
+         "rule": rule, "rule_v": rule, "rule_name": rule, "from": e.get("from") or "", "to": e.get("to") or "",
+         "action": act, "blocked": act not in PAN_ALLOW_ACTIONS, "bytes": 0}
+    if lt == "traffic":
+        r.update(bytes=acc_int(e.get("bytes")), srcloc=e.get("srcloc") or "", dstloc=e.get("dstloc") or "",
+                 category=e.get("category") or "", risk="")
+    elif lt == "threat":
+        r.update(name=str(first(e, "threatid", "threat_name")), severity=acc_sev(e.get("severity")),
+                 kind=e.get("subtype") or "")
+    else:
+        url = str(e.get("misc") or "")
+        r.update(url=url, host=acc_host(url), category=e.get("category") or "")
+    return r
+
+
+def acc_fg_rec(kind, e):
+    e = acc_flat(e)
+    pid, pname = str(e.get("policyid") if e.get("policyid") is not None else ""), str(e.get("policyname") or "")
+    act = str(e.get("action") or "").lower()
+    r = {"t": to_epoch(("%s %s" % (e.get("date") or "", e.get("time") or "")).strip()),
+         "src": e.get("srcip") or "", "dst": e.get("dstip") or "", "port": str(e.get("dstport") or ""),
+         "app": e.get("app") or "", "user": first(e, "user", "unauthuser"),
+         "rule": "%s · %s" % (pid, pname) if pid and pname else pid or pname, "rule_v": pid, "rule_name": pname,
+         "from": e.get("srcintf") or "", "to": e.get("dstintf") or "", "action": act, "bytes": 0}
+    if kind == "traffic":
+        r.update(bytes=acc_int(e.get("sentbyte")) + acc_int(e.get("rcvdbyte")), srcloc=e.get("srccountry") or "",
+                 dstloc=e.get("dstcountry") or "", category=e.get("appcat") or "",
+                 risk=str(e.get("apprisk") or "").lower(), blocked=fg_is_blocked(e), service=e.get("service") or "")
+    elif kind in ("threat", "virus"):
+        r.update(name=str(first(e, "attack", "virus", "msg")), severity=acc_sev(first(e, "severity", "crlevel")),
+                 kind=e.get("subtype") or ("virus" if kind == "virus" else "ips"), blocked=act not in FG_PASS_ACTIONS)
+    else:
+        r.update(url="%s%s" % (e.get("hostname") or "", e.get("url") or ""), host=str(e.get("hostname") or "").lower(),
+                 category=first(e, "catdesc", "cat"), blocked=act == "blocked")
+    return r
+
+
+def acc_fmt_t(t):
+    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(t))
+
+
+def acc_cover(what, n_read, scan, recs, limit_hit):
+    ts = [r["t"] for r in recs if r.get("t")]
+    s = "%s: %s log entries read, %s kept after filters%s" % (
+        what, "{:,}".format(n_read), "{:,}".format(len(recs)),
+        " (%s → %s device time)" % (acc_fmt_t(min(ts)), acc_fmt_t(max(ts))) if ts else "")
+    if limit_hit:
+        s += ("; the read limit (%s per log type) was reached, so older entries in the time range are not counted. "
+              "Add a filter or raise 'Log entries to read' to cover more." % "{:,}".format(scan))
+    return s + "."
+
+
+def acc_pan_collect(sess, flt, period, scan):
+    query = " and ".join([ACC_FILTERS[k][1].format(v=v) for k, v in flt.items()] + ["(receive_time in %s)" % period])
+    deadline = time.time() + ACC_DEADLINE
+
+    def one(lt):
+        rows, skip = [], 0
+        while skip < scan and time.time() < deadline:
+            k = min(5000, scan - skip)   # PAN-OS returns at most 5000 entries per log query
+            got = pan_log_rows(sess, lt, query, k, skip)
+            rows.extend(got)
+            if len(got) < k:
+                return rows, False
+            skip += k
+        return rows, True
+    recs, notes, errors = {}, [], []
+    with concurrent.futures.ThreadPoolExecutor(3) as ex:
+        futs = [(lt, ex.submit(one, lt)) for lt in ("traffic", "threat", "url")]
+        for lt, f in futs:
+            try:
+                raw, hit = f.result()
+            except (ValueError, urllib.error.URLError, OSError) as e:
+                errors.append("%s log: %s" % (lt, getattr(e, "reason", e)))
+                recs[lt] = []
+                continue
+            # Session-start logs (log at session start) would count a session twice.
+            rs = [acc_pan_rec(lt, e) for e in raw
+                  if not (lt == "traffic" and str(e.get("subtype") or "").lower() == "start")]
+            recs[lt] = [r for r in rs if acc_keep(r, flt)]
+            notes.append(acc_cover({"traffic": "Traffic", "threat": "Threat", "url": "URL"}[lt], len(raw), scan, recs[lt], hit))
+    return recs, notes, errors, "log query " + query
+
+
+def acc_fg_collect(sess, flt, period, scan, src, vdom):
+    cutoff = time.time() - ACC_PERIODS[period]
+    conds = []
+    for k, v in flt.items():
+        # Subnets, names with spaces and policy names are matched locally only.
+        if isinstance(v, (ipaddress.IPv4Network, ipaddress.IPv6Network)) or " " in str(v) or \
+                (k == "rule" and not str(v).isdigit()):
+            continue
+        conds.append((ACC_FILTERS[k][2], v))
+    deadline = time.time() + ACC_DEADLINE
+
+    def one(path):
+        out, start = [], 0
+        while start < scan and time.time() < deadline:
+            k = min(1000, scan - start)
+            q = [("start", str(start)), ("rows", str(k))] + [("filter", "%s==%s" % c) for c in conds]
+            if vdom:
+                q.append(("vdom", vdom))
+            st, ok, data = rest_get(sess, "/api/v2/log/%s/%s?%s" % (src, path, urllib.parse.urlencode(q)))
+            res = data.get("results") if ok and isinstance(data, dict) else None
+            if isinstance(res, dict):
+                res = [res]
+            if not isinstance(res, list):
+                if not out:
+                    raise ValueError("HTTP %s, response: %s" % (st, str(data)[:200]))
+                return out, False
+            res = [e for e in res if isinstance(e, dict)]
+            out.extend(res)
+            if len(res) < k:
+                return out, False
+            eps = [x for x in (fg_event_epoch(e) for e in res) if x]
+            if eps and min(eps) < cutoff:   # newest first: everything after this page is older than the range
+                return out, False
+            start += k
+        return out, True
+    audit(sess, "ACC log reads %s" % (" ".join("%s==%s" % c for c in conds) or "(unfiltered)"))
+    recs, notes, errors = {"traffic": [], "threat": [], "url": []}, [], []
+    with concurrent.futures.ThreadPoolExecutor(4) as ex:
+        futs = [(kind, path, ex.submit(one, path)) for kind, path in FG_ACC_LOGS]
+        for kind, path, f in futs:
+            try:
+                raw, hit = f.result()
+            except (ValueError, urllib.error.URLError, OSError) as e:
+                errors.append("%s log (%s): %s" % (path, src, getattr(e, "reason", e)))
+                continue
+            raw_in = [e for e in raw if (fg_event_epoch(e) or cutoff) >= cutoff]
+            rs = [r for r in (acc_fg_rec(kind, e) for e in raw_in) if acc_keep(r, flt)]
+            recs["threat" if kind == "virus" else kind].extend(rs)
+            notes.append(acc_cover({"traffic": "Traffic", "threat": "IPS", "virus": "Antivirus",
+                                    "url": "Web filter"}[kind], len(raw), scan, rs, hit))
+    return recs, notes, errors, "log reads /api/v2/log/%s/{%s}" % (src, ",".join(p for _, p in FG_ACC_LOGS))
+
+
+def acc_top(recs, key, sort, drill=None, pred=None, label_key=None, value_key=None, n=10):
+    cnt, byt, lab = collections.Counter(), collections.Counter(), {}
+    for r in recs:
+        if pred and not pred(r):
+            continue
+        v = r.get(value_key or key)
+        if not isinstance(v, (str, int, float)):
+            v = acc_scalar(v)
+            v = "" if v is None else str(v)
+        if v in (None, ""):
+            continue
+        cnt[v] += 1
+        byt[v] += r.get("bytes") or 0
+        if label_key:
+            lab[v] = r.get(label_key) or v
+    order = byt if sort == "bytes" and any(byt.values()) else cnt
+    return [[str(lab.get(v, v)), cnt[v], byt[v], str(v) if acc_drill_ok(drill, v) else ""]
+            for v, _ in order.most_common(n)]
+
+
+def do_acc(b):
+    sess = SESSIONS.get(b.get("id"))
+    if not sess or sess["vendor"] not in ("paloalto", "fortigate"):
+        return {"ok": False, "error": "connect a Palo Alto firewall or a FortiGate first"}
+    t0 = time.time()
+    pan = sess["vendor"] == "paloalto"
+    try:
+        flt = acc_filters(b)
+        period = b.get("period") or "last-hour"
+        if period not in ACC_PERIODS:
+            raise ValueError("invalid time range")
+        sort = "sessions" if b.get("sort") == "sessions" else "bytes"
+        scan = num(b.get("scan"), 100, 50000, 5000, "log entries to read per log type")
+        audit(sess, "ACC %s %s" % (period, json.dumps({k: str(v) for k, v in flt.items()})))
+        if pan:
+            recs, notes, errors, request = acc_pan_collect(sess, flt, period, scan)
+        else:
+            src = b.get("log_source") or "disk"
+            if src not in FG_LOG_SOURCES:
+                raise ValueError("invalid log source")
+            recs, notes, errors, request = acc_fg_collect(sess, flt, period, scan, src, pstr(b.get("vdom"), "VDOM"))
+        if errors and not notes:
+            raise ValueError("every log read failed. Check that the API account has log read access%s. (%s)" % (
+                "" if pan else ", logging to the chosen log source is enabled and the VDOM is correct",
+                "; ".join(errors)))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+    tr, th, ur = recs.get("traffic", []), recs.get("threat", []), recs.get("url", [])
+
+    # Timeline: one bucket size for every chart, about 60 columns over the time the logs cover.
+    ts = [r["t"] for r in tr + th + ur if r.get("t")]
+    keys, bs, bucket = [], 60, "1 minute"
+    if ts:
+        lo, hi = min(ts), max(ts)
+        bs, bucket = next((x for x in ACC_BUCKETS if (hi - lo) / x[0] <= 60), ACC_BUCKETS[-1])
+        keys = list(range(int(lo // bs * bs), int(hi // bs * bs) + 1, bs))
+    idx = {k: i for i, k in enumerate(keys)}
+
+    def S(rs, pred=None, val=None):
+        out = [0] * len(keys)
+        for r in rs:
+            if r.get("t") and (not pred or pred(r)):
+                i = idx.get(int(r["t"] // bs * bs))
+                if i is not None:
+                    out[i] += val(r) if val else 1
+        return out
+    blocked, allowed = (lambda r: r["blocked"]), (lambda r: not r["blocked"])
+    hi_sev = lambda r: r.get("severity") in ("critical", "high")
+    nbytes = lambda r: r.get("bytes") or 0
+    n_tr, n_bl, n_th, n_hi = len(tr), sum(1 for r in tr if r["blocked"]), len(th), sum(1 for r in th if hi_sev(r))
+    tot_bytes = sum(nbytes(r) for r in tr)
+    tiles = [{"label": "Sessions", "value": n_tr, "fmt": "num", "spark": S(tr)},
+             {"label": "Data", "value": tot_bytes, "fmt": "bytes", "spark": S(tr, val=nbytes)},
+             {"label": "Applications", "value": len({r["app"] for r in tr if r["app"]}), "fmt": "num"},
+             {"label": "Source IPs", "value": len({r["src"] for r in tr if r["src"]}), "fmt": "num"},
+             {"label": "Blocked sessions", "value": n_bl, "fmt": "num", "spark": S(tr, blocked),
+              "sub": "%.1f%% of sessions" % (100.0 * n_bl / n_tr) if n_tr else ""},
+             {"label": "Threats", "value": n_th, "fmt": "num", "spark": S(th),
+              "sub": "%d blocked" % sum(1 for r in th if r["blocked"]) if n_th else ""},
+             {"label": "Critical / high threats", "value": n_hi, "fmt": "num", "spark": S(th, hi_sev)},
+             {"label": "Blocked URLs", "value": sum(1 for r in ur if r["blocked"]), "fmt": "num", "spark": S(ur, blocked),
+              "sub": "of %s URL log entries" % "{:,}".format(len(ur)) if ur else ""}]
+
+    def T(title, rs, key, drill=None, pred=None, traffic=False, **kw):
+        return {"title": title, "drill": drill, "metric": "traffic" if traffic else "count",
+                "rows": acc_top(rs, key, sort if traffic else "sessions", drill, pred, **kw)}
+    rule_kw = {"label_key": "rule", "value_key": "rule_v"}
+    rules = "Rules" if pan else "Policies"
+    zf, zt = ("Source zones", "Destination zones") if pan else ("Source interfaces", "Destination interfaces")
+    sevs = [s for s in ACC_SEVERITIES if any(r.get("severity") == s for r in th)]
+    sevs += sorted({r.get("severity") for r in th if r.get("severity") and r.get("severity") not in ACC_SEVERITIES})
+    tabs = [
+        {"title": "Network activity", "count": n_tr, "charts": [
+            {"title": "Sessions over time", "stack": True, "fmt": "num",
+             "series": [["Allowed", S(tr, allowed)], ["Blocked", S(tr, blocked)]]},
+            {"title": "Data over time", "fmt": "bytes", "series": [["Data", S(tr, val=nbytes)]]}],
+         "tops": [T("Applications", tr, "app", "app", traffic=True), T("Source IPs", tr, "src", "src", traffic=True),
+                  T("Destination IPs", tr, "dst", "dst", traffic=True), T("Users", tr, "user", "user", traffic=True),
+                  T(rules, tr, "rule", "rule", traffic=True, **rule_kw),
+                  T(zf, tr, "from", "from_zone", traffic=True), T(zt, tr, "to", "to_zone", traffic=True),
+                  T("Destination ports", tr, "port", "port", traffic=True),
+                  T("Destination countries", tr, "dstloc", traffic=True),
+                  T("URL categories" if pan else "Application categories", tr, "category", traffic=True)] +
+                 ([] if pan else [T("Services", tr, "service", traffic=True),
+                                  T("High / critical risk applications", tr, "app", "app", traffic=True,
+                                    pred=lambda r: r.get("risk") in ("critical", "high"))])},
+        {"title": "Threat activity", "count": n_th, "charts": [
+            {"title": "Threats over time by severity", "stack": True, "fmt": "num",
+             "series": [[s, S(th, lambda r, s=s: r.get("severity") == s)] for s in sevs]}],
+         "tops": [T("Threats", th, "name"), T("Severity", th, "severity"), T("Threat types", th, "kind"),
+                  T("Attackers (source)", th, "src", "src"), T("Victims (destination)", th, "dst", "dst"),
+                  T("Applications", th, "app", "app"), T(rules, th, "rule", "rule", **rule_kw), T("Actions", th, "action")]},
+        {"title": "Blocked activity", "count": n_bl + sum(1 for r in th + ur if r["blocked"]), "charts": [
+            {"title": "Blocked over time", "fmt": "num",
+             "series": [["Sessions", S(tr, blocked)], ["Threats", S(th, blocked)], ["URLs", S(ur, blocked)]]}],
+         "tops": [T("Blocked applications", tr, "app", "app", blocked), T("Blocked sources", tr, "src", "src", blocked),
+                  T("Blocked destinations", tr, "dst", "dst", blocked), T("Blocked ports", tr, "port", "port", blocked),
+                  T("Blocking " + rules.lower(), tr, "rule", "rule", blocked, **rule_kw),
+                  T("Blocked threats", th, "name", None, blocked), T("Blocked URL categories", ur, "category", None, blocked),
+                  T("Blocked web hosts", ur, "host", None, blocked)]},
+        {"title": "URL activity", "count": len(ur), "charts": [
+            {"title": "URL requests over time", "stack": True, "fmt": "num",
+             "series": [["Allowed", S(ur, allowed)], ["Blocked", S(ur, blocked)]]}],
+         "tops": [T("URL categories", ur, "category"), T("Web hosts", ur, "host"), T("Users", ur, "user", "user"),
+                  T("Source IPs", ur, "src", "src")]}]
+    applied = collections.OrderedDict((k, {"label": ACC_FILTERS[k][0], "value": str(v)}) for k, v in flt.items())
+    dash = {"vendor": sess["vendor"], "bucket": bucket, "sort": sort, "t": [acc_fmt_t(k) for k in keys],
+            "tiles": tiles, "tabs": tabs, "filters": applied}
+
+    # The same numbers as tables: the table view, and what Copy / CSV / HTML report export.
+    shown = {"num": lambda v: "{:,}".format(v), "bytes": cf_fmt_bytes}
+    data = {"headline": {t["label"]: shown[t["fmt"]](t["value"]) + (" (%s)" % t["sub"] if t.get("sub") else "")
+                         for t in tiles}}
+    for tab in tabs:
+        for tp in tab["tops"]:
+            if tp["rows"]:
+                data[re.sub(r"\W+", "_", "%s %s" % (tab["title"].split()[0], tp["title"])).lower().strip("_")] = [
+                    ({"name": r[0], "sessions": r[1], "data": cf_fmt_bytes(r[2]),
+                      "share": "%.1f%%" % (100.0 * r[1] / n_tr) if n_tr else ""} if tp["metric"] == "traffic"
+                     else {"name": r[0], "log_entries": r[1]}) for r in tp["rows"]]
+    tl_b, tl_d, tl_bl, tl_th, tl_ur = S(tr), S(tr, val=nbytes), S(tr, blocked), S(th), S(ur)
+    data["timeline"] = [{"time": acc_fmt_t(k), "sessions": tl_b[i], "blocked_sessions": tl_bl[i],
+                         "data": cf_fmt_bytes(tl_d[i]), "threats": tl_th[i], "url_entries": tl_ur[i]}
+                        for i, k in enumerate(keys)]
+    summary = (["Filters: " + " · ".join("%s %s" % (f["label"], f["value"]) for f in applied.values())] if applied else []) + \
+        ["Time range: %s. Charts use %s buckets; times are the firewall's own clock." % (period, bucket)] + notes + \
+        ["Built from the logs (like ACC): only traffic that matches a rule with logging enabled is counted. "
+         "Each log entry counts as one session or event" + ("; session-start logs are skipped." if pan else ".")] + errors
+    label = "ACC · %s SESSIONS · %s · %s BLOCKED · %s THREATS (%d CRITICAL/HIGH)" % (
+        "{:,}".format(n_tr), cf_fmt_bytes(tot_bytes), "%.1f%%" % (100.0 * n_bl / n_tr) if n_tr else "0%",
+        "{:,}".format(n_th), n_hi)
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": request,
+            "verdict": {"label": label, "kind": "bad" if n_hi else "ok" if n_tr or n_th or ur else "info"},
+            "summary": summary, "data": data, "acc": dash}
 
 
 def adm_row(time_, user, kind, action, obj="", change="", source="", result=""):
@@ -6702,7 +7634,7 @@ class Handler(BaseHTTPRequestHandler):
                   "/api/profile/delete": do_profile_delete, "/api/health": do_health,
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
                   "/api/fglogs": do_fg_logs, "/api/adminaudit": do_admin_audit, "/api/f5sync": do_f5_sync, "/api/pancapture": do_pan_capture,
-                  "/api/backup": do_backup, "/api/cf": do_cf}
+                  "/api/backup": do_backup, "/api/cf": do_cf, "/api/acc": do_acc}
         fn = routes.get(self.path)
         if not fn:
             return self._send(404, {"error": "not found"})
@@ -6814,6 +7746,10 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .dtop{display:grid;grid-template-columns:minmax(0,1fr) 30% auto;gap:6px 10px;align-items:center;font-size:12.5px}
 #pretty .dtop .dn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#pretty .dtop .dn.lnk{cursor:pointer;color:var(--mint)}
 #pretty .dtop .db{height:6px;border-radius:3px;background:var(--panel2)}#pretty .dtop .db span{display:block;height:6px;border-radius:3px;background:#3987e5}
+#pretty .dtabs{display:flex;gap:6px;flex-wrap:wrap}#pretty .dtabs button.on{border-color:var(--violet);box-shadow:0 0 12px #7C6CFF33;color:var(--mint)}
+#pretty .dtile.bad{border-color:var(--coral);box-shadow:0 0 10px #FF7A5933}#pretty .dtile.warn{border-color:#c98500}
+#pretty .fchip{display:inline-block;border:1px solid var(--line);border-radius:99px;padding:0 9px;margin:0 0 4px 6px;cursor:pointer;color:var(--mint)}
+#pretty .fchip:hover{border-color:var(--coral)}
 #pretty .dtop .dvv{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
 </style></head><body>
 <header><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><small>read-only troubleshooting · F5 · Palo Alto · FortiGate · Cloudflare · local only</small></header>
@@ -6850,7 +7786,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
     <p class="muted" style="margin:8px 0 0">Credentials stay in memory of the Python process. Closing it clears everything.</p></div>
 </div>
 <div>
-  <div id="cftools"></div><div id="appsec"></div>
+  <div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
   <div id="iplookup"></div><div id="f5tools"></div>
   <div id="health"></div>
   <div class="card" id="main"><h3>Checks</h3><div class="muted">Connect a device to begin.</div></div>
@@ -6918,7 +7854,7 @@ async function disconnect(id,ev){ev.stopPropagation();await api("/api/disconnect
  devices=devices.filter(d=>d.id!==id);if(cur===id)cur=devices.length?devices[0].id:null;renderAll()}
 function select(id){cur=id;renderAll()}
 function dev(){return devices.find(d=>d.id===cur)}
-function renderAll(){renderDevs();renderChecks();renderCf();renderAppsec();renderIp();renderF5();renderHealth();const d=dev();
+function renderAll(){renderDevs();renderChecks();renderCf();renderAcc();renderAppsec();renderIp();renderF5();renderHealth();const d=dev();
  $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:""}
 function renderDevs(){const el=$("#devs");el.innerHTML="";
  if(!devices.length){el.textContent="No devices connected.";return}
@@ -6935,7 +7871,17 @@ function renderHealth(){const box=$("#health");box.innerHTML="";const d=dev();if
  const note=document.createElement("p");note.className="muted";
  note.textContent="Runs a small vendor-specific check set. This reports API response success, not whether device metrics meet your operational thresholds.";
  card.appendChild(note);const button=document.createElement("button");button.className="primary";
- button.textContent="Run snapshot";button.onclick=runHealth;card.appendChild(button);box.appendChild(card)}
+ button.textContent="Run snapshot";button.onclick=runHealth;card.appendChild(button);
+ if(d.vendor==="paloalto"||d.vendor==="fortigate"){const rb=document.createElement("button");rb.className="primary";rb.style.marginLeft="8px";
+  rb.textContent="Resource utilization";rb.onclick=resUtil;card.appendChild(rb);
+  const rs=document.createElement("select");rs.id="ru_range";rs.style.cssText="width:auto;margin-left:8px";
+  rs.title=d.vendor==="paloalto"?"PAN-OS keeps dataplane history per minute (60), hour (24), day (7) and week (13)":
+   "FortiOS keeps resource history for 24 hours; longer ranges add memory conserve-mode events from the event log";
+  [["1h","last hour"],["6h","last 6 hours"],["24h","last 24 hours"],["3d","last 3 days"],["7d","last 7 days"]].concat(
+   d.vendor==="paloalto"?[["4w","last 4 weeks"],["13w","last 13 weeks"]]:[["30d","last 30 days (events)"]]).forEach(([v,l])=>{
+   const o=document.createElement("option");o.value=v;o.textContent=l;rs.appendChild(o)});card.appendChild(rs)}
+ box.appendChild(card)}
+async function resUtil(){const c=(catalog[(dev()||{}).vendor]||[]).find(x=>x.id==="resutil");if(c)run(c,{range:$("#ru_range")||{value:"1h"}})}
 async function runHealth(){setBusy("health snapshot");const r=await api("/api/health",{id:cur});show(r,"health snapshot")}
 function renderChecks(){const m=$("#main");m.innerHTML="<h3>Checks</h3>";const d=dev();
  if(!d){m.innerHTML+="<div class='muted'>Connect a device to begin.</div>";return}
@@ -7045,8 +7991,10 @@ function secNode(s){const w=mk("div","rsec");
  return w}
 function renderOut(){const box=$("#pretty");box.textContent="";if(!last)return;
  if(last.error){box.appendChild(mk("div","bad",last.error));return}
- box.classList.toggle("tall",!!(last.dashboard||last.charts));
- if(last.dashboard)box.appendChild(dashNode(last.dashboard));  // charts first; the tables below are the table view
+ box.classList.toggle("tall",!!(last.dashboard||last.charts||last.acc||last.tiles));
+ if(Array.isArray(last.tiles)&&last.tiles.length)box.appendChild(tilesNode(last.tiles));
+ if(last.dashboard)box.appendChild(dashNode(last.dashboard));
+ if(last.acc)box.appendChild(accNode(last.acc));  // charts first; the tables below are the table view
  if(Array.isArray(last.charts)&&last.charts.length)box.appendChild(chartsNode(last.charts));
  buildSections(last.data).forEach(s=>box.appendChild(secNode(s)));
  if(!box.childNodes.length)box.appendChild(mk("div","nv","Nothing to show for this check."));
@@ -7400,6 +8348,65 @@ function dashNode(d){const w=mk("div","dash");
  w.appendChild(grid);
  if(d.tops.length){const tg=mk("div","dgrid tops");d.tops.forEach(([t,rows])=>tg.appendChild(dTop(t,rows)));w.appendChild(tg)}
  return w}
+// ---- ACC (PAN-OS / FortiGate): Application Command Center-style dashboard built from the firewall's logs ----
+// [filter key, PAN-OS label, FortiGate label, placeholder]
+const ACC_F=[["src","Source IP","Source IP","10.1.1.10 or 10.1.0.0/16"],["dst","Destination IP","Destination IP","198.51.100.9"],
+ ["app","Application","Application","ssl"],["user","User","User","corp\alice"],["rule","Rule","Policy ID or name","allow-web"],
+ ["from_zone","Source zone","Source interface","trust"],["to_zone","Destination zone","Destination interface","untrust"],["port","Destination port","Destination port","443"]];
+const ACC_C={allowed:DC[0],blocked:DC[1],critical:DC[1],high:DC[3],medium:DC[4],low:DC[0],informational:DOTHER};
+let accTab=0;
+function renderAcc(){const box=$("#acc");box.innerHTML="";const d=dev();if(!d||(d.vendor!=="paloalto"&&d.vendor!=="fortigate"))return;const pan=d.vendor==="paloalto";
+ box.innerHTML='<div class="card"><h3>ACC · Application Command Center · read-only, from the logs</h3><div class="row3">'+
+  sel("acc_period","Time range",["last-15-minutes","last-hour","last-6-hrs","last-12-hrs","last-24-hrs","last-7-days"],"last-hour")+
+  sel("acc_sort","Rank network lists by",["bytes","sessions"],"bytes")+fld("acc_scan","Log entries to read per log type","5000","5000")+
+  (pan?"":sel("acc_src","Log source",["disk","memory","fortianalyzer"],"disk")+fld("acc_vdom","VDOM (optional)","root"))+
+  '</div><div class="grp">Global filters (optional · click any entry in the dashboard to add one)</div><div class="row3">'+
+  ACC_F.map(([k,pl,fl,ph])=>fld("acc_f_"+k,pan?pl:fl,ph)).join("")+
+  '</div><div class="row" style="margin-top:10px;flex-wrap:wrap"><button class="primary" onclick="accRun()">Run ACC</button><button onclick="accClear()">Clear filters &amp; run</button></div>'+
+  '<p class="muted" style="margin:8px 0 0">Reads the newest '+(pan?'traffic, threat and URL':'traffic, IPS, antivirus and web-filter')+
+  ' logs in the time range (filters are applied by the firewall) and summarises them: network, threat, blocked and URL activity. '+
+  'On a busy firewall the read limit can cover less than the whole range; the output says how much was covered.</p></div>'}
+function tilesNode(list){const w=mk("div","dtiles");w.style.marginBottom="12px";
+ list.forEach(t=>{const x=mk("div","dtile"+(t.kind?" "+t.kind:""));x.appendChild(mk("div","dl",t.label));
+  x.appendChild(mk("div","dv",t.value==null?"n/a":t.fmt==="pct"?(+t.value).toFixed(1)+"%":(DFMT[t.fmt]||dNum)(t.value)));
+  if(t.sub)x.appendChild(mk("div","dl",t.sub));
+  if(t.spark&&t.spark.length>1){const sp=mk("div");sp.innerHTML=dSpark(t.spark);x.appendChild(sp)}w.appendChild(x)});return w}
+function accFilt(){const f={};ACC_F.forEach(([k])=>{const v=g("acc_f_"+k).trim();if(v)f[k]=v});return f}
+async function accRun(){const f=accFilt(),ks=Object.keys(f);
+ setBusy("ACC (reads up to "+g("acc_scan")+" log entries per log type; can take a minute)");
+ const r=await api("/api/acc",{id:cur,period:g("acc_period"),sort:g("acc_sort"),scan:g("acc_scan"),log_source:g("acc_src"),vdom:g("acc_vdom"),filters:f});
+ show(r,"ACC · "+g("acc_period")+(ks.length?" · "+ks.map(k=>k+" "+f[k]).join(" · "):""))}
+function accSet(k,v){const i=$("#acc_f_"+k);if(i)i.value=v}
+function accClear(){ACC_F.forEach(([k])=>accSet(k,""));accRun()}
+function accDrill(k,v){accSet(k,v);accRun()}
+function accUnset(k){accSet(k,"");accRun()}
+function accTop(tp,sort){const card=mk("div","dcard");card.appendChild(mk("div","sec",tp.title));
+ if(!tp.rows.length){card.appendChild(mk("div","nv","None in the logs read."));return card}
+ const byB=tp.metric==="traffic"&&sort==="bytes"&&tp.rows.some(r=>r[2]),pv=r=>byB?r[2]:r[1],m=Math.max(...tp.rows.map(pv),1),gr=mk("div","dtop");
+ tp.rows.forEach(r=>{const ok=!!(tp.drill&&r[3]),nm=mk("div","dn"+(ok?" lnk":""),r[0]);
+  nm.title=(ok?"Click: filter the ACC to "+r[0]:r[0])+"\n"+(tp.metric==="traffic"?dNum(r[1])+" sessions · "+dBytes(r[2]):dNum(r[1])+" log entries");
+  if(ok)nm.onclick=()=>accDrill(tp.drill,r[3]);
+  const bar=mk("div","db"),fill=mk("span");fill.style.width=(100*pv(r)/m).toFixed(1)+"%";bar.appendChild(fill);
+  gr.appendChild(nm);gr.appendChild(bar);gr.appendChild(mk("div","dvv",byB?dBytes(r[2]):dNum(r[1])))});
+ card.appendChild(gr);return card}
+function accNode(d){const w=mk("div","dash");
+ const tiles=mk("div","dtiles");d.tiles.forEach(t=>{const x=mk("div","dtile");x.appendChild(mk("div","dl",t.label));
+  x.appendChild(mk("div","dv",t.value==null?"n/a":DFMT[t.fmt](t.value)));if(t.sub)x.appendChild(mk("div","dl",t.sub));
+  if(t.spark){const sp=mk("div");sp.innerHTML=dSpark(t.spark);x.appendChild(sp)}tiles.appendChild(x)});
+ w.appendChild(tiles);
+ const ks=Object.keys(d.filters||{}),hint=mk("div","muted",(ks.length?"Filters:":"No filters")+"");
+ ks.forEach(k=>{const c=mk("span","fchip",d.filters[k].label+": "+d.filters[k].value+" ✕");c.title="Remove this filter and run again";c.onclick=()=>accUnset(k);hint.appendChild(c)});
+ hint.appendChild(document.createTextNode(" · buckets: "+d.bucket+" · times are the firewall's clock · hover a chart for values · click a highlighted entry to filter by it"));
+ w.appendChild(hint);
+ const bar=mk("div","dtabs"),panes=[];
+ d.tabs.forEach((tab,i)=>{const b=mk("button",i===accTab?"on":"",tab.title+" ("+dNum(tab.count)+")");
+  b.onclick=()=>{accTab=i;[...bar.children].forEach((x,j)=>x.classList.toggle("on",j===i));panes.forEach((p,j)=>p.style.display=j===i?"":"none")};bar.appendChild(b);
+  const p=mk("div");p.style.display=i===accTab?"":"none";const cg=mk("div","dgrid");cg.style.marginBottom="12px";
+  tab.charts.forEach(c=>cg.appendChild(dChart(c.title,d.t,c.series.map(([n,v],k)=>({name:n,color:ACC_C[String(n).toLowerCase()]||DC[k%DC.length],vals:v})),
+   {stack:!!c.stack,fmt:DFMT[c.fmt]||dNum,noTotal:c.fmt!=="num"})));
+  p.appendChild(cg);const tg=mk("div","dgrid tops");tab.tops.forEach(tp=>tg.appendChild(accTop(tp,d.sort)));p.appendChild(tg);
+  panes.push(p)});
+ w.appendChild(bar);panes.forEach(p=>w.appendChild(p));return w}
 function cfRules(){cfRun("rules","Cloudflare rule search",{q:g("cf_r_q")})}
 function cfDns(){cfRun("dns","Cloudflare DNS search",{name:g("cf_d_name"),content:g("cf_d_content"),type:g("cf_d_type")})}
 function cfPosture(){cfRun("posture","Cloudflare security posture",{days:g("cf_days")})}

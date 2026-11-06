@@ -14,6 +14,29 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
 - FortiGate lookups: Virtual IPs (name / external / mapped IP filter), static routes (IP, gateway, interface filter)
 - PAN-OS lookups: destination / static NAT rules (the Virtual IP equivalent), configured static routes, session list
   with source / destination filter (URL category lookup was already available)
+- Resource utilization for PAN-OS and FortiGate (Checks, or the button on the health card): tiles, charts and findings
+  with warning / high thresholds. PAN-OS: management CPU and memory (cache excluded), load, top processes, dataplane
+  CPU per data processor (average of active cores, the busiest core, the highest core maximum), session table,
+  packet buffers / descriptors, CPS / throughput / PPS, disk partitions. FortiGate: CPU (incl. per core), memory
+  against the device's own conserve-mode thresholds, log disk, sessions, setup rate and log rates.
+  Time range (e.g. `1h`, `6h`, `3d`, `2w`): PAN-OS dataplane history goes back up to 13 weeks (per minute for 1 hour, per
+  hour for 24 hours, per day for 7 days, per week for 13 weeks); management CPU / memory, sessions and disk are always
+  current values. FortiOS keeps resource history for 24 hours at most; longer ranges add the memory conserve-mode
+  enter / leave events from the system event log (needs Log & Report read)
+- ACC (Application Command Center-style dashboard) for PAN-OS and FortiGate, built from the firewall's logs with
+  read-only log queries: headline tiles (sessions, data, applications, sources, blocked sessions, threats,
+  critical / high threats, blocked URLs), charts over time, and top-10 lists in four tabs:
+  - Network activity: applications, source / destination IPs, users, rules / policies, zones / interfaces,
+    destination ports, countries, categories (FortiGate also: services, high-risk applications)
+  - Threat activity: threats, severity, threat types, attackers, victims, applications, rules, actions
+  - Blocked activity: blocked applications, sources, destinations, ports, blocking rules, threats, URL categories, hosts
+  - URL activity: URL categories, web hosts, users, sources
+
+  Global filters (source / destination IP or subnet, application, user, rule / policy, zone / interface, port) are
+  sent to the firewall's log query and applied again locally. Click any entry to add it as a filter, and click a
+  filter chip to remove it. The time range goes up to 7 days. On a busy firewall the read limit (5,000 entries per log
+  type by default, up to 50,000) can cover less than the whole range, and the output shows exactly which time span was
+  covered. Only traffic logged by a rule is counted, as in the firewall's own ACC
 - PAN-OS / FortiGate log search, admin-change audit; log searches take a time range (up to 1 day back) on F5,
   FortiGate and the F5/FortiGate admin audit (PAN-OS has its own time-range selector)
 - Optional F5 active tools (log search, tcpdump ( with the ability to extract the pms by utilizing tshark with f5 filters and save the output in .pms,
@@ -91,7 +114,7 @@ Profile with only these XML API permissions:
 |---|---|
 | Operational Requests | `<show>` / allow-listed `<test>` checks, packet capture (`debug dataplane packet-diag`) |
 | Configuration | IP lookup, NAT rules, static routes (reads the running config) |
-| Log | Log search, admin audit |
+| Log | Log search, ACC, admin audit |
 | Export | Packet capture download, configuration backup |
 
 Leave Commit, Import and User-ID off. Packet capture changes packet-diag state, so read-only
@@ -104,7 +127,7 @@ the machine running this tool.
 | Feature | Admin profile access |
 |---|---|
 | Checks, IP lookup, VIPs, static routes, sessions | Read on System, Network, Firewall |
-| Traffic log search, admin audit | Read on Log & Report |
+| Traffic log search, ACC, admin audit | Read on Log & Report |
 | Configuration backup | **super_admin** profile (FortiOS requires it for the backup API) |
 
 
