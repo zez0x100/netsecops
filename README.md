@@ -7,9 +7,25 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
 - Health checks and curated read-only status queries per vendor
 - "Where does this IP appear?" lookup (F5 pools, nodes, virtual servers, data groups, policies; PAN/Forti rules
   that reference the IP)
-- PAN-OS / FortiGate policy lookup: find a rule by name (or FortiGate policy ID) with its position, action,
-  objects resolved to their values, security profiles and hit count; or which rule allows or blocks a flow
-  (source, destination, port, protocol; zones on PAN-OS, ingress interface on FortiGate)
+- PAN-OS / FortiGate policy lookup (one box): an IP or subnet shows the objects and rules that reference it; a name
+  (or FortiGate policy ID) finds the rule with its position, action, objects resolved to their values, security
+  profiles and hit count; "List all policies" lists every rule
+- PAN-OS / FortiGate flow check: source and destination IP (optional port, protocol; zones on PAN-OS) show which rule
+  allows or blocks the flow; on FortiGate the ingress interface is optional and taken from the route to the source
+- Flow trace (one card, shown once a device is connected): one flow (client IP -> destination IP or hostname, port,
+  protocol) followed along the path Cloudflare -> FortiGate DMZ -> F5 DMZ -> Palo Alto, each device tested with the
+  addresses it sees:
+  1. Cloudflare: DNS record (origin IP, proxied or not) and WAF events for the client IP. When proxied, the next
+     devices are tested with a Cloudflare edge address as source (from Cloudflare's published ranges)
+  2. FortiGate: policy verdict for that source -> origin IP:port, then the VIP that maps it to the F5 virtual address
+     (a policy with NAT enabled is flagged)
+  3. F5: virtual server on the mapped address (or for the hostname), enabled, pool members up / down, and the SNAT
+     address it uses (automap: the self IP in the member's subnet, floating preferred; SNAT pool: its first member)
+  4. Palo Alto: policy verdict for F5 SNAT address -> pool member IP:port
+  A hostname not in Cloudflare is resolved through the F5 virtual server and the FortiGate VIP. Optional log search
+  (F5 WAF log by the client IP header when proxied; FortiGate and Palo Alto traffic logs). The result is one row per
+  device and check, and the first block found ("STOPS AT ..."). Devices not connected are skipped; routing between
+  the devices is not checked; FortiOS policy lookup on a VIP's external address is not yet verified on a real unit
 - F5 ASM/WAF request-log search (incl. by any HTTP header: value, IP, True-Client-IP, hostname, URL, time, support ID, POST body), top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
 - FortiGate lookups: Virtual IPs (name / external / mapped IP filter), static routes (IP, gateway, interface filter)
 - PAN-OS lookups: destination / static NAT rules (the Virtual IP equivalent), configured static routes, session list
@@ -17,12 +33,23 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
 - Resource utilization for PAN-OS and FortiGate (Checks, or the button on the health card): tiles, charts and findings
   with warning / high thresholds. PAN-OS: management CPU and memory (cache excluded), load, top processes, dataplane
   CPU per data processor (average of active cores, the busiest core, the highest core maximum), session table,
-  packet buffers / descriptors, CPS / throughput / PPS, disk partitions. FortiGate: CPU (incl. per core), memory
+  packet buffers / descriptors, CPS / throughput / PPS, disk partitions, a per-core heatmap (cores x time) and the
+  top management-plane processes by CPU and memory. FortiGate: CPU (incl. per core), memory
   against the device's own conserve-mode thresholds, log disk, sessions, setup rate and log rates.
   Time range (e.g. `1h`, `6h`, `3d`, `2w`): PAN-OS dataplane history goes back up to 13 weeks (per minute for 1 hour, per
   hour for 24 hours, per day for 7 days, per week for 13 weeks); management CPU / memory, sessions and disk are always
   current values. FortiOS keeps resource history for 24 hours at most; longer ranges add the memory conserve-mode
   enter / leave events from the system event log (needs Log & Report read)
+- Palo Alto application traffic volume over a period (Checks > Traffic): sessions, bytes, average per hour and Mbit/s
+  per application from the firewall's summary database (dynamic report top-app-summary), so a 24-hour or 7-day
+  question covers the whole period instead of a log sample
+- F5 top virtual servers: ranked by current, total or max connections, traffic or packets (Checks > LTM)
+- F5 performance dashboard (Checks, or the button on the health card), time range 30 minutes to 24 hours: tiles
+  (average CPU, busiest core, memory, TMM memory, control-plane memory, swap, fullest disk), CPU and memory charts
+  over time, CPU per core, top 10 processes by CPU and by memory, subsystem CPU and memory (tmm, waf, l7_dos,
+  log_analytics, fw, ... grouped by process), disk use per partition, with findings. Read-only REST gives the current
+  values and the performance averages; with the F5 active-tools tick-box (Administrator) it also reads the history
+  from the BIG-IP's own RRD files plus `top` and `df` through fixed, read-only util/bash commands
 - ACC (Application Command Center-style dashboard) for PAN-OS and FortiGate, built from the firewall's logs with
   read-only log queries: headline tiles (sessions, data, applications, sources, blocked sessions, threats,
   critical / high threats, blocked URLs), charts over time, and top-10 lists in four tabs:
@@ -37,6 +64,24 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
   filter chip to remove it. The time range goes up to 7 days. On a busy firewall the read limit (5,000 entries per log
   type by default, up to 50,000) can cover less than the whole range, and the output shows exactly which time span was
   covered. Only traffic logged by a rule is counted, as in the firewall's own ACC
+- AI assistant with a local LLM (any OpenAI-compatible server: Ollama, LM Studio, llama.cpp server, vLLM), in a chat
+  panel opened from the "✦ AI" button in the bottom-right corner of the page:
+  - Explain current output: what it shows, what is wrong or unusual, the likely cause and the next checks to run
+  - Ask about current output: follow-up questions on the same output, with the conversation kept
+  - Ask & run checks: the model answers any question by choosing and running up to 8 of the console's read-only
+    lookups on ALL connected devices, whichever one is selected (tools named per device type: pa_, fg_, f5_, cf_;
+    catalog checks, IP / policy lookup, log search, ACC, F5 hostname / WAF log search, Cloudflare lookups; a device
+    field picks one when several of a type are connected), and combines them across devices; plus a policy check
+    (every connected Palo Alto / FortiGate: which rule allows or blocks IP A -> IP B:port) and the flow trace for
+    internet clients and published hostnames. Each call is in the audit log of the device it read and its result can
+    be opened in Output. Needs a model with tool calling (e.g. qwen2.5 / qwen3, llama3.1+, mistral-nemo)
+  - Typing a question and pressing Enter uses "Ask & run checks" whenever a device is connected (the output on
+    screen is still sent along); "Ask about current output" answers from the screen only
+  - Every answer is checked: names and IPs it states that are not in the data the model was given are listed in a
+    warning (small models can invent them)
+
+  Quick start: `ollama pull qwen2.5:14b`, `ollama serve`, then in Model settings use `http://127.0.0.1:11434/v1`,
+  List models, Save. For long outputs start Ollama with a bigger context window (e.g. `OLLAMA_CONTEXT_LENGTH=16384`)
 - PAN-OS / FortiGate log search, admin-change audit; log searches take a time range (up to 1 day back) on F5,
   FortiGate and the F5/FortiGate admin audit (PAN-OS has its own time-range selector)
 - Optional F5 active tools (log search, tcpdump ( with the ability to extract the pms by utilizing tshark with f5 filters and save the output in .pms,
@@ -91,6 +136,13 @@ Open the URL printed in the terminal.
   - F5 active tools and F5 backup run fixed shell commands through `util/bash` (Administrator role).
   - PAN-OS packet capture changes packet-diag state and clears all packet-diag settings before and after,
     which ends any capture another admin has running.
+- AI assistant: device data is sent only to an approved model server: this PC (127.0.0.1 / localhost) or a host in
+  `llm_approved.txt` next to `netops_console.py` (one host name per line; kept out of git, none by default). Any other address is refused, checked before
+  every request. The model server is always reached directly (never through the system or a cloud web proxy), and a
+  redirect is refused instead of followed, so neither the prompt nor the API key can be sent elsewhere. Model
+  settings show where the data goes. Before sending, passwords, keys, tokens, hashes and PEM blocks are masked and large
+  output is trimmed to the context budget. The model can only call read-only lookups; active tools are never offered
+  to it, and nothing it writes is run. Model settings and the optional API key live in memory only.
 - Backups and captures are written to `./captures` (git-ignored). **Never commit them**: they contain
   device configuration and secrets.
 

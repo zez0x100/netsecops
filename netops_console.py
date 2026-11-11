@@ -82,11 +82,17 @@ CATALOG = {
         {"id": "failover", "group": "HA", "label": "Failover status", "path": "/mgmt/tm/cm/failover-status"},
         {"id": "sync", "group": "HA", "label": "Config sync status", "path": "/mgmt/tm/cm/sync-status"},
         {"id": "tgstats", "group": "HA", "label": "Traffic-group stats", "path": "/mgmt/tm/cm/traffic-group/stats"},
-        {"id": "cpu", "group": "Resources", "label": "CPU", "path": "/mgmt/tm/sys/cpu"},
-        {"id": "mem", "group": "Resources", "label": "Memory", "path": "/mgmt/tm/sys/memory"},
         {"id": "perf", "group": "Resources", "label": "Performance (all stats)", "path": "/mgmt/tm/sys/performance/all-stats"},
+        {"id": "resutil", "group": "Resources", "label": "Performance dashboard (CPU per core, memory, subsystems, top processes, "
+         "disk; history and processes need the active-tools tick-box)", "handler": "f5_perf",
+         "params": [P("range", "Time range: 30m-24h", "6h", "1h", required=False)]},
         {"id": "ifaces", "group": "Network", "label": "Interface stats", "path": "/mgmt/tm/net/interface/stats"},
-        {"id": "vsall", "group": "LTM", "label": "All virtual server stats", "path": "/mgmt/tm/ltm/virtual/stats"},
+        {"id": "vstop", "group": "LTM", "label": "Top virtual servers by connections / traffic (busiest first: current, "
+         "total and max connections, bits in/out)", "handler": "f5_vs_top",
+         "params": [P("by", "Sort by: current, total, max, bits or packets", "current", "current", required=False),
+                    P("top", "How many (1-500)", "20", "20", required=False)]},
+        {"id": "vsall", "group": "LTM", "label": "All virtual servers: names, IPs, pools and up/down status (no connection "
+         "counts)", "path": "/mgmt/tm/ltm/virtual/stats"},
         {"id": "vsone", "group": "LTM", "label": "One virtual server stats", "path": "/mgmt/tm/ltm/virtual/{vs}/stats",
          "params": [P("vs", "Virtual server", "~Common~my_vs")]},
         {"id": "polsearch", "group": "LTM", "label": "Local traffic policy search (rules and conditions)",
@@ -102,6 +108,13 @@ CATALOG = {
          "handler": "pan_resources",
          "params": [P("range", "Time range: 1h-24h, 1d-7d or 1w-13w", "3d", "1h", required=False)]},
         {"id": "resources", "group": "Device", "label": "System resources (top)", "cmd": "<show><system><resources/></system></show>"},
+        {"id": "apptraffic", "group": "Traffic", "label": "Application traffic volume over a period (full period from the "
+         "summary database: sessions, bytes, average per hour and Mbit/s; e.g. web-browsing = HTTP, ssl = HTTPS)",
+         "handler": "pan_app_traffic",
+         "params": [P("period", "Time range: last-hour, last-6-hrs, last-12-hrs, last-24-hrs, last-7-days, last-30-days",
+                      "last-24-hrs", "last-24-hrs", required=False),
+                    P("app", "Application (or part of it; 'http' = web-browsing and http-*)", "web-browsing", required=False),
+                    P("top", "How many applications (1-500)", "50", "50", required=False)]},
         {"id": "jobs", "group": "Device", "label": "Jobs (all)", "cmd": "<show><jobs><all/></jobs></show>"},
         {"id": "ha", "group": "HA", "label": "HA state", "cmd": "<show><high-availability><state/></high-availability></show>"},
         {"id": "ifaces", "group": "Network", "label": "Interfaces (all)", "cmd": "<show><interface>all</interface></show>"},
@@ -163,14 +176,10 @@ CATALOG = {
         {"id": "ips", "group": "Reference", "label": "Cloudflare edge IP ranges", "path": "/client/v4/ips"},
     ],
 }
-CATALOG_PUBLIC = CATALOG  # contains no secrets
+# contains no secrets; entries marked "hidden" are not listed in the page
+CATALOG_PUBLIC = {v: [c for c in cs if not c.get("hidden")] for v, cs in CATALOG.items()}
 PROFILE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_profiles.json")
-HEALTH_CHECKS = {
-    "f5": ("version", "failover", "cpu", "mem"),
-    "paloalto": ("sysinfo", "resources", "ha"),
-    "fortigate": ("status", "resources", "ha"),
-    "cloudflare": ("zones", "ips"),
-}
+
 
 
 # ----------------------------------------------------------------------------
@@ -353,36 +362,6 @@ def do_profile_delete(b):
     return {"ok": True}
 
 
-def do_health(b):
-    sess = SESSIONS.get(b.get("id"))
-    if not sess:
-        return {"ok": False, "error": "device not connected"}
-    specs = [next(c for c in CATALOG[sess["vendor"]] if c["id"] == check)
-             for check in HEALTH_CHECKS[sess["vendor"]]]
-    checks = []
-    for spec in specs:
-        try:
-            run = {"cmd": spec["cmd"]} if "cmd" in spec else {"path": spec["path"]}
-            audit(sess, "health: " + spec["label"])
-            result = execute(sess, run)
-            checks.append({"id": spec["id"], "label": spec["label"], "ok": result["ok"],
-                           "status": result["status"], "ms": result["ms"],
-                           "error": "" if result["ok"] else
-                           "device returned HTTP %s or an unsuccessful vendor response" % result["status"]})
-        except (urllib.error.URLError, OSError) as e:
-            checks.append({"id": spec["id"], "label": spec["label"], "ok": False,
-                           "error": "request failed: %s" % getattr(e, "reason", e)})
-    passed = sum(1 for check in checks if check["ok"])
-    return {"ok": passed == len(checks), "status": 200, "ms": sum(c.get("ms", 0) for c in checks),
-            "request": "health snapshot", "data": {"checks": checks},
-            "verdict": {"label": "%d of %d checks responded successfully" % (passed, len(checks)),
-                        "kind": "ok" if passed == len(checks) else "bad"},
-            "summary": ["Reachability/API-response summary only; inspect device-specific state and thresholds separately."]}
-
-
-# ----------------------------------------------------------------------------
-# Actions
-# ----------------------------------------------------------------------------
 def do_connect(b):
     vendor = b.get("vendor")
     if vendor not in CATALOG:
@@ -505,6 +484,7 @@ def do_run(b):
                 if not v and p_.get("required", True):
                     raise ValueError("missing: " + p_["label"])
                 vals[p_["name"]] = v
+            vals["_ack"] = bool(b.get("ack"))   # F5 performance: util/bash only with the active-tools tick-box
             audit(sess, spec["label"])
             return PAN_HANDLERS[spec["handler"]](sess, vals)
         if "cmd" in spec:
@@ -518,6 +498,8 @@ def do_run(b):
                                   result.get("data"))
             if rows:
                 result["data"] = {"virtual_servers": rows}
+        if sess["vendor"] == "f5" and spec["id"] == "certs" and result.get("ok") and isinstance(result.get("data"), dict):
+            result["data"] = {"certificates": f5_cert_rows(result["data"].get("items") or [])}
         if sess["vendor"] == "f5" and spec["id"] == "polsearch" and result.get("ok"):
             rows = f5_policy_search(sess, str((b.get("params") or {}).get("policy") or "").strip())
             result["data"] = {"policies": rows} if rows else {"policies": [], "note": "no local traffic policy matches that name"}
@@ -741,22 +723,47 @@ def strip_rd(a):
     return (a or "").split("%", 1)[0]
 
 
+def spec_range(spec):
+    """(first, last) address of a literal IP, CIDR, 'a-b' range or 'a.b.c.d m.m.m.m'; raises ValueError."""
+    spec = spec.strip()
+    if "-" in spec and "/" not in spec and " " not in spec:
+        a, b = [ipaddress.ip_address(x.strip()) for x in spec.split("-", 1)]
+        return a, b
+    net = ipaddress.ip_network("%s/%s" % tuple(spec.split()[:2]) if " " in spec else spec, strict=False)
+    return net.network_address, net.broadcast_address
+
+
 def ip_in_spec(ip, spec):
-    """True if ip falls inside spec: literal IP, CIDR, 'a-b' range, or 'a.b.c.d m.m.m.m'."""
+    """True if ip falls inside spec: literal IP, CIDR, 'a-b' range, or 'a.b.c.d m.m.m.m'.
+    ip may also be a subnet (ip_network): then True if spec and the subnet share any address."""
     spec = (spec or "").strip()
     if not spec:
         return False
     try:
-        if "-" in spec and "/" not in spec and " " not in spec:
-            a, b = [ipaddress.ip_address(x.strip()) for x in spec.split("-", 1)]
-            return a <= ip <= b
-        if " " in spec:
-            net = ipaddress.ip_network("%s/%s" % tuple(spec.split()[:2]), strict=False)
-        else:
-            net = ipaddress.ip_network(spec, strict=False)
-        return ip in net
+        a, b = spec_range(spec)
+        if isinstance(ip, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+            return ip.version == a.version and a <= ip.broadcast_address and b >= ip.network_address
+        return ip.version == a.version and a <= ip <= b
     except (ValueError, TypeError):
         return False
+
+
+def spec_relation(ip, spec):
+    """For a subnet lookup: how the object relates to the subnet."""
+    if not isinstance(ip, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+        return ""
+    try:
+        a, b = spec_range(spec)
+    except (ValueError, TypeError):
+        return ""
+    lo, hi = ip.network_address, ip.broadcast_address
+    if a == lo and b == hi:
+        return " · same as the subnet"
+    if a <= lo and b >= hi:
+        return " · contains the subnet"
+    if a >= lo and b <= hi:
+        return " · inside the subnet"
+    return " · partly overlaps the subnet"
 
 
 def ip_is_exact(ip, spec):
@@ -1147,7 +1154,7 @@ def pan_lookup(sess, ip, vsys, flow, refs=True):
             for tag in ("ip-netmask", "ip-range"):
                 v = e.findtext(tag)
                 if v and ip_in_spec(ip, v):
-                    matched[e.get("name")] = "%s %s (%s)" % (tag, v.strip(), label)
+                    matched[e.get("name")] = "%s %s (%s)%s" % (tag, v.strip(), label, spec_relation(ip, v))
             if e.find("fqdn") is not None or e.find("ip-wildcard") is not None:
                 skipped += 1
         node = section(xp, "address-group")
@@ -1186,13 +1193,9 @@ def pan_lookup(sess, ip, vsys, flow, refs=True):
     res = {"matching_objects": matched, "rules_referencing_ip": rules}
     summary = []
     if refs:
-        if matched:
-            summary.append("Address objects/groups containing the IP: " + ", ".join(sorted(matched)))
-        else:
+        # The matching objects and rules are shown as tables, so the summary only reports when there are none.
+        if not matched:
             summary.append("No address object or group contains this IP.")
-        for r in rules:
-            summary.append("Rule '%s' [%s, action=%s, disabled=%s] references it in %s" % (
-                r["rule"], r["scope"], r["action"], r["disabled"], "/".join(sorted({h["field"] for h in r["hits"]}))))
         if not rules:
             summary.append("No security rule names this IP directly or via an object.")
         if skipped:
@@ -1245,7 +1248,7 @@ def pan_lookup(sess, ip, vsys, flow, refs=True):
                 flow["src"], flow["dst"], flow["port"] or "-", flow["proto"], name, act))
     res["notes"] = notes
     if verdict is None:
-        verdict = {"label": "%d RULE(S) REFERENCE THIS IP" % len(rules), "kind": "info"}
+        verdict = {"label": "%d RULE(S) REFERENCE THIS %s" % (len(rules), ("SUBNET" if isinstance(ip, (ipaddress.IPv4Network, ipaddress.IPv6Network)) else "IP")), "kind": "info"}
     return res, summary, verdict
 
 
@@ -1269,9 +1272,10 @@ def fg_lookup(sess, ip, vdom, flow, refs=True):
         if n == "all" or a.get("subnet") == "0.0.0.0 0.0.0.0":
             continue
         if t == "ipmask" and ip_in_spec(ip, a.get("subnet")):
-            matched[n] = "subnet " + a["subnet"]
+            matched[n] = "subnet " + a["subnet"] + spec_relation(ip, a["subnet"])
         elif t == "iprange" and ip_in_spec(ip, "%s-%s" % (a.get("start-ip"), a.get("end-ip"))):
-            matched[n] = "range %s-%s" % (a.get("start-ip"), a.get("end-ip"))
+            rng = "%s-%s" % (a.get("start-ip"), a.get("end-ip"))
+            matched[n] = "range " + rng + spec_relation(ip, rng)
         elif t not in ("ipmask", "iprange"):
             skipped += 1
     changed = True
@@ -1300,18 +1304,30 @@ def fg_lookup(sess, ip, vdom, flow, refs=True):
     res = {"matching_objects": matched, "policies_referencing_ip": rules}
     summary = []
     if refs:
-        summary.append("Address objects/groups containing the IP: " + (", ".join(sorted(matched)) or "none"))
-        for r in rules:
-            flags = " (NEGATED)" if any(h["negated"] for h in r["hits"]) else ""
-            summary.append("Policy %s '%s' [action=%s, status=%s] references it in %s%s" % (
-                r["policyid"], r["name"] or "", r["action"], r["status"],
-                "/".join(sorted({h["field"] for h in r["hits"]})), flags))
+        # The matching objects and policies are shown as tables, so the summary only reports when there are none.
+        if not matched:
+            summary.append("No address object or group contains this IP.")
         if not rules:
             summary.append("No IPv4 policy references this IP directly or via an object.")
         if skipped:
             notes.append("%d FQDN/geography/wildcard object(s) were not evaluated." % skipped)
         notes.append("IPv6 policies, internet-service and the built-in 'all' object are not part of the reference search.")
     verdict = None
+    if flow and not flow["srcintf"]:
+        # No ingress interface given: use the interface of the route back to the source (as the GUI suggests).
+        rq = {"destination": flow["src"]}
+        if vdom:
+            rq["vdom"] = vdom
+        st, ok, rd = rest_get(sess, "/api/v2/monitor/router/lookup?" + urllib.parse.urlencode(rq))
+        rr = rd.get("results") if ok and isinstance(rd, dict) else None
+        rr = rr[0] if isinstance(rr, list) and rr else rr
+        intf = str((rr or {}).get("interface") or "") if isinstance(rr, dict) else ""
+        if not intf:
+            res["notes"] = notes + ["Could not find the route to %s (HTTP %s); enter the ingress interface." % (flow["src"], st)]
+            return res, summary, {"label": "INGRESS INTERFACE NOT FOUND", "kind": "warn"}
+        flow["srcintf"] = intf
+        notes.append("Ingress interface %s was taken from the route to the source %s%s." % (
+            intf, flow["src"], (" via " + str(rr.get("gateway"))) if rr.get("gateway") else ""))
     if flow:
         q = {"srcintf": flow["srcintf"], "sourceip": flow["src"], "dest": flow["dst"], "protocol": flow["proto"]}
         if flow["port"]:
@@ -1343,14 +1359,14 @@ def fg_lookup(sess, ip, vdom, flow, refs=True):
                     verdict = {"label": "BLOCKED by " + label.strip(), "kind": "bad"}
                 else:
                     verdict = {"label": "MATCHED %s (action: %s)" % (label.strip(), act), "kind": "info"}
-                summary.insert(0, "Flow %s -> %s port %s %s: policy %s, action '%s'" % (
-                    flow["src"], flow["dst"], flow["port"] or "-", flow["proto"], pid, act))
+                summary.insert(0, "Flow %s -> %s port %s %s (ingress %s): policy %s, action '%s'" % (
+                    flow["src"], flow["dst"], flow["port"] or "-", flow["proto"], flow["srcintf"], pid, act))
             else:
                 verdict = {"label": "NO POLICY MATCHED (implicit deny)", "kind": "bad"}
                 summary.insert(0, "Policy lookup returned no policy. Confirm the ingress interface is correct.")
     res["notes"] = notes
     if verdict is None:
-        verdict = {"label": "%d POLICY(IES) REFERENCE THIS IP" % len(rules), "kind": "info"}
+        verdict = {"label": "%d POLICY(IES) REFERENCE THIS %s" % (len(rules), ("SUBNET" if isinstance(ip, (ipaddress.IPv4Network, ipaddress.IPv6Network)) else "IP")), "kind": "info"}
     return res, summary, verdict
 
 
@@ -1413,12 +1429,16 @@ def pan_policy_search(sess, q, vsys):
                      "security_profiles": profiles, "log_at_session_end": e.findtext("log-end") or "yes",
                      "tags": m("tag"), "description": (e.findtext("description") or "").strip()})
     notes = []
-    if rows:   # hit counts are kept per vsys rule base
-        lst = "".join("<member>%s</member>" % xml_escape(r["rule"]) for r in rows[:50])
+    root, hits = None, {}
+    for i in range(0, len(rows), 50):   # hit counts are kept per vsys rule base
+        lst = "".join("<member>%s</member>" % xml_escape(r["rule"]) for r in rows[i:i + 50])
         root = pan_xml(sess, {"type": "op", "cmd": "<show><rule-hit-count><vsys><vsys-name><entry name='%s'><rule-base>"
                               "<entry name='security'><rules><list>%s</list></rules></entry></rule-base></entry>"
                               "</vsys-name></vsys></rule-hit-count></show>" % (xml_escape(vsys), lst)}, 30)
-        hits = {h.get("name"): h for h in (root.findall(".//rules/entry") if root is not None else [])}
+        if root is None:
+            break
+        hits.update((h.get("name"), h) for h in root.findall(".//rules/entry"))
+    if rows:
         for r in rows:
             h = hits.get(r["rule"])
             if h is not None:
@@ -1485,12 +1505,12 @@ def do_policy_search(b):
     if not sess or sess["vendor"] not in ("paloalto", "fortigate"):
         return {"ok": False, "error": "connect a Palo Alto or FortiGate device first"}
     t0 = time.time()
-    q = str(b.get("name") or "").strip()
-    if not POLICY_Q_RE.match(q):
+    q = "" if b.get("all") else str(b.get("name") or "").strip()
+    if q and not POLICY_Q_RE.match(q) or not q and not b.get("all"):
         return {"ok": False, "error": "enter a policy name (or part of it)%s, without quotes or < >" % (
             " or a policy ID" if sess["vendor"] == "fortigate" else "")}
     try:
-        audit(sess, "policy search '%s'" % q)
+        audit(sess, "policy search '%s'" % q if q else "list all policies")
         if sess["vendor"] == "paloalto":
             rows, notes = pan_policy_search(sess, q, pstr(b.get("vsys"), "vsys") or "vsys1")
             key = lambda r: "%s (%s, position %s)" % (r["rule"], r["scope"], r["position"])
@@ -1502,15 +1522,21 @@ def do_policy_search(b):
         return {"ok": False, "error": str(e)}
     except (urllib.error.URLError, OSError) as e:
         return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+    # Negate flags as yes / no ("disable" would show as a red pill), moved to the end so source, destination and
+    # service sit next to each other.
+    for i, r in enumerate(rows):
+        neg = {k: ("yes" if str(r.get(k)) in ("yes", "enable") else "no") for k in ("negate_source", "negate_destination")}
+        rows[i] = dict([(k, x) for k, x in r.items() if k not in neg] + list(neg.items()))
     # A few matches read best one by one; many as a table.
-    data = {key(r): r for r in rows} if len(rows) <= 5 else {"policies": rows}
+    data = {key(r): r for r in rows} if q and len(rows) <= 5 else {"policies": rows}
     off = [r for r in rows if r["enabled"] == "no"]
-    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "policy search " + q,
-            "verdict": {"label": ("%d POLICY(IES) MATCH '%s'" % (len(rows), q)) + (" · %d DISABLED" % len(off) if off else "")
-                        if rows else "NO POLICY NAME CONTAINS '%s'" % q, "kind": "info" if rows else "warn"},
+    label = ("%d POLICY(IES) MATCH '%s'" % (len(rows), q)) if q else "%d POLICY(IES) IN TOTAL" % len(rows)
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "policy search " + q if q else "all policies",
+            "verdict": {"label": label + (" · %d DISABLED" % len(off) if off else "")
+                        if rows else "NO POLICY NAME CONTAINS '%s'" % q if q else "NO POLICIES FOUND", "kind": "info" if rows else "warn"},
             "summary": ["%s: action %s%s%s" % (key(r), r["action"], "" if r["enabled"] == "yes" else ", DISABLED",
                                                 ", hits %s" % r["hit_count"] if r.get("hit_count") not in (None, "") else "")
-                        for r in rows[:10]] + notes,
+                        for r in (rows[:10] if q else [])] + notes,
             "data": data}
 
 
@@ -1896,6 +1922,8 @@ def pan_top_parse(text):
         out["procs"] = [{"pid": p.get("PID"), "process": p.get("COMMAND"), "user": p.get("USER"),
                          "cpu_pct": p.get("%CPU"), "mem_pct": p.get("%MEM"), "resident": p.get("RES")}
                         for p in procs[:10]]
+        out["procs_mem"] = sorted(({"process": p.get("COMMAND"), "pid": p.get("PID"), "bytes": f5_size(p.get("RES")) or 0}
+                                   for p in procs), key=lambda p: -p["bytes"])[:10]
     return out
 
 
@@ -1953,6 +1981,7 @@ def pan_resources(sess, v):
     if not got:
         return {"ok": False, "error": "no resource command answered. " + " ".join(notes)}
     tiles, charts, findings, data = [], [], [], collections.OrderedDict()
+    heats, bars = [], []
     text = lambda d: str(acc_scalar((d or {}).get("result")) or "")
     rows = []
 
@@ -2004,6 +2033,9 @@ def pan_resources(sess, v):
                            "fmt": "pct", "series": [["Average of active cores", [round(x, 1) for x in avg]],
                                                     ["Busiest core (%s)" % busiest[0], busiest[1][-n:]]] +
                                                    ([["Highest core maximum", [0] * (n - m_) + pmax]] if pmax else [])})
+            hc = sorted([(c, v) for c, v in cores if len(v) >= n], key=lambda cv: int(cv[0]) if cv[0].isdigit() else 9999)
+            heats.append({"title": "Dataplane cores %s · %s · %s (%% load per core)" % (dp["dp"], span, per),
+                          "t": ru_labels(n, step), "rows": [["core %s" % c, v[-n:]] for c, v in hc]})
             data["dataplane_cores_%s" % dp["dp"]] = [
                 {"core": c, "now_pct": vals[-1], "mean_pct": round(sum(vals) / float(len(vals)), 1), "peak_pct": max(vals),
                  "note": "" if any(vals) else "idle all period (reserved / not used for traffic); left out of the average"}
@@ -2054,6 +2086,15 @@ def pan_resources(sess, v):
     if disks:
         worst = max(disks, key=lambda d: d["use_pct"])
         tiles.append(ru_tile("Fullest disk", worst["use_pct"], worst["mounted_on"]))
+    if top.get("procs"):
+        bars.append({"title": "Top 10 management-plane processes by CPU", "fmt": "pct",
+                     "rows": [["%s (%s)" % (p["process"], p["pid"]), ru_float(p["cpu_pct"]) or 0] for p in top["procs"]]})
+    if top.get("procs_mem"):
+        bars.append({"title": "Top 10 management-plane processes by memory (resident)", "fmt": "bytes",
+                     "rows": [["%s (%s)" % (p["process"], p["pid"]), p["bytes"]] for p in top["procs_mem"] if p["bytes"]]})
+    if disks:
+        bars.append({"title": "Disk use by partition", "fmt": "pct",
+                     "rows": [[d["mounted_on"], d["use_pct"]] for d in sorted(disks, key=lambda d: -d["use_pct"])]})
     data = collections.OrderedDict([("utilization", rows)] + list(data.items()))
     if top.get("procs"):
         data["top_processes_management_plane"] = top["procs"]
@@ -2070,7 +2111,9 @@ def pan_resources(sess, v):
     label = "MGMT CPU %s · DP CPU %s · MGMT MEM %s · SESSIONS %s · PKT BUFFER %s · %s" % (
         pick("Management CPU"), pick("Dataplane CPU"), pick("Management memory"), pick("Session table"), pick("Packet buffer"),
         span.upper())
-    return ru_result(t0, " + ".join(cmds[k] for k in cmds), tiles, charts, findings, data, notes, label)
+    out = ru_result(t0, " + ".join(cmds[k] for k in cmds), tiles, charts, findings, data, notes, label)
+    out["heat"], out["bars"] = heats, bars
+    return out
 
 
 FG_RES_LABELS = collections.OrderedDict([
@@ -2297,8 +2340,582 @@ def fg_resources(sess, v):
     return ru_result(t0, " + ".join("GET " + p for p in paths.values()), tiles, charts, findings, data, notes, label)
 
 
+# ---- F5 performance dashboard: CPU per core, memory, subsystems, top processes, disk, history up to 24 hours -----
+F5_PERF_MAX = 86400
+# Process name -> BIG-IP subsystem (module); first match wins
+F5_SUBSYS = (
+    ("tmm (traffic)", re.compile(r"^tmm")),
+    ("waf (ASM)", re.compile(r"^(bd|bd_agent|bd_\w+|asm\w*|pabnagd|policy_engine|anomaly_engine)")),
+    ("l7_dos", re.compile(r"^(dosl7d|admd)")),
+    ("log_analytics (AVR)", re.compile(r"^(avrd|avr\w+|monpd)")),
+    ("fw (AFM)", re.compile(r"^(pccd|autodosd|dwbld|iprepd|bdosd)")),
+    ("APM", re.compile(r"^(apmd|websso|eam|oauth|localdbmgr|vdi|rba|acctd)")),
+    ("DNS / GTM", re.compile(r"^(gtmd|big3d|zxfrd|named|zrd)")),
+    ("control plane", re.compile(r"^(mcpd|restjavad|restnoded|java|httpd|tomcat|icrd\w*|iControl\w*|scriptd|tmrouted|"
+                                 r"sod|bigd|statsd|merged|alertd|syslog\w*|devmgmtd|csyncd|chmand|lind|lopd|qkview|"
+                                 r"mysqld|tmsh|bcm56xxd|snmpd|sshd|systemd|rsyslogd|auditd|crond|ntpd|mgmt\w*)")),
+)
+CPU_STATES = ("softirq", "iowait", "stolen", "system", "steal", "user", "nice", "idle", "irq", "sys")
+
+
+def f5_subsys(name):
+    return next((s for s, rx in F5_SUBSYS if rx.match(name or "")), "other")
+
+
+def f5_bytes(n):
+    n = float(n or 0)
+    for u in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or u == "TiB":
+            return ("%.0f %s" if u == "B" else "%.2f %s") % (n, u)
+        n /= 1024.0
+
+
+def f5_stat_rows(node, out=None):
+    """Every 'entries' block of a stats response as one flat {field: value} row."""
+    out = [] if out is None else out
+    if isinstance(node, dict):
+        ents = node.get("entries")
+        if isinstance(ents, dict):
+            row = {}
+            for k, v in ents.items():
+                if isinstance(v, dict) and ("value" in v or "description" in v) and len(v) <= 2:
+                    row[k.rsplit("/", 1)[-1]] = v.get("value", v.get("description"))
+            if row:
+                out.append(row)
+        for v in node.values():
+            if isinstance(v, (dict, list)):
+                f5_stat_rows(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            f5_stat_rows(v, out)
+    return out
+
+
+def f5_size(v):
+    """top RES column ('123456' KiB, '1.2g', '512m', '3.1t') -> bytes."""
+    m = re.match(r"^([\d.]+)([kmgtp]?)$", str(v or "").strip().lower())
+    if not m:
+        return None
+    try:
+        return float(m.group(1)) * {"": 1024, "k": 1024, "m": 1 << 20, "g": 1 << 30, "t": 1 << 40, "p": 1 << 50}[m.group(2)]
+    except ValueError:
+        return None
+
+
+def f5_top_parse(text_):
+    """Process rows from `top -b`: [{pid, user, name, cpu_pct, res_bytes, mem_pct}]."""
+    procs, cols = [], None
+    for line in text_.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "PID" and "COMMAND" in parts:
+            cols = {c: i for i, c in enumerate(parts)}
+            continue
+        if cols and parts[0].isdigit() and len(parts) >= len(cols):
+            g = lambda c: parts[cols[c]] if c in cols else ""
+            procs.append({"pid": int(parts[0]), "user": g("USER"), "name": " ".join(parts[cols["COMMAND"]:]),
+                          "cpu_pct": ru_float(g("%CPU")) or 0.0, "res_bytes": f5_size(g("RES")) or 0.0,
+                          "mem_pct": ru_float(g("%MEM")) or 0.0})
+    return procs
+
+
+def f5_df_parse(text_):
+    out = []
+    for line in text_.splitlines()[1:]:
+        p = line.split()
+        if len(p) < 6 or not p[1].isdigit() or p[0] in ("tmpfs", "devtmpfs", "none", "shm", "udev"):
+            continue
+        if int(p[1]) == 0 or p[5].startswith(("/dev", "/run", "/sys", "/proc")):
+            continue
+        out.append({"mounted_on": p[5], "size": f5_bytes(int(p[1]) * 1024), "used": f5_bytes(int(p[2]) * 1024),
+                    "available": f5_bytes(int(p[3]) * 1024), "use_pct": int(ru_float(p[4]) or 0), "filesystem": p[0]})
+    return out
+
+
+def f5_rrd_parse(text_):
+    """`rrdtool fetch` output -> (data source names, [(epoch, [value or None, ...])])."""
+    names, rows = [], []
+    for line in text_.splitlines():
+        head = line.split(":", 1)[0].strip()
+        if ":" in line and head.isdigit():
+            vs = []
+            for x in line.split(":", 1)[1].split():
+                try:
+                    f = float(x)
+                    vs.append(None if f != f else f)   # nan
+                except ValueError:
+                    vs.append(None)
+            rows.append((int(head), vs))
+        elif line.strip() and not names and not rows:
+            names = line.split()
+    return names, rows
+
+
+def f5_rrd_series(fname, names, rows):
+    """Percentage series from one RRD file: CPU (user / system / idle ... states, one series per group of states)
+    or memory (used / total). Returns ([(kind, label, {epoch: pct})], recognised)."""
+    low = [n.lower() for n in names]
+    groups = collections.OrderedDict()
+    for i, n in enumerate(low):
+        st = next((s for s in CPU_STATES if s in n), None)
+        if st:
+            groups.setdefault(n.replace(st, "", 1).strip("_- "), {})[st] = i
+    out = []
+    for grp, idx in groups.items():
+        if "idle" not in idx or len(idx) < 3:
+            continue
+        pts = {}
+        for ts, vs in rows:
+            parts = [vs[i] for i in idx.values() if i < len(vs) and vs[i] is not None]
+            tot = sum(parts)
+            if len(parts) == len(idx) and tot > 0:
+                idle = vs[idx["idle"]] + (vs[idx["iowait"]] if "iowait" in idx else 0)
+                pts[ts] = max(0.0, min(100.0, 100.0 * (tot - idle) / tot))
+        out.append(("cpu", (fname + " " + (grp if len(grp) > 1 else "")).strip(), pts))
+    mem = collections.OrderedDict()
+    for i, n in enumerate(low):
+        for key, role in (("used", "used"), ("total", "total"), ("size", "total")):
+            if key in n:
+                mem.setdefault(n.replace(key, "", 1).strip("_- "), {})[role] = i
+                break
+    for grp, idx in mem.items():
+        if "used" in idx and "total" in idx:
+            pts = {}
+            for ts, vs in rows:
+                u = vs[idx["used"]] if idx["used"] < len(vs) else None
+                t = vs[idx["total"]] if idx["total"] < len(vs) else None
+                if u is not None and t:
+                    pts[ts] = max(0.0, min(100.0, 100.0 * u / t))
+            name = next((n for k, n in (("tmm", "TMM"), ("other", "other (control plane)"), ("swap", "swap"))
+                         if k in grp), grp if len(grp) > 1 else "")
+            out.append(("mem", (fname + " " + name).strip(), pts))
+    return [s for s in out if s[2]], bool(out)
+
+
+def f5_downsample(ts_list, series, maxn=240):
+    """Average blocks so a chart has at most maxn points. series: [[name, [values]]]."""
+    n = len(ts_list)
+    if n <= maxn:
+        return ts_list, series
+    k = -(-n // maxn)
+    out = []
+    for name, vals in series:
+        v2 = []
+        for i in range(0, n, k):
+            blk = [x for x in vals[i:i + k] if x is not None]
+            v2.append(sum(blk) / len(blk) if blk else None)
+        out.append([name, v2])
+    return [ts_list[i] for i in range(0, n, k)], out
+
+
+def f5_hist_chart(title, sers, maxlines=6):
+    """Line chart over the union of timestamps; with more than maxlines series: average, busiest and quietest."""
+    allts = sorted(set(ts for _, pts in sers for ts in pts))
+    if len(allts) < 2:
+        return None
+    series = [[lbl, [pts.get(ts) for ts in allts]] for lbl, pts in sers]
+    if len(series) > maxlines:
+        cols = list(zip(*[s[1] for s in series]))
+
+        def agg(fn):
+            return [fn([x for x in c if x is not None]) if any(x is not None for x in c) else None for c in cols]
+        series = [["average of %d cores" % len(series), agg(lambda xs: sum(xs) / len(xs))],
+                  ["busiest core", agg(max)], ["quietest core", agg(min)]]
+    ts2, series = f5_downsample(allts, series)
+    return {"title": title, "fmt": "pct", "t": [time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) for t in ts2],
+            "series": [[n, [None if x is None else round(x, 1) for x in v]] for n, v in series]}
+
+
+def f5_perf(sess, v):
+    t0 = time.time()
+    secs = ru_range(v.get("range"))
+    if secs > F5_PERF_MAX:
+        raise ValueError("BIG-IP performance history: up to 24 hours (24h)")
+    span, use_bash = ru_span(secs), bool(v.get("_ack"))
+    paths = collections.OrderedDict([("cpu", "/mgmt/tm/sys/cpu"), ("host", "/mgmt/tm/sys/host-info"),
+                                     ("mem", "/mgmt/tm/sys/memory"), ("perf", "/mgmt/tm/sys/performance/all-stats"),
+                                     ("version", "/mgmt/tm/sys/version")])
+    if not use_bash:
+        paths["proc"] = "/mgmt/tm/sys/proc-info"
+    script = ("echo '### NPROC'; nproc 2>/dev/null; "
+              "echo '### TOP'; COLUMNS=250 top -b -n 2 -d 1 2>/dev/null | awk '/^top -/{n++} n==2' | head -n 600; "
+              "echo '### DF'; df -P -k 2>/dev/null; "
+              "echo '### RRDLIST'; ls -1 /var/rrd 2>/dev/null | head -n 400; "
+              "for f in $(ls -1 /var/rrd 2>/dev/null | grep -iE 'cpu|mem' | head -n 64); do echo \"### RRD $f\"; "
+              "rrdtool fetch \"/var/rrd/$f\" AVERAGE -r %d -s -%d -e now 2>&1 | head -n 400; done"
+              % (max(10, secs // 240), secs))
+    with concurrent.futures.ThreadPoolExecutor(7) as ex:
+        futs = {k: ex.submit(rest_get, sess, p) for k, p in paths.items()}
+        f_bash = ex.submit(f5_bash, sess, script, 90) if use_bash else None
+    got, notes, tiles, charts, bars, findings = {}, [], [], [], [], []
+    for k, f in futs.items():
+        try:
+            st, ok, body = f.result()
+        except (urllib.error.URLError, OSError) as e:
+            st, ok, body = 0, False, str(getattr(e, "reason", e))
+        if ok and isinstance(body, dict):
+            got[k] = body
+        elif k not in ("proc", "host"):
+            notes.append("GET %s: HTTP %s" % (paths[k], st))
+    sections = {}
+    if f_bash:
+        audit(sess, "F5 util/bash read-only performance read (top, df, rrdtool fetch, %s)" % span)
+        try:
+            st, ok, out, bdata = f_bash.result()
+        except (urllib.error.URLError, OSError) as e:
+            st, ok, out, bdata = 0, False, "", {"message": str(getattr(e, "reason", e))}
+        if ok:
+            cur_key, buf = None, {}
+            for line in out.splitlines():
+                if line.startswith("### "):
+                    cur_key = line[4:].strip()
+                    buf[cur_key] = []
+                elif cur_key:
+                    buf[cur_key].append(line)
+            sections = {k: "\n".join(x) for k, x in buf.items()}
+        else:
+            notes.append(f5_bash_error(st, bdata, "util/bash performance read") + " History, processes, subsystems and "
+                         "disk are skipped; the current values come from read-only REST.")
+    if not got and not sections:
+        return {"ok": False, "error": "no performance data answered. " + " ".join(notes)}
+    data, rows = collections.OrderedDict(), []
+
+    # CPU now, per core: sys/cpu (or host-info) 5 s / 1 min / 5 min average idle %
+    cores = {}
+    for src in ("cpu", "host"):
+        for r in f5_stat_rows(got.get(src)):
+            if "cpuId" in r and ru_float(r.get("fiveSecAvgIdle")) is not None:
+                cid = int(ru_float(r["cpuId"]) or 0)
+                cores.setdefault(cid, {"core": cid, "now_pct": round(100 - ru_float(r["fiveSecAvgIdle"]), 1),
+                                       "1min_pct": round(100 - (ru_float(r.get("oneMinAvgIdle")) or 100), 1),
+                                       "5min_pct": round(100 - (ru_float(r.get("fiveMinAvgIdle")) or 100), 1),
+                                       "user_pct": r.get("fiveSecAvgUser", ""), "system_pct": r.get("fiveSecAvgSystem", ""),
+                                       "iowait_pct": r.get("fiveSecAvgIowait", "")})
+        if cores:
+            break
+    cores = [cores[k] for k in sorted(cores)]
+    ncpu = len(cores) or int(ru_float((sections.get("NPROC") or "").strip()) or 0) or None
+    if cores:
+        avg = sum(c["now_pct"] for c in cores) / len(cores)
+        avg5 = sum(c["5min_pct"] for c in cores) / len(cores)
+        busy = max(cores, key=lambda c: c["now_pct"])
+        tiles.append(ru_tile("Avg. CPU utilization", avg, "%d cores · 5 min average %.1f%%" % (len(cores), avg5)))
+        tiles.append(ru_tile("Busiest core", busy["now_pct"], "core %s · 5 min average %.1f%%" % (busy["core"], busy["5min_pct"])))
+        sev = ru_sev(avg5, 90, 80)
+        rows.append({"resource": "CPU (all cores)", "current": "%.1f%%" % avg, "detail": "5 min average %.1f%%" % avg5,
+                     "status": {"high": "HIGH", "medium": "warning"}.get(sev, "ok")})
+        if sev:
+            findings.append(finding(sev, "CPU", "Average CPU at %.0f%% over 5 minutes" % avg5))
+        if busy["5min_pct"] >= 95 and len(cores) > 1:
+            findings.append(finding("medium", "CPU core %s" % busy["core"], "One core at %.0f%% over 5 minutes" % busy["5min_pct"],
+                                    "each TMM thread is pinned to a core: one busy TMM can drop traffic while the "
+                                    "average looks fine"))
+        bars.append({"title": "CPU per core · now (5 s average)", "fmt": "pct",
+                     "rows": [["core %s" % c["core"], c["now_pct"]] for c in cores]})
+        data["cpu_cores"] = cores
+
+    # memory
+    mrow = next((r for src in ("mem", "host") for r in f5_stat_rows(got.get(src))
+                 if "memoryTotal" in r and "memoryUsed" in r), None)
+    mem_total = ru_float(mrow["memoryTotal"]) if mrow else None
+    for lbl, u, t, hi, med in (("Memory utilization", "memoryUsed", "memoryTotal", 95, 90),
+                               ("TMM memory", "tmmMemoryUsed", "tmmMemoryTotal", 95, 85),
+                               ("Other (control plane) memory", "otherMemoryUsed", "otherMemoryTotal", 95, 90),
+                               ("Swap", "swapUsed", "swapTotal", 50, 20)):
+        uu, tt = ru_float((mrow or {}).get(u)), ru_float((mrow or {}).get(t))
+        if uu is None or not tt:
+            continue
+        pct = 100.0 * uu / tt
+        sev = ru_sev(pct, hi, med)
+        rows.append({"resource": lbl, "current": "%.1f%%" % pct, "detail": "%s of %s" % (f5_bytes(uu), f5_bytes(tt)),
+                     "status": {"high": "HIGH", "medium": "warning"}.get(sev, "ok")})
+        tiles.append(ru_tile(lbl, pct, "%s of %s" % (f5_bytes(uu), f5_bytes(tt)), hi, med))
+        if sev:
+            findings.append(finding(sev, lbl, "%s at %.0f%%" % (lbl, pct),
+                                    "swap in use means the control plane is short of memory" if u == "swapUsed" else ""))
+
+    # read-only averages (current / 3 hours / 24 hours / ...) from sys performance all-stats
+    perf_rows = [r for r in f5_stat_rows(got.get("perf")) if any(isinstance(x, str) for x in r.values())]
+    if perf_rows:
+        data["performance_averages"] = perf_rows
+
+    # processes and subsystems
+    procs, proc_src = (f5_top_parse(sections["TOP"]) if "TOP" in sections else []), "top, 1 s sample"
+    if not procs and got.get("proc"):
+        for r in f5_stat_rows(got["proc"]):
+            name = first(r, "procName", "name", "command")
+            if not name:
+                continue
+            cpu_k = next((k for k in r if re.match(r"cpuUsage(Recent|5sec|Now|Current)", k)), None) or \
+                next((k for k in r if k.lower().startswith("cpu")), None)
+            mem_k = next((k for k in r if k.lower() in ("rss", "residentsetsize", "memoryusage", "rssbytes")), None) or \
+                next((k for k in r if k.lower() in ("vsize", "virtualsize")), None)
+            procs.append({"pid": r.get("pid", ""), "user": "", "name": str(name),
+                          "cpu_pct": ru_float(r.get(cpu_k)) or 0.0, "res_bytes": ru_float(r.get(mem_k)) or 0.0})
+        proc_src = "sys proc-info"
+    if procs:
+        bars.append({"title": "Top 10 processes by CPU (% of one core, " + proc_src + ")", "fmt": "pct",
+                     "rows": [["%s (%s)" % (p["name"], p["pid"]), round(p["cpu_pct"], 1)]
+                              for p in sorted(procs, key=lambda p: -p["cpu_pct"])[:10]]})
+        bars.append({"title": "Top 10 processes by memory (resident)", "fmt": "bytes",
+                     "rows": [["%s (%s)" % (p["name"], p["pid"]), p["res_bytes"]]
+                              for p in sorted(procs, key=lambda p: -p["res_bytes"])[:10]]})
+        sub_cpu, sub_mem = collections.Counter(), collections.Counter()
+        for p in procs:
+            s = f5_subsys(p["name"])
+            sub_cpu[s] += p["cpu_pct"]
+            sub_mem[s] += p["res_bytes"]
+        div = float(ncpu or 1)
+        crow = [[k, round(x / div, 2)] for k, x in sub_cpu.most_common() if x > 0]
+        crow.append(["idle", round(max(0.0, 100 - sum(sub_cpu.values()) / div), 2)])
+        bars.append({"title": "Subsystem CPU utilization (%% of all %s cores)" % (ncpu or "?"), "fmt": "pct", "rows": crow})
+        mrows = [[k, x] for k, x in sub_mem.most_common() if x > 0]
+        if mem_total:
+            mrows.append(["not resident in a process (free, cache)", max(0.0, mem_total - sum(sub_mem.values()))])
+        bars.append({"title": "Subsystem memory utilization (resident)", "fmt": "bytes", "rows": mrows})
+        data["top_processes"] = [{"process": p["name"], "pid": p["pid"], "user": p["user"], "cpu_pct": round(p["cpu_pct"], 1),
+                                  "resident": f5_bytes(p["res_bytes"]), "subsystem": f5_subsys(p["name"])}
+                                 for p in sorted(procs, key=lambda p: -p["cpu_pct"])[:25]]
+        notes.append("Subsystems are grouped by process name: tmm = traffic, bd / asm = waf, dosl7d = l7_dos, avrd / monpd "
+                     "= log_analytics, pccd / autodosd = fw, mcpd / restjavad ... = control plane. TMM busy-polls on "
+                     "Virtual Edition, so top can show it busier than the TMM CPU in 'show sys tmm-info'.")
+
+    # disk
+    disks = f5_df_parse(sections["DF"]) if "DF" in sections else []
+    for d in disks:
+        sev = ru_sev(d["use_pct"], 90, 80)
+        d["status"] = {"high": "HIGH", "medium": "warning"}.get(sev, "ok")
+        if sev:
+            findings.append(finding(sev, "Disk %s" % d["mounted_on"], "%s is %d%% full" % (d["mounted_on"], d["use_pct"]),
+                                    "%s used of %s, %s free" % (d["used"], d["size"], d["available"])))
+    if disks:
+        worst = max(disks, key=lambda d: d["use_pct"])
+        tiles.append(ru_tile("Disk use (fullest)", worst["use_pct"], worst["mounted_on"]))
+        bars.append({"title": "Disk use by partition", "fmt": "pct",
+                     "rows": [[d["mounted_on"], d["use_pct"]] for d in sorted(disks, key=lambda d: -d["use_pct"])]})
+
+    # history from the BIG-IP's own RRD files (the data behind the GUI performance graphs)
+    cpu_s, mem_s, unknown = [], [], []
+    for key, txt in sections.items():
+        if key.startswith("RRD "):
+            names, rrows = f5_rrd_parse(txt)
+            if not rrows:
+                continue
+            ser, known = f5_rrd_series(key[4:], names, rrows)
+            for kind, label, pts in ser:
+                (cpu_s if kind == "cpu" else mem_s).append((label, pts))
+            if not known:
+                unknown.append("%s (%s)" % (key[4:], ", ".join(names[:8])))
+    if cpu_s:
+        total = [s for s in cpu_s if not re.search(r"\d", s[0])][:1]
+        per = sorted([s for s in cpu_s if re.search(r"\d", s[0])],
+                     key=lambda s: [int(x) for x in re.findall(r"\d+", s[0])])
+        c = f5_hist_chart("CPU utilization · %s (%%)" % span, total + per if len(per) <= 5 else per)
+        if c:
+            charts.append(c)
+        hist = [{"cpu": lbl, "average_pct": round(sum(p.values()) / len(p), 1), "max_pct": round(max(p.values()), 1)}
+                for lbl, p in total + per if p]
+        if hist:
+            data["cpu_history"] = hist
+            hot = max(hist, key=lambda h: h["max_pct"])
+            if hot["max_pct"] >= 95:
+                findings.append(finding("medium", hot["cpu"], "Peaked at %.0f%% in the %s" % (hot["max_pct"], span),
+                                        "average %.1f%%" % hot["average_pct"]))
+        src = total[0][1] if total else (c and dict(zip(range(len(c["t"])), c["series"][0][1])))
+        if src:
+            spark = [x for _, x in sorted(src.items()) if x is not None][-120:]
+            for t_ in tiles:
+                if t_["label"] == "Avg. CPU utilization":
+                    t_["spark"] = [round(x, 1) for x in spark]
+    if mem_s:
+        c = f5_hist_chart("Memory utilization · %s (%%)" % span, mem_s)
+        if c:
+            charts.append(c)
+            for t_ in tiles:
+                if t_["label"] == "Memory utilization":
+                    t_["spark"] = [x for x in c["series"][0][1] if x is not None][-120:]
+    if unknown:
+        notes.append("RRD files read but not charted (data source names not recognised): %s." % "; ".join(unknown[:12]))
+    if sections and not cpu_s and not mem_s:
+        notes.append("No CPU / memory history found in /var/rrd (files: %s)." %
+                     (", ".join((sections.get("RRDLIST") or "").split()[:40]) or "none"))
+
+    data = collections.OrderedDict([("utilization", rows)] + list(data.items()))
+    if disks:
+        data["disk"] = disks
+    ver = next((r for r in f5_stat_rows(got.get("version")) if "Version" in r), None)
+    if ver:
+        notes.insert(0, "%s %s (build %s)" % (ver.get("Product") or "BIG-IP", ver.get("Version", ""), ver.get("Build", "")))
+    if use_bash:
+        notes.insert(0, "History: the %s from the BIG-IP's own RRD files (/var/rrd, the data behind the GUI performance "
+                        "graphs), read with fixed read-only commands (rrdtool fetch, top, df) through util/bash." % span)
+    else:
+        notes.insert(0, "Read-only REST only: current CPU per core, memory and the performance averages. Tick the "
+                        "confirmation box in 'F5 active tools' (Administrator role) to add the %s of CPU / memory "
+                        "history, top processes, subsystem CPU / memory and disk use; that runs fixed, read-only "
+                        "commands (rrdtool fetch, top, df) through util/bash." % span)
+    notes.append("Thresholds: average CPU (5 min) warn at 80%, high at 90%; memory warn at 90%, high at 95%; TMM memory "
+                 "warn at 85%; swap warn at 20%; disk warn at 80%, high at 90%.")
+    pick = lambda name: next((r["current"] for r in rows if r["resource"] == name), "n/a")
+    label = "CPU %s · MEMORY %s · TMM MEMORY %s · %s" % (pick("CPU (all cores)"), pick("Memory utilization"),
+                                                        pick("TMM memory"), span.upper())
+    reqs = ["GET " + p for p in paths.values()] + (["bash: " + script] if use_bash else [])
+    out = ru_result(t0, " + ".join(reqs), tiles, charts, findings, data, notes, label)
+    out["bars"] = bars
+    return out
+
+
+F5_VS_SORT = {"current": "clientside.curConns", "total": "clientside.totConns", "max": "clientside.maxConns",
+              "bits": "_bits", "packets": "_pkts"}
+
+
+def f5_vs_top(sess, v):
+    """Virtual servers ranked by connections or traffic, from /mgmt/tm/ltm/virtual/stats (counters since last reset)."""
+    t0 = time.time()
+    by = str(v.get("by") or "current").strip().lower()
+    if by not in F5_VS_SORT:
+        raise ValueError("sort by one of: " + ", ".join(F5_VS_SORT))
+    top = num(v.get("top") or "20", 1, 500, 20, "how many")
+    ok, d = f5_get(sess, "/mgmt/tm/ltm/virtual/stats")
+    if not ok:
+        raise ValueError("could not read virtual server stats (%s)" % str(d)[:200])
+
+    def n(x):
+        try:
+            return int(float(x))
+        except (TypeError, ValueError):
+            return 0
+    rows = []
+    for r in f5_stat_rows(d):
+        name = r.get("tmName")
+        if not name or "clientside.curConns" not in r:
+            continue
+        bits = n(r.get("clientside.bitsIn")) + n(r.get("clientside.bitsOut"))
+        pkts = n(r.get("clientside.pktsIn")) + n(r.get("clientside.pktsOut"))
+        dest = str(r.get("destination") or "").rsplit("/", 1)[-1]
+        rows.append({"vs_name": name, "destination": re.sub(r"%\d+", "", dest),
+                     "current_connections": n(r.get("clientside.curConns")),
+                     "max_connections": n(r.get("clientside.maxConns")),
+                     "total_connections": n(r.get("clientside.totConns")),
+                     "traffic_in": cf_fmt_bytes(n(r.get("clientside.bitsIn")) // 8),
+                     "traffic_out": cf_fmt_bytes(n(r.get("clientside.bitsOut")) // 8),
+                     "availability": r.get("status.availabilityState", ""), "enabled": r.get("status.enabledState", ""),
+                     "_bits": bits, "_pkts": pkts})
+    key = F5_VS_SORT[by]
+    keymap = {"clientside.curConns": "current_connections", "clientside.totConns": "total_connections",
+              "clientside.maxConns": "max_connections"}
+    rows.sort(key=lambda x: x[keymap.get(key, key)], reverse=True)
+    total = len(rows)
+    rows = rows[:top]
+    for i, x in enumerate(rows, 1):
+        x["rank"] = i
+        x.pop("_bits"), x.pop("_pkts")
+    rows = [dict([("rank", x.pop("rank"))] + list(x.items())) for x in rows]
+    what = {"current": "current connections", "total": "total connections", "max": "max connections",
+            "bits": "traffic (bits in + out)", "packets": "packets (in + out)"}[by]
+    summary = []
+    if rows:
+        summary.append("Busiest by %s: %s (%s current, %s total connections) out of %d virtual server(s)." % (
+            what, rows[0]["vs_name"], rows[0]["current_connections"], rows[0]["total_connections"], total))
+    summary.append("Total, max and traffic counters run since the last stats reset or reboot; current connections are live.")
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "GET /mgmt/tm/ltm/virtual/stats",
+            "data": {"virtual_servers": rows}, "summary": summary,
+            "verdict": {"label": "TOP %d OF %d VIRTUAL SERVERS BY %s" % (len(rows), total, what.upper()), "kind": "info"}}
+
+
+PAN_REPORT_PERIODS = collections.OrderedDict([("last-15-minutes", 900), ("last-hour", 3600), ("last-6-hrs", 21600),
+                                             ("last-12-hrs", 43200), ("last-24-hrs", 86400), ("last-7-days", 604800),
+                                             ("last-30-days", 2592000)])
+
+
+def pan_report(sess, name, period, topn, timeout=120):
+    """PAN-OS dynamic report (ACC summary database) -> list of {field: text} entries. Waits for the job if the
+    firewall answers asynchronously."""
+    q = {"type": "report", "reporttype": "dynamic", "reportname": name, "period": period, "topn": str(topn)}
+    st, raw = http(sess, "POST", "/api/", {"X-PAN-KEY": sess["key"], "Content-Type": "application/x-www-form-urlencoded"},
+                   urllib.parse.urlencode(q).encode(), timeout)
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        raise ValueError("the firewall's answer to the %s report was not XML (HTTP %s)" % (name, st))
+    if root.get("status") == "error":
+        raise ValueError("the firewall refused the %s report: %s" % (
+            name, " ".join(t.strip() for t in root.itertext() if t.strip())[:300]))
+    job = root.findtext(".//job")
+    end = time.time() + timeout
+    while job and root.find(".//entry") is None and time.time() < end:
+        time.sleep(2)
+        st, raw = http(sess, "POST", "/api/", {"X-PAN-KEY": sess["key"],
+                       "Content-Type": "application/x-www-form-urlencoded"},
+                       urllib.parse.urlencode({"type": "report", "action": "get", "job-id": job}).encode(), timeout)
+        root = ET.fromstring(raw)
+        if (root.findtext(".//status") or "").upper() == "FIN":
+            break
+    return [{c.tag: (c.text or "").strip() for c in e} for e in root.iter("entry")]
+
+
+def pan_app_traffic(sess, v):
+    """Sessions and bytes per application over the whole period, from the summary database (not a log sample)."""
+    t0 = time.time()
+    period = str(v.get("period") or "last-24-hrs").strip()
+    if period not in PAN_REPORT_PERIODS:
+        raise ValueError("time range: one of " + ", ".join(PAN_REPORT_PERIODS))
+    app = str(v.get("app") or "").strip().lower()
+    if app and not re.match(r"^[\w.+-]{1,64}$", app):
+        raise ValueError("invalid application name")
+    top = num(v.get("top") or "50", 1, 500, 50, "how many")
+    ents = pan_report(sess, "top-app-summary", period, 500 if app else top)
+    secs = PAN_REPORT_PERIODS[period]
+
+    def n(e, *keys):
+        for k in keys:
+            try:
+                return int(float(e.get(k) or ""))
+            except ValueError:
+                pass
+        return 0
+    rows, total_b, total_s = [], 0, 0
+    for e in ents:
+        name = e.get("name") or e.get("app") or e.get("application") or ""
+        if not name:
+            continue
+        b, ss = n(e, "nbytes", "bytes"), n(e, "nsess", "sessions", "count", "repeatcnt")
+        total_b, total_s = total_b + b, total_s + ss
+        if app and not (app in name.lower() or (app == "http" and (name == "web-browsing" or name.startswith("http")))):
+            continue
+        rows.append({"application": name, "sessions": ss, "bytes": cf_fmt_bytes(b),
+                     "average_per_hour": cf_fmt_bytes(b * 3600 // secs) if b else "0",
+                     "average_rate": "%.2f Mbit/s" % (b * 8.0 / secs / 1e6),
+                     "share_of_traffic": "", "category": e.get("app-category") or e.get("category") or "",
+                     "risk": e.get("risk") or e.get("risk-of-app") or "", "_b": b})
+    rows.sort(key=lambda r: r["_b"], reverse=True)
+    rows = rows[:top]
+    for r in rows:
+        r["share_of_traffic"] = "%.1f%%" % (100.0 * r["_b"] / total_b) if total_b else ""
+        r.pop("_b")
+    summary = ["Period %s (%d h). Totals from the firewall's summary database, so the whole period is counted, not a "
+               "log sample." % (period, secs // 3600 or 1)]
+    if rows:
+        r0 = rows[0]
+        summary.insert(0, "%s: %s in %s sessions, on average %s per hour (%s)." % (
+            r0["application"], r0["bytes"], "{:,}".format(r0["sessions"]), r0["average_per_hour"], r0["average_rate"]))
+    if app == "http" or "web-browsing" in app:
+        summary.append("HTTP is the application web-browsing; HTTPS that is not decrypted is 'ssl' (look it up with "
+                       "application ssl).")
+    if not ents:
+        summary.append("The report came back empty: the summary database may be disabled, or the account may not "
+                       "read reports.")
+    label = ("%s · %s" % (rows[0]["application"].upper(), rows[0]["bytes"]) if app and rows else
+             "NO TRAFFIC FOR APPLICATION '%s'" % app.upper() if app else "TOP %d APPLICATIONS" % len(rows))
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
+            "request": "report top-app-summary " + period, "data": {"applications": rows}, "summary": summary,
+            "verdict": {"label": label + " · " + period.upper(), "kind": "info" if rows else "warn"}}
+
+
 PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_routes, "pan_sessions": pan_sessions,
-                "pan_resources": pan_resources, "fg_resources": fg_resources}
+                "pan_resources": pan_resources, "fg_resources": fg_resources,
+                "f5_perf": f5_perf, "f5_vs_top": f5_vs_top, "pan_app_traffic": pan_app_traffic}
 
 
 def do_ipcheck(b):
@@ -2307,8 +2924,15 @@ def do_ipcheck(b):
         return {"ok": False, "error": "device not connected"}
     t0 = time.time()
     try:
-        ip = parse_ip(b.get("ip"), "IP address")
         v = sess["vendor"]
+        if v in ("paloalto", "fortigate") and b.get("mode", "refs") == "refs" and "/" in str(b.get("ip") or ""):
+            ip = parse_ip_or_net(b.get("ip"), "IP address")   # a subnet: objects / rules that overlap it
+            if ip.prefixlen == ip.max_prefixlen:
+                ip = ip.network_address
+        elif "/" in str(b.get("ip") or ""):
+            raise ValueError("a subnet works for the Palo Alto / FortiGate reference lookup only; enter one IP address here")
+        else:
+            ip = parse_ip(b.get("ip"), "IP address")
         audit(sess, "IP lookup " + str(ip))
         if v == "f5":
             res, summary, verdict = f5_lookup(sess, ip)
@@ -2338,8 +2962,6 @@ def do_ipcheck(b):
                 flow = {"src": str(src), "dst": str(dst), "port": port, "proto": proto,
                         "from": pstr(b.get("from"), "from zone"), "to": pstr(b.get("to"), "to zone"),
                         "srcintf": pstr(b.get("srcintf"), "ingress interface")}
-                if v == "fortigate" and not flow["srcintf"]:
-                    raise ValueError("ingress interface is required for the FortiGate verdict")
             if v == "paloalto":
                 res, summary, verdict = pan_lookup(sess, ip, pstr(b.get("vsys"), "vsys") or "vsys1", flow,
                                                    mode == "refs")
@@ -2351,6 +2973,396 @@ def do_ipcheck(b):
         return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
     return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
             "request": "IP lookup %s" % ip, "data": res, "summary": summary, "verdict": verdict}
+
+
+# ---- Flow trace: one flow followed along the path Cloudflare -> FortiGate DMZ -> F5 DMZ -> Palo Alto ---------------
+# Each device is tested with the addresses it really sees: after Cloudflare proxying (source = a Cloudflare edge
+# address, destination = the origin IP), after the FortiGate VIP (destination = the mapped F5 virtual address) and
+# after the F5 (source = its SNAT address, destination = the pool members).
+FLOW_STAGE = {"cloudflare": (1, "1 Edge · Cloudflare"), "fortigate": (2, "2 DMZ firewall · FortiGate"),
+              "f5": (3, "3 DMZ load balancer · F5"), "paloalto": (4, "4 Internal firewall · Palo Alto")}
+FLOW_PAN_PERIOD = {"last 15 minutes": "last-15-minutes", "last hour": "last-hour", "last 6 hours": "last-6-hrs",
+                   "last 12 hours": "last-12-hrs", "last 24 hours": "last-24-hrs"}
+FLOW_MAX_LEGS = 3   # address pairs carried to the next device (several origin IPs, VIPs or pool members)
+
+
+def flow_hop(sess, check, r, details=None):
+    """One row of the trace from a lookup result."""
+    v = r.get("verdict") if isinstance(r.get("verdict"), dict) else {}
+    ok = bool(r.get("ok"))
+    st = FLOW_STAGE.get(sess["vendor"], (9, "?"))
+    return {"order": st[0], "layer": st[1], "device": sess.get("name") or sess["host"], "vendor": sess["vendor"],
+            "check": check, "result": v.get("label", "") if ok else "NOT CHECKED: %s" % str(r.get("error") or "failed")[:300],
+            "state": (v.get("kind") or "info") if ok else "warn",
+            "details": "; ".join(str(x) for x in (details or [])[:6] if x)[:900]}
+
+
+def flow_leg(src, dst, port, via=""):
+    return {"src": src or "", "dst": dst, "port": str(port or ""), "via": via}
+
+
+def flow_to(l):
+    return l["dst"] + (":" + l["port"] if l["port"] else "")
+
+
+def flow_txt(l):
+    return "%s -> %s" % (l["src"] or "?", flow_to(l))
+
+
+def flow_dedupe(legs):
+    out, seen = [], set()
+    for l in legs:
+        k = (l["src"], l["dst"], l["port"])
+        if k not in seen:
+            seen.add(k)
+            out.append(l)
+    return out
+
+
+def flow_trace_cf(sess, sid, src, host, within):
+    """-> (hops, origin IPs, Cloudflare edge address if the host is proxied, else '')"""
+    hops, ips, edge = [], [], ""
+    if host:
+        r = do_cf({"id": sid, "mode": "dns", "name": host})
+        recs = [x for x in ((r.get("data") or {}).get("dns_records") or []) if str(x.get("name")).lower() == host]
+        prox = any(x.get("proxied") for x in recs if x.get("type") in ("A", "AAAA", "CNAME"))
+        if r.get("ok"):
+            r["verdict"] = ({"label": "%s: %d DNS record(s), %s" % (host, len(recs), "PROXIED through Cloudflare" if prox
+                                                                      else "DNS only (not proxied)"), "kind": "ok"} if recs else
+                            {"label": "%s is not in the Cloudflare zones this token sees" % host, "kind": "info"})
+            ips += [x["content"] for x in recs if x.get("type") in ("A", "AAAA")]
+        if prox:
+            try:
+                nets = [n for n in cf_edge_nets(sess) if n.version == 4] or cf_edge_nets(sess)
+                edge = str(nets[0].network_address + 1) if nets else ""
+            except (urllib.error.URLError, OSError, ValueError, KeyError):
+                edge = ""
+            edge = edge or "173.245.48.1"   # in Cloudflare's long-published 173.245.48.0/20 edge range
+        hops.append(flow_hop(sess, "DNS record", r, ["%s %s -> %s%s" % (x["name"], x["type"], x["content"],
+                                                                        " (proxied)" if x.get("proxied") else "")
+                                                     for x in recs]))
+    if src:
+        r = do_cf(dict({"id": sid, "mode": "events", "ip": src, "within": within, "top": "50"},
+                       **({"host": host} if host else {})))
+        ev = (r.get("data") or {}).get("events") or []
+        if r.get("ok"):
+            blocked = [e for e in ev if e.get("action") in CF_BLOCK]
+            r["verdict"] = ({"label": "BLOCKED: %d of %d security event(s) for %s are blocks" % (len(blocked), len(ev), src),
+                             "kind": "bad"} if blocked else
+                            {"label": "%d security event(s) for %s, none blocking" % (len(ev), src), "kind": "ok"} if ev else
+                            {"label": "no security events for %s (%s)" % (src, within), "kind": "ok"})
+        hops.append(flow_hop(sess, "WAF / firewall events", r, ["%s %s %s (rule %s, ray %s)" % (
+            e.get("time", ""), e.get("action", ""), e.get("url") or e.get("host", ""), e.get("description") or e.get("rule_id", ""),
+            e.get("ray_id", "")) for e in sorted(ev, key=lambda e: e.get("action") not in CF_BLOCK)]))
+    return hops, ips, edge
+
+
+def flow_fw_verdict(sess, sid, leg, proto, within, logs, log_src=True):
+    """Policy verdict (+ traffic log) of one firewall for one leg -> (hops, matched policy / rule dict)."""
+    v = sess["vendor"]
+    if not leg["src"]:
+        return [flow_hop(sess, "Policy ? -> %s" % flow_to(leg), {"ok": False, "error": "source IP unknown: enter the client IP"})], {}
+    r = do_ipcheck({"id": sid, "ip": leg["src"], "peer": leg["dst"], "mode": "verdict", "role": "source",
+                    "port": leg["port"], "proto": proto})
+    ft = (r.get("data") or {}).get("flow_test") or {}
+    pol = ft.get("matched_policy") or ft.get("matched_rule") or {}
+    hops = [flow_hop(sess, "Policy " + flow_txt(leg), r, ([leg["via"]] if leg["via"] else []) + list(r.get("summary") or [])
+                     + list((r.get("data") or {}).get("notes") or []))]
+    if logs:
+        q = {"id": sid, "dest_ip": leg["dst"], "count": "50"}
+        if log_src:
+            q["ip"] = leg["src"]
+        lr = (do_pan_logs(dict(q, log_type="traffic", period=FLOW_PAN_PERIOD.get(within, "last-24-hrs"))) if v == "paloalto"
+              else do_fg_logs(dict(q, log_source="disk", within=within)))
+        ent = (lr.get("data") or {}).get("entries") or []
+        hops.append(flow_hop(sess, "Traffic log %s -> %s" % (leg["src"] if log_src else "any", leg["dst"]), lr, [
+            "%s %s -> %s:%s %s %s" % (e.get("time") or e.get("date_time", ""), e.get("source_ip", ""), e.get("destination_ip", ""),
+                                      e.get("to_port") or e.get("destination_port", ""), e.get("action") or e.get("result", ""),
+                                      e.get("rule") or e.get("policy", "")) for e in ent]))
+    return hops, pol
+
+
+def flow_fg_vip(vips, leg):
+    """FortiGate Virtual IP whose external address (and port, with port forwarding) matches the leg -> (vip, next leg)."""
+    try:
+        ip = ipaddress.ip_address(leg["dst"])
+    except ValueError:
+        return None, None
+    for v in vips or []:
+        if not ip_in_spec(ip, str(v.get("extip") or "")):
+            continue
+        fwd = v.get("portforward") == "enable"
+        if fwd and leg["port"]:
+            lo, _, hi = str(v.get("extport") or "").partition("-")
+            if not (lo.strip().isdigit() and int(lo) <= int(leg["port"]) <= int(hi or lo)):
+                continue
+        mapped = [str(m.get("range", "")) for m in as_list(v.get("mappedip")) if m.get("range")]
+        if not mapped:
+            continue
+        mip = mapped[0].split("-")[0].strip()
+        mport = str(v.get("mappedport") or "").split("-")[0].strip() if fwd and v.get("mappedport") else leg["port"]
+        nxt = flow_leg(leg["src"], mip, mport)
+        nxt["via"] = "FortiGate VIP %s: %s -> %s" % (v.get("name"), flow_to(leg), flow_to(nxt))
+        return v, nxt
+    return None, None
+
+
+def flow_trace_fg(sess, sid, legs, proto, within, logs, proxied):
+    hops, out = [], []
+    vips = fg_cmdb(sess, "vip", "")
+    for leg in legs[:FLOW_MAX_LEGS]:
+        h, pol = flow_fw_verdict(sess, sid, leg, proto, within, logs, log_src=not proxied)
+        if pol.get("nat") == "enable":
+            h[0]["details"] = ("Policy also does source NAT (nat enable): the F5 sees the FortiGate's address. "
+                               + h[0]["details"])[:900]
+        hops += h
+        v, nxt = flow_fg_vip(vips, leg)
+        if vips is None:
+            hops.append(flow_hop(sess, "VIP for %s" % flow_to(leg), {"ok": False, "error": "could not read firewall/vip"}))
+        elif v:
+            hops.append(flow_hop(sess, "VIP for %s" % flow_to(leg), {"ok": True, "verdict": {
+                "label": "VIP %s maps %s -> %s" % (v.get("name"), flow_to(leg), flow_to(nxt)), "kind": "ok"}},
+                ["external interface %s" % v.get("extintf"), "port forward %s" % (v.get("portforward") or "disable"),
+                 v.get("comment")]))
+        else:
+            hops.append(flow_hop(sess, "VIP for %s" % flow_to(leg), {"ok": True, "verdict": {
+                "label": "no VIP for %s: destination passed on unchanged" % flow_to(leg), "kind": "info"}}))
+        out.append(nxt or leg)
+    return hops, out
+
+
+def flow_f5_snat(sess, v, member_ip, fallback):
+    """The source address the F5 uses towards a pool member -> (ip, how)."""
+    sat = v.get("sourceAddressTranslation") or {}
+    t = str(sat.get("type") or "none")
+    if t == "automap":
+        ok, d = f5_get(sess, "/mgmt/tm/net/self")
+        best = None
+        for s in (d.get("items") or []) if ok else []:
+            a = str(s.get("address") or "")
+            ipm = strip_rd(a.split("/")[0]) + ("/" + a.split("/")[1] if "/" in a else "")
+            try:
+                net = ipaddress.ip_interface(ipm)
+                if ipaddress.ip_address(member_ip) in net.network:
+                    cand = (s.get("floating") == "enabled", str(net.ip))
+                    best = max(best, cand) if best else cand
+            except ValueError:
+                continue
+        if best:
+            return best[1], "SNAT automap (%s self IP %s)" % ("floating" if best[0] else "non-floating", best[1])
+        return "", "SNAT automap, but no self IP is in the pool member's subnet (routed): the source address is not known"
+    if t == "snat" and sat.get("pool"):
+        ok, d = f5_get(sess, "/mgmt/tm/ltm/snatpool/" + str(sat["pool"]).replace("/", "~"))
+        mem = [strip_rd(str(m).rsplit("/", 1)[-1]) for m in as_list(d.get("members"))] if ok else []
+        if mem:
+            return mem[0], "SNAT pool %s (%s)" % (sat["pool"], ", ".join(mem[:4]))
+        return "", "SNAT pool %s could not be read" % sat["pool"]
+    return fallback, "no SNAT: the source address is passed on unchanged"
+
+
+def flow_trace_f5(sess, sid, legs, src, host, within, logs, proxied):
+    hops, out, hp = [], [], {}
+    if host:
+        r = do_f5_host({"id": sid, "hostname": host})
+        ent = [e for e in ((r.get("data") or {}).get("entries") or []) if e.get("destination")]
+        hp = {e["virtual_server"]: e.get("forwards_to_pool") for e in ent if e.get("forwards_to_pool")}
+        hops.append(flow_hop(sess, "Hostname -> virtual server", r, ["%s (%s) pool %s" % (
+            e["virtual_server"], e["destination"], e.get("forwards_to_pool") or e.get("default_pool") or "-") for e in ent]))
+    ok, dv = f5_get(sess, "/mgmt/tm/ltm/virtual")
+    if not ok:
+        return hops + [flow_hop(sess, "Virtual server", {"ok": False, "error": "could not read virtual servers"})], legs
+    for leg in legs[:FLOW_MAX_LEGS]:
+        vss = [v for v in dv.get("items") or [] if f5_dest_ip(v.get("destination")) == leg["dst"]
+               and (not leg["port"] or f5_member_port(v.get("destination")) in (leg["port"], "0", "any"))]
+        if not vss:
+            hops.append(flow_hop(sess, "Virtual server for %s" % flow_to(leg), {"ok": True, "verdict": {
+                "label": "no virtual server listens on %s: the F5 is not in this path, or the address is wrong" % flow_to(leg),
+                "kind": "warn"}}, [leg["via"]]))
+            out.append(leg)
+            continue
+        for v in vss[:2]:
+            pool = hp.get(v.get("fullPath")) or v.get("pool") or ""
+            mem = []
+            if pool:
+                okm, dm = f5_get(sess, "/mgmt/tm/ltm/pool/%s/members" % pool.replace("/", "~"))
+                mem = (dm.get("items") or []) if okm else []
+            up = [m for m in mem if str(m.get("state", "")).lower() in ("up", "unchecked", "checking")
+                  and "disabled" not in str(m.get("session", ""))]
+            off = v.get("disabled") is True or v.get("enabled") is False
+            label = "%s (%s) %s · pool %s: %d of %d member(s) up" % (
+                v.get("fullPath"), v.get("destination"), "DISABLED" if off else "enabled", pool or "(none)", len(up), len(mem))
+            kind = "bad" if off or (mem and not up) or not pool else "warn" if len(up) < len(mem) else "ok"
+            first_ip = strip_rd(str((up or mem or [{}])[0].get("address") or ""))
+            snat, how = flow_f5_snat(sess, v, first_ip, leg["src"]) if first_ip else ("", "")
+            hops.append(flow_hop(sess, "Virtual server for %s" % flow_to(leg),
+                                 {"ok": True, "verdict": {"label": label, "kind": kind}},
+                                 ([leg["via"]] if leg["via"] else []) + [how] +
+                                 ["member %s state %s %s" % (m.get("name"), m.get("state"), m.get("session", "")) for m in mem]))
+            for m in (up or mem)[:FLOW_MAX_LEGS]:
+                out.append(flow_leg(snat, strip_rd(str(m.get("address") or "")), f5_member_port(m.get("name")),
+                                    "F5 %s -> pool member %s (%s)" % (v.get("fullPath"), m.get("name"), how)))
+    if src and logs:
+        # Behind Cloudflare the F5 sees Cloudflare's address; the client is in a header (X-Forwarded-For / True-Client-IP).
+        q = {"id": sid, "mode": "search", "top": "50", "within": within, ("header_ip" if proxied else "ip"): src}
+        if host:
+            q["hostname"] = host
+        r = do_f5_asm(q)
+        rq = (r.get("data") or {}).get("requests") or []
+        if r.get("ok"):
+            bl = [x for x in rq if str(x.get("status", "")).lower() == "blocked"]
+            r["verdict"] = ({"label": "BLOCKED: %d of %d WAF request(s) from %s" % (len(bl), len(rq), src), "kind": "bad"}
+                            if bl else {"label": "%d WAF request(s) from %s, none blocked" % (len(rq), src), "kind": "ok"})
+        hops.append(flow_hop(sess, "WAF (ASM) log", r, ["%s %s %s%s support ID %s: %s" % (
+            x.get("time", ""), x.get("status", ""), x.get("hostname", ""), x.get("url", ""), x.get("support_id", ""),
+            x.get("block_reason", "")) for x in sorted(rq, key=lambda x: str(x.get("status", "")).lower() != "blocked")]))
+    return hops, out
+
+
+def flow_trace_pa(sess, sid, legs, proto, within, logs):
+    hops = []
+    for leg in legs[:FLOW_MAX_LEGS]:
+        hops += flow_fw_verdict(sess, sid, leg, proto, within, logs)[0]
+    return hops, legs
+
+
+def flow_resolve_host(by, src, host, port):
+    """No Cloudflare answer: start from the F5 virtual server of the hostname, mapped back through the FortiGate VIP."""
+    legs = []
+    for k, s in by("f5"):
+        r = do_f5_host({"id": k, "hostname": host})
+        for e in (r.get("data") or {}).get("entries") or []:
+            if e.get("destination"):
+                legs.append(flow_leg(src, f5_dest_ip(e["destination"]), port, "F5 virtual server %s" % e["virtual_server"]))
+    for k, s in by("fortigate"):
+        vips = fg_cmdb(s, "vip", "") or []
+        for i, l in enumerate(legs):
+            for v in vips:
+                ext = str(v.get("extip") or "")
+                if ext and "-" not in ext and any(strip_rd(str(m.get("range", ""))).split("-")[0].strip() == l["dst"]
+                                                  for m in as_list(v.get("mappedip"))):
+                    legs[i] = flow_leg(src, ext, port, "external address of FortiGate VIP %s" % v.get("name"))
+    return legs
+
+
+def do_flow_trace(b):
+    t0 = time.time()
+    src = str(b.get("src") or "").strip()
+    if src:
+        src = str(parse_ip(src, "Source IP"))
+    dst = str(b.get("dst") or "").strip().lower().rstrip(".")
+    if not dst:
+        raise ValueError("enter the destination: an IP address or a hostname")
+    try:
+        dst_ip, host = str(ipaddress.ip_address(dst)), ""
+    except ValueError:
+        if not re.match(r"^[a-z0-9_\-]+(\.[a-z0-9_\-]+)+$", dst):
+            raise ValueError("the destination must be an IP address or a hostname such as shop.example.com")
+        dst_ip, host = "", dst
+    port = str(num(b.get("port"), 1, 65535, None, "port")) if str(b.get("port") or "").strip() else ""
+    proto = pstr(b.get("proto"), "protocol").lower() or "tcp"
+    within = str(b.get("within") or "last 24 hours").strip().lower()
+    if within not in FLOW_PAN_PERIOD:
+        raise ValueError("invalid time range")
+    logs = bool(b.get("logs"))
+    with LOCK:
+        sess = [(k, s) for k, s in SESSIONS.items() if s["vendor"] in FLOW_STAGE]
+    if not sess:
+        raise ValueError("connect at least one device first")
+    for _, s in sess:
+        audit(s, "flow trace %s -> %s%s %s%s" % (src or "?", dst, ":" + port if port else "", proto, " +logs" if logs else ""))
+    by = lambda v: [(k, s) for k, s in sess if s["vendor"] == v]
+
+    def each(vendor, fn):
+        """fn(sid, sess) on each device of a vendor in parallel -> [(hops, extra)]; a failing device gives a 'not checked' row."""
+        items = by(vendor)
+
+        def one(x):
+            try:
+                return fn(x[0], x[1])
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                return [flow_hop(x[1], "lookup", {"ok": False, "error": str(getattr(e, "reason", e))})], None
+            except Exception as e:   # an unexpected reply from one device must not stop the trace on the others
+                return [flow_hop(x[1], "lookup", {"ok": False, "error": "unexpected reply: %s: %s" % (type(e).__name__, e)})], None
+        if not items:
+            return []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(items))) as ex:
+            return list(ex.map(one, items))
+
+    hops, notes = [], []
+    legs = [flow_leg(src, dst_ip, port, "destination entered")] if dst_ip else []
+    # 1. Cloudflare: the origin IP from DNS; when proxied, the next devices see a Cloudflare edge address as source.
+    proxied, edge, origin = False, "", []
+    for h, extra in each("cloudflare", lambda k, s: (lambda r: (r[0], r[1:]))(flow_trace_cf(s, k, src, host, within))):
+        hops += h
+        if extra:
+            origin += extra[0]
+            if extra[1]:
+                proxied, edge = True, extra[1]
+    if proxied:
+        notes.append("%s is proxied by Cloudflare: past the edge the source is a Cloudflare address (tested as %s, from "
+                     "Cloudflare's published ranges); the client IP only travels in headers." % (host, edge or "unknown"))
+    if host and origin:
+        legs = [flow_leg(edge if proxied else src, ip, port, "Cloudflare DNS origin for %s" % host)
+                for ip in dict.fromkeys(origin)]
+    if host and not legs:
+        legs = flow_resolve_host(by, src, host, port)
+        if legs:
+            notes.append("%s was resolved through the F5 virtual server%s, not Cloudflare." % (
+                host, " and the FortiGate VIP" if any("VIP" in l["via"] for l in legs) else ""))
+    legs = flow_dedupe(legs)
+    if not legs:
+        notes.append("Could not resolve %s on any connected device: enter the destination IP instead." % host)
+    if len(legs) > FLOW_MAX_LEGS:
+        notes.append("Only the first %d addresses were followed." % FLOW_MAX_LEGS)
+    # 2. FortiGate DMZ: policy verdict, then the VIP that maps the public address to the F5 virtual server.
+    if legs and by("fortigate"):
+        nxt = []
+        for h, out in each("fortigate", lambda k, s: flow_trace_fg(s, k, legs, proto, within, logs, proxied)):
+            hops += h
+            nxt += out or []
+        legs = flow_dedupe(nxt) or legs
+    # 3. F5 DMZ: virtual server, pool members and the SNAT address the Palo Alto will see.
+    if (legs or host) and by("f5"):
+        nxt = []
+        for h, out in each("f5", lambda k, s: flow_trace_f5(s, k, legs, src, host, within, logs, proxied)):
+            hops += h
+            nxt += out or []
+        legs = flow_dedupe(nxt) or legs
+    # 4. Palo Alto: policy verdict for F5 SNAT address -> pool member.
+    if legs and by("paloalto"):
+        for h, _ in each("paloalto", lambda k, s: flow_trace_pa(s, k, legs, proto, within, logs)):
+            hops += h
+    hops.sort(key=lambda h: h["order"])
+    if not src:
+        notes.append("No client IP given: Cloudflare events and the FortiGate verdict for a client that is not proxied "
+                     "were not checked.")
+    notes.append("Path followed: Cloudflare -> FortiGate DMZ -> F5 DMZ -> Palo Alto; each device is tested with the "
+                 "addresses it sees (Cloudflare edge address, FortiGate VIP mapping, F5 SNAT -> pool member). Devices not "
+                 "connected are skipped. Routing between the devices is not checked, and whether FortiOS policy lookup "
+                 "matches a VIP's external address is not yet verified on a real FortiGate.")
+    if not logs:
+        notes.append("Configuration only: tick 'Also search logs' to add the F5 WAF log and firewall traffic logs.")
+    bad = [h for h in hops if h["state"] == "bad"]
+    unk = [h for h in hops if h["state"] == "warn"]
+    if bad:
+        verdict = {"label": "STOPS AT %s (%s): %s" % (bad[0]["device"], bad[0]["layer"], bad[0]["result"]), "kind": "bad"}
+    elif unk:
+        verdict = {"label": "NO BLOCK FOUND, %d check(s) not conclusive" % len(unk), "kind": "warn"}
+    else:
+        verdict = {"label": "NO BLOCK FOUND on %d device(s)" % len({h["device"] for h in hops}), "kind": "ok"}
+    summary = ["%s · %s · %s: %s" % (h["layer"], h["device"], h["check"], h["result"]) for h in hops]
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
+            "request": "flow trace %s -> %s%s/%s on %d device(s)" % (src or "?", dst, ":" + port if port else "", proto, len(sess)),
+            "verdict": verdict, "summary": summary + notes,
+            "data": {"hops": [dict({k: h[k] for k in ("layer", "device", "check", "result", "details")},
+                                   state={"bad": "blocked", "warn": "unclear"}.get(h["state"], h["state"])) for h in hops]}}
+
+
+def do_flow_trace_api(b):
+    try:
+        return do_flow_trace(b)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
 
 
 # ---- F5 active tools: log search + tcpdump (shell via util/bash) ------------
@@ -2882,6 +3894,38 @@ def f5_waf_posture(sess):
     return findings, inv, notes
 
 
+def f5_cert_key(name):
+    """'/Common/site.crt', 'site.crt', '~Common~site' -> 'common/site' (to match profile and certificate-store names)."""
+    n = str(name or "").strip().replace("~", "/").lower()
+    n = n if n.startswith("/") else "/common/" + n
+    return re.sub(r"\.(crt|cer|pem)$", "", n).strip("/")
+
+
+def f5_exp_text(c, epoch):
+    s = str(c.get("expirationString") or "").strip()
+    return s or (time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(epoch)) if epoch else "")
+
+
+def f5_cert_rows(items):
+    """Certificate object, Common Name, SAN and expiry date; soonest expiry first, expired ones marked EXPIRED."""
+    rows = []
+    for c in items:
+        exp = to_epoch(c.get("expirationDate")) or to_epoch(c.get("expirationString"))
+        left = days_from_now(exp) if exp else None
+        cn = c.get("commonName") or next((x.strip()[3:] for x in re.split(r"(?<!\\),", str(c.get("subject") or ""))
+                                          if x.strip().upper().startswith("CN=")), "")
+        san = ", ".join(x.strip().split(":", 1)[-1] for x in str(c.get("subjectAlternativeName") or "").split(",") if x.strip())
+        date = f5_exp_text(c, exp)
+        if left is not None and left < 0:
+            date += " · EXPIRED"
+        rows.append({"certificate": c.get("fullPath") or c.get("name") or "", "common_name": cn, "san": san,
+                     "expiry_date": date, "_e": exp or float("inf")})
+    rows.sort(key=lambda r: r["_e"])
+    for r in rows:
+        r.pop("_e")
+    return rows
+
+
 def f5_ssl_posture(sess, warn_days):
     findings, inv, notes = [], [], []
     usage = {}
@@ -2919,12 +3963,14 @@ def f5_ssl_posture(sess, warn_days):
         inv.append({"type": "client-ssl", "name": name, "used_by": used, "ciphers": ciphers,
                     "cipher_group": group, "options": opts, "not_explicitly_disabled": not_disabled,
                     "certs": [ck.get("cert") for ck in p.get("certKeyChain") or []]})
+    cert_exp = {}   # normalised name -> (expiry text, days left), bundles included
     for c in f5_items(sess, "/mgmt/tm/sys/crypto/cert", notes, "certificates") or []:
-        if c.get("isBundle") in (True, "true"):
-            continue
         name = c.get("fullPath") or c.get("name")
         exp = to_epoch(c.get("expirationDate")) or to_epoch(c.get("expirationString"))
         left = days_from_now(exp) if exp else None
+        cert_exp[f5_cert_key(name)] = (f5_exp_text(c, exp), left)
+        if c.get("isBundle") in (True, "true"):
+            continue
         users = cert_users.get(name, [])
         where = "used by: " + (", ".join(users) or "no client-SSL profile")
         if left is not None:
@@ -2942,8 +3988,44 @@ def f5_ssl_posture(sess, warn_days):
         if isinstance(size, int) and "rsa" in ktype.lower() and size < 2048:
             findings.append(finding("medium" if users else "low", name, "RSA key is only %d bits" % size, where))
         inv.append({"type": "certificate", "name": name, "subject": c.get("subject"),
+                    "status": "" if left is None else "EXPIRED" if left < 0 else "valid",
                     "expires": c.get("expirationString"), "days_left": left, "key": "%s %s" % (ktype, size or ""),
                     "used_by": users})
+    # certificate expiry next to each profile's certificates; names not in the list are read one by one
+    # (profiles reference 'sys file ssl-cert' objects, which the crypto list does not always show under the same name)
+    need = lambda: sorted({c for r in inv if r["type"] == "client-ssl" for c in r["certs"]
+                           if c and not cert_exp.get(f5_cert_key(c), ("",))[0]})
+    if need():
+        for c in f5_items(sess, "/mgmt/tm/sys/file/ssl-cert", notes, "certificate files") or []:
+            exp = to_epoch(c.get("expirationDate")) or to_epoch(c.get("expirationString"))
+            k = f5_cert_key(c.get("fullPath") or c.get("name"))
+            if exp and not cert_exp.get(k, ("",))[0]:
+                cert_exp[k] = (f5_exp_text(c, exp), days_from_now(exp))
+    failed = []
+    for c in need()[:30]:
+        ref = urllib.parse.quote(c.replace("/", "~"))
+        for base in ("/mgmt/tm/sys/file/ssl-cert/", "/mgmt/tm/sys/crypto/cert/"):
+            st, ok, d = rest_get(sess, base + ref)
+            exp = (to_epoch(d.get("expirationDate")) or to_epoch(d.get("expirationString"))) if ok and isinstance(d, dict) else None
+            if exp:
+                cert_exp[f5_cert_key(c)] = (f5_exp_text(d, exp), days_from_now(exp))
+                break
+        else:
+            failed.append("%s (HTTP %s)" % (c, st))
+    if failed:
+        notes.append("Could not read the expiry of: %s. The account needs read access to System > File Management "
+                     "(sys file ssl-cert / sys crypto cert)." % ", ".join(failed))
+    for r in inv:
+        if r["type"] == "client-ssl":
+            out = []
+            for c in r["certs"]:
+                if not c:
+                    continue
+                txt, left = cert_exp.get(f5_cert_key(c), ("", None))
+                out.append("%s: %s" % (c, "expiry not readable (see notes)" if not txt else
+                                       txt if left is None else "%s (%s)" % (txt, "EXPIRED %d day(s) ago" % -left if left < 0
+                                                                             else "%d day(s) left" % left)))
+            r["cert_expiry"] = out
     notes.append("'Used by' covers client-SSL profiles attached to virtual servers. Certificates referenced "
                  "only by server-SSL, APM, or monitors show as unused.")
     return findings, inv, notes
@@ -7538,6 +8620,731 @@ def do_cf(b):
         return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
 
 
+# ---- Local LLM assistant: explain the current output, chat about it, or let the model run read-only checks --------
+# Talks to an OpenAI-compatible chat API (Ollama, LM Studio, llama.cpp server, vLLM). Settings live in memory only.
+# Sent only to this PC or an approved host (LLM_APPROVED); secrets are masked and large output trimmed before sending.
+LLM_CFG = {"url": "http://127.0.0.1:11434/v1", "model": "", "key": "", "budget": 24000}
+LLM_LOCAL = ("127.0.0.1", "localhost", "::1")
+# The only model servers device data may be sent to, besides this PC: exact host names, no wildcards, one per line in
+# llm_approved.txt next to this script (not in git: lines starting with # are comments). Any other address is refused,
+# so prompts with device output cannot leave the environment. Add a host only when that model server is approved.
+def llm_load_approved():
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_approved.txt"), encoding="utf-8") as f:
+            return tuple(dict.fromkeys(h for h in (x.split("#")[0].strip().lower().rstrip(".") for x in f)
+                                       if re.match(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", h)))
+    except OSError:
+        return ()
+
+
+LLM_APPROVED = llm_load_approved()
+LLM_SECRET_KEY = re.compile(r"(passw|passphrase|secret|token|api[_-]?key|apikey|private[_-]?key|\bpsk\b|pre-?shared|"
+                            r"community|cookie|authorization|auth[_-]?hash|x-api-key|session[_-]?id)", re.I)
+LLM_PEM = re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?(-----END [A-Z0-9 ]+-----|$)", re.S)
+LLM_HASH = re.compile(r"\$(1|2[abxy]?|5|6|y|sha512|md5)\$[^\s\"',;]{8,}")
+LLM_BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{16,}")
+LLM_SYSTEM = (
+    "You are a network-security troubleshooting assistant inside ITSec Ops, a read-only console for F5 BIG-IP, "
+    "Palo Alto PAN-OS, FortiGate and Cloudflare. Answer only from the data you are given or that tools return, and quote "
+    "the values that matter (IPs, rule / policy names, times, percentages, counts). If the data does not show something, "
+    "say so and name the check that would show it. Start with the conclusion, then the evidence, then next steps; keep it "
+    "short and use plain markdown (short paragraphs, '-' bullets, **bold**, `code`). Never invent device output. Data may "
+    "be trimmed ('_trimmed' marks it) and values shown as [redacted] were hidden on purpose. For 'top / most / highest / "
+    "lowest' questions read the ranking from the tables and top lists in the data and copy the names and numbers "
+    "exactly; if the data does not contain the answer, say that instead of guessing. Every name you write (virtual "
+    "server, pool, rule, policy, object, host, IP) must appear character for character in the data; never write an "
+    "example or typical name.")
+
+
+def llm_url_ok(url):
+    u = urllib.parse.urlparse(str(url or "").strip())
+    if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password:
+        raise ValueError("model address must look like https://%s/v1 or http://127.0.0.1:11434/v1"
+                         % (LLM_APPROVED[0] if LLM_APPROVED else "<approved-host>"))
+    host = u.hostname.lower().rstrip(".")
+    if host not in LLM_LOCAL and host not in LLM_APPROVED:
+        raise ValueError("%s is not an approved model server, so device data will not be sent to it. Approved: %s "
+                         "(or this PC: 127.0.0.1 / localhost). Approved hosts are listed in llm_approved.txt next to netops_console.py."
+                         % (u.hostname, ", ".join(LLM_APPROVED) or "none"))
+    # The full endpoint pasted from API docs (…/v1/chat/completions) is cut back to the API base (…/v1).
+    return re.sub(r"/(chat/completions|completions|models)$", "", str(url).strip().rstrip("/"))
+
+
+LLM_WAIT = 600   # seconds the model may stay silent (loading, reading the prompt) before we give up
+
+
+class LlmNoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect could carry the prompt or the API key to another host: stop instead of following it."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("the model server answered with a redirect (HTTP %s) to %s; not followed, so nothing was sent "
+                         "there. Use the final address of the API as the model server." % (code, newurl[:200]))
+
+
+def llm_route():
+    host = (urllib.parse.urlparse(LLM_CFG["url"]).hostname or "").lower().rstrip(".")
+    return "%s · %s · direct (no proxy) · redirects blocked" % (
+        host or "?", "this PC" if host in LLM_LOCAL else "approved" if host in LLM_APPROVED else "NOT approved")
+
+
+def llm_http(method, path, body=None, timeout=60, root=False, stream=False):
+    base = llm_url_ok(LLM_CFG["url"])   # checked before every request, not only when saved
+    if root:   # the server's own API next to /v1, e.g. Ollama /api/tags
+        base = re.sub(r"/v1$", "", base)
+    hdr = {"Content-Type": "application/json"}
+    if LLM_CFG["key"]:
+        hdr["Authorization"] = "Bearer " + LLM_CFG["key"]
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode() if body is not None else None,
+                                 method=method, headers=hdr)
+    # Always direct (no system / cloud web proxy may see the prompt) and never redirected to another address.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), LlmNoRedirect())
+    try:
+        if stream:   # Ollama NDJSON: the timeout applies to each read, so a long answer is never cut off while it flows
+            with opener.open(req, timeout=LLM_WAIT) as r:
+                out, text, calls = {}, [], []
+                for line in r:
+                    if not line.strip():
+                        continue
+                    d = json.loads(line)
+                    if d.get("error"):
+                        return 500, {"error": d["error"]}
+                    m = d.get("message") or {}
+                    text.append(m.get("content") or "")
+                    calls += m.get("tool_calls") or []
+                    if d.get("done"):
+                        out = d
+                out["message"] = {"role": "assistant", "content": "".join(text)}
+                if calls:
+                    out["message"]["tool_calls"] = calls
+                return r.status, out
+        with opener.open(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read()[:600].decode("utf-8", "replace")
+        try:
+            raw = (json.loads(raw).get("error") or {}).get("message") or raw
+        except (ValueError, AttributeError):
+            pass
+        return e.code, {"error": str(raw)}
+
+
+def llm_redact(x, depth=0):
+    if depth > 30:
+        return "[nested too deep]"
+    if isinstance(x, dict):
+        return collections.OrderedDict((k, "[redacted]" if LLM_SECRET_KEY.search(str(k)) and x[k] not in (None, "", [], {})
+                                        and not isinstance(x[k], bool) else llm_redact(x[k], depth + 1)) for k in x)
+    if isinstance(x, list):
+        return [llm_redact(v, depth + 1) for v in x]
+    if isinstance(x, str):
+        x = LLM_PEM.sub("[redacted PEM block]", x)
+        x = LLM_HASH.sub("[redacted hash]", x)
+        return LLM_BEARER.sub(r"\1 [redacted]", x)
+    return x
+
+
+def llm_trim(x, cap, depth=0):
+    if isinstance(x, dict):
+        return collections.OrderedDict((k, llm_trim(v, cap, depth + 1)) for k, v in x.items())
+    if isinstance(x, list):
+        out = [llm_trim(v, cap, depth + 1) for v in x[:cap]]
+        if len(x) > cap:
+            out.append({"_trimmed": "%d more item(s) not shown" % (len(x) - cap)})
+        return out
+    if isinstance(x, str) and len(x) > max(300, cap * 40):
+        return x[:max(300, cap * 40)] + " …[_trimmed]"
+    return x
+
+
+def llm_series(name, vals):
+    v = [float(x) for x in vals or [] if isinstance(x, (int, float))]
+    if not v:
+        return {"name": name, "points": 0}
+    return {"name": name, "points": len(vals), "first": round(v[0], 2), "min": round(min(v), 2),
+            "avg": round(sum(v) / len(v), 2), "max": round(max(v), 2), "last": round(v[-1], 2)}
+
+
+def llm_view(r):
+    """The parts of a result a model needs: verdict, summary, tiles, charts as statistics, top lists, data tables."""
+    if not isinstance(r, dict):
+        return {"output": r}
+    out = collections.OrderedDict()
+    for k in ("error", "request", "verdict", "summary"):
+        if r.get(k):
+            out[k] = r[k]
+    if r.get("tiles"):
+        out["tiles"] = [{"label": t.get("label"), "value": t.get("value"), "unit": "%" if t.get("fmt") == "pct" else "",
+                         "detail": t.get("sub"), "state": t.get("kind") or "ok"} for t in r["tiles"] if isinstance(t, dict)]
+    if "data" in r:   # the tables hold the answers: keep them ahead of the chart statistics
+        out["data"] = r["data"]
+    if r.get("charts"):
+        out["charts"] = [{"title": c.get("title"), "from": (c.get("t") or [""])[0], "to": (c.get("t") or [""])[-1],
+                          "series": [llm_series(s[0], s[1]) for s in c.get("series") or [] if len(s) > 1]}
+                         for c in r["charts"] if isinstance(c, dict)]
+    if r.get("heat"):
+        out["per_core_load"] = [{"title": h.get("title"), "cores": [llm_series(n, v) for n, v in h.get("rows") or []]}
+                                for h in r["heat"] if isinstance(h, dict)]
+    if r.get("bars"):
+        out["top_lists"] = [{"title": b.get("title"), "rows": b.get("rows")} for b in r["bars"] if isinstance(b, dict)]
+    a = r.get("acc")
+    if isinstance(a, dict):
+        out["acc"] = {"tiles": [{"label": t.get("label"), "value": t.get("value")} for t in a.get("tiles") or []],
+                      "filters": a.get("filters"),
+                      "tabs": [{"tab": t.get("title"), "top_lists": [{"title": p.get("title"), "rows": p.get("rows")}
+                                                                    for p in t.get("tops") or []]} for t in a.get("tabs") or []]}
+    d = r.get("dashboard")
+    if isinstance(d, dict):
+        out["dashboard"] = {"tiles": [{"label": t.get("label"), "value": t.get("value"), "previous": t.get("prev")}
+                                      for t in d.get("tiles") or []],
+                            "requests": llm_series("requests", d.get("requests")),
+                            "status": [llm_series(k, v) for k, v in d.get("status") or []],
+                            "top_lists": [{"title": t, "rows": rows} for t, rows in d.get("tops") or []]}
+    if "data" in out:
+        out.move_to_end("data", last=False)
+        for k in ("tiles", "summary", "verdict", "request", "error"):
+            if k in out:
+                out.move_to_end(k, last=False)
+    return out
+
+
+def llm_lists(x, path=(), out=None):
+    """Every list in x with its path and JSON size."""
+    out = [] if out is None else out
+    if isinstance(x, dict):
+        for k, v in x.items():
+            llm_lists(v, path + (k,), out)
+    elif isinstance(x, list):
+        out.append((len(json.dumps(x, default=str)), path, x))
+        for i, v in enumerate(x):
+            llm_lists(v, path + (i,), out)
+    return out
+
+
+def llm_pack(r, budget):
+    """Redacted, trimmed JSON of a result that fits `budget` characters. Returns (text, trimmed?)."""
+    v = llm_redact(llm_view(r))
+    full = json.dumps(v, default=str)
+    if len(full) <= budget:
+        return full, False
+    # Halve the biggest list first (usually a per-minute timeline or a long log table), so short ranked lists
+    # such as a top 10 stay complete; then shorten long strings; cutting the text is the last resort.
+    v = json.loads(full, object_pairs_hook=collections.OrderedDict)
+    size = len(full)
+    for _ in range(400):
+        if size <= budget:
+            break
+        cand = [c for c in llm_lists(v) if len([y for y in c[2] if not (isinstance(y, dict) and "_trimmed" in y)]) > 3]
+        if not cand:
+            break
+        _, path, lst = max(cand, key=lambda c: c[0])
+        real = [y for y in lst if not (isinstance(y, dict) and "_trimmed" in y)]
+        total = real and next((int(y["_n"]) for y in lst if isinstance(y, dict) and "_n" in y), len(real))
+        keep = max(3, len(real) // 2)
+        lst[:] = real[:keep] + [{"_trimmed": "%d of %d item(s) not shown" % (total - keep, total), "_n": total}]
+        size = len(json.dumps(v, default=str))
+    t = json.dumps(v, default=str)
+    if len(t) > budget:
+        t = json.dumps(llm_trim(v, 10 ** 6), default=str)   # shorten very long strings
+    if len(t) > budget:
+        t = t[:budget] + " …[_trimmed]"
+    return t, True
+
+
+def llm_is_ollama():
+    """Is the model server Ollama? (asked once per address)"""
+    if LLM_CFG.get("_probe") != LLM_CFG["url"]:
+        LLM_CFG["_probe"], LLM_CFG["_ollama"] = LLM_CFG["url"], False
+        try:
+            st, d = llm_http("GET", "/api/version", timeout=5, root=True)
+            LLM_CFG["_ollama"] = st == 200 and isinstance(d, dict) and "version" in d
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+    return LLM_CFG["_ollama"]
+
+
+def llm_chat_ollama(messages, tools, est):
+    """Ollama's own /api/chat: unlike its /v1 API it takes num_ctx, so the input is not cut to the default
+    2k-4k token window (which made answers ignore the output)."""
+    # A few fixed sizes: every change of num_ctx makes Ollama reload the model, which costs minutes on a laptop.
+    ctx = next((c for c in (8192, 16384, 32768) if est + 2048 <= c), 32768)
+    nm = []
+    for m in messages:
+        m = dict(m)
+        if m.get("tool_calls"):
+            calls = []
+            for c in m["tool_calls"]:
+                fn = c.get("function") or {}
+                a = fn.get("arguments")
+                try:
+                    a = json.loads(a) if isinstance(a, str) else (a or {})
+                except ValueError:
+                    a = {}
+                calls.append({"function": {"name": fn.get("name"), "arguments": a}})
+            m["tool_calls"] = calls
+        if m["role"] == "tool":
+            m = {"role": "tool", "content": m["content"], "tool_name": m.get("name")}
+        nm.append(m)
+    body = {"model": LLM_CFG["model"], "messages": nm, "stream": True, "keep_alive": "30m",
+            "options": {"num_ctx": ctx, "temperature": 0.2}}
+    if tools:
+        body["tools"] = tools
+    st, d = llm_http("POST", "/api/chat", body, root=True, stream=True)
+    if st >= 300 or not isinstance(d, dict) or not isinstance(d.get("message"), dict):
+        err = (d or {}).get("error") if isinstance(d, dict) else d
+        if tools and st in (400, 422, 500):
+            raise ValueError("Ollama rejected tool calling for %s (HTTP %s: %s). Use a model that supports tools "
+                             "(e.g. qwen2.5 / qwen3, llama3.1+, mistral-nemo) or ask without running checks."
+                             % (LLM_CFG["model"], st, err))
+        raise ValueError(llm_404(st, " (Ollama /api/chat)", d))
+    msg = dict(d["message"])
+    if msg.get("tool_calls"):
+        msg["tool_calls"] = [{"id": "call_%d" % i, "type": "function",
+                              "function": {"name": (c.get("function") or {}).get("name"),
+                                           "arguments": json.dumps((c.get("function") or {}).get("arguments") or {})}}
+                             for i, c in enumerate(msg["tool_calls"])]
+    pt, ct = d.get("prompt_eval_count") or 0, d.get("eval_count") or 0
+    return msg, {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct, "num_ctx": ctx, "_est": est}
+
+
+def llm_chat(messages, tools=None):
+    est = (sum(len(json.dumps(m, default=str)) for m in messages) + (len(json.dumps(tools)) if tools else 0)) // 3
+    if llm_is_ollama():
+        return llm_chat_ollama(messages, tools, est)
+    body = {"model": LLM_CFG["model"], "messages": messages, "temperature": 0.2, "stream": False}
+    if tools:
+        body["tools"], body["tool_choice"] = tools, "auto"
+    st, d = llm_http("POST", "/chat/completions", body, timeout=LLM_WAIT)
+    if st >= 300 or not isinstance(d, dict) or not d.get("choices"):
+        err = (d or {}).get("error") if isinstance(d, dict) else d
+        if tools and st in (400, 422, 500):
+            raise ValueError("the model server rejected tool calling (HTTP %s: %s). Use a model that supports tools "
+                             "(e.g. qwen2.5 / qwen3, llama3.1+, mistral-nemo) or ask without running checks." % (st, err))
+        raise ValueError(llm_404(st, "/chat/completions", d))
+    return d["choices"][0].get("message") or {}, dict(d.get("usage") or {}, _est=est)
+
+
+# Agent tools: only the console's own read-only lookups, on every connected device (tool names start with the vendor:
+# pa_, fg_, f5_, cf_; a 'device' field picks one when several of a vendor are connected). Active tools (tcpdump,
+# file download, backups, packet capture, F5 shell) are never offered.
+LLM_PFX = {"paloalto": "pa", "fortigate": "fg", "f5": "f5", "cloudflare": "cf"}
+LLM_VNAME = {"paloalto": "Palo Alto", "fortigate": "FortiGate", "f5": "F5 BIG-IP", "cloudflare": "Cloudflare"}
+
+
+def llm_devices():
+    """Connected devices for the agent: {label: (sid, sess)}; label = device name (address added if names repeat)."""
+    with LOCK:
+        items = sorted(SESSIONS.items(), key=lambda x: (x[1]["vendor"], str(x[1].get("name") or x[1]["host"])))
+    names = [str(s.get("name") or s["host"]) for _, s in items]
+    return {(nm if names.count(nm) == 1 else "%s (%s)" % (nm, s["host"])): (k, s) for (k, s), nm in zip(items, names)}
+
+
+def llm_tools():
+    devs, tools = llm_devices(), []
+
+    def tool(name, desc, props, req=()):
+        tools.append({"type": "function", "function": {"name": name, "description": desc, "parameters": {
+            "type": "object", "properties": props, "required": list(req)}}})
+    S = lambda d, **k: dict({"type": "string", "description": d}, **k)
+    if not devs:
+        return tools
+    conn = ["%s (%s)" % (l, s["vendor"]) for l, (_, s) in devs.items()]
+    tool("flow_trace", "Follow ONE flow along the path Cloudflare -> FortiGate DMZ -> F5 DMZ -> Palo Alto on every "
+         "connected device (%s): Cloudflare DNS + WAF events, FortiGate policy + VIP mapping, F5 virtual server / pool "
+         "members / SNAT (+ WAF log), Palo Alto policy for F5 SNAT -> pool member (+ traffic logs). Use it first for "
+         "internet-facing flows: a public client IP or a published hostname ('can client X reach shop.example.com', "
+         "'why is X blocked on our site'). Returns one row per device and check, and where it stops. Not for two "
+         "internal addresses: use policy_check." % "; ".join(conn),
+         {"src": S("client / source IP (needed for firewall verdicts and WAF logs)"),
+          "dst": S("destination IP or hostname, e.g. shop.example.com"), "port": S("destination port, e.g. 443"),
+          "proto": S("tcp, udp or icmp (default tcp)"), "logs": {"type": "boolean", "description": "also search the F5 WAF "
+                                                                 "log and firewall traffic logs (slower)"},
+          "within": S("time range for events and logs", enum=list(FLOW_PAN_PERIOD))}, ["dst"])
+    fws = [l for l, (_, s) in devs.items() if s["vendor"] in ("paloalto", "fortigate")]
+    if fws:
+        tool("policy_check", "Ask every connected firewall (%s) which security rule / policy matches the flow src -> "
+             "dst:port and whether it allows or blocks it (PAN-OS 'test security-policy-match', FortiGate policy lookup). "
+             "Use it for 'can A reach B', 'is there a rule that allows A to B', 'is A blocked to B' between two IP "
+             "addresses, e.g. internal ones." % ", ".join(fws),
+             {"src": S("source IP"), "dst": S("destination IP"), "port": S("destination port (if the user gave none, "
+                                                                          "leave it empty and say so)"),
+              "proto": S("tcp, udp or icmp (default tcp)"),
+              "device": S("only this firewall; empty = all connected firewalls", enum=fws)}, ["src", "dst"])
+    for v in ("paloalto", "fortigate", "f5", "cloudflare"):
+        labels = [l for l, (_, s) in devs.items() if s["vendor"] == v]
+        if not labels:
+            continue
+        p, vn = LLM_PFX[v], LLM_VNAME[v]
+        D = {"device": S("which %s (default: %s)" % (vn, labels[0]), enum=labels)}
+
+        def vt(name, desc, props, req=()):
+            tool(p + "_" + name, "%s (%s): %s" % (vn, ", ".join(labels), desc), dict(D, **props), req)
+        cat = CATALOG[v]
+        vt("run_check", "run one read-only check from the console catalog. Checks: %s" % "; ".join(
+            "%s = %s%s" % (c["id"], c["label"], " (params: %s)" % ", ".join(
+                x["name"] + ("" if x.get("required", True) else "?") for x in c.get("params", [])) if c.get("params") else "")
+            for c in cat), {"check": S("check id", enum=[c["id"] for c in cat]),
+                            "params": {"type": "object", "description": "parameters of the check by name"}}, ["check"])
+        if v in ("paloalto", "fortigate"):
+            vt("ip_lookup", "rules / objects that reference an IP or a subnet (CIDR, e.g. 10.1.2.32/28: anything that "
+               "overlaps it); with 'peer' (single IPs only, plus port / protocol) the policy verdict on this firewall "
+               "for the flow ip -> peer.",
+               {"ip": S("source IP, or the IP / CIDR subnet to look up"), "peer": S("destination IP (optional)"),
+                "port": S("destination port"), "proto": S("tcp, udp, icmp or a protocol number"),
+                "from_zone": S("PAN-OS source zone"), "to_zone": S("PAN-OS destination zone"),
+                "ingress_interface": S("FortiGate ingress interface (optional: taken from the route to the source IP)")},
+               ["ip"])
+            vt("policy_by_name", "find a security rule / policy by name (or FortiGate policy ID): position, action, "
+               "objects resolved, profiles, hit count.", {"name": S("rule name, part of it, or policy ID")}, ["name"])
+            vt("log_search", "search the firewall logs for an IP (source or destination).",
+               dict({"ip": S("IP address"), "dest_ip": S("destination IP (optional)"),
+                     "blocked_only": {"type": "boolean"}, "count": S("max rows, default 50")},
+                    **({"log_type": S("threat, url or traffic", enum=list(PAN_LOG_TYPES)),
+                        "period": S("time range", enum=list(PAN_LOG_PERIODS))} if v == "paloalto" else {})), ["ip"])
+            vt("acc", "Application Command Center summary from the logs: top applications, sources, destinations, "
+               "threats, blocked traffic and URLs, optionally filtered.",
+               {"period": S("time range", enum=list(ACC_PERIODS)),
+                "filters": {"type": "object", "description": "optional: src, dst, app, user, rule, from_zone, to_zone, port"}})
+        if v == "f5":
+            vt("ip_lookup", "where an IP appears on the BIG-IP: pools, nodes, virtual servers, data groups, policies.",
+               {"ip": S("IP address")}, ["ip"])
+            vt("hostname_lookup", "which virtual servers / policies / iRules handle a hostname.",
+               {"hostname": S("host name")}, ["hostname"])
+            vt("waf_log_search", "search the ASM / WAF request log by client IP, support ID, hostname, URL or status.",
+               {"ip": S("client IP"), "support_id": S("ASM support ID"), "hostname": S("host"), "url": S("URL path"),
+                "status": S("request status, e.g. blocked"), "within": S("time range", enum=[k for k in LOOKBACK])})
+        if v == "cloudflare":
+            vt("lookup", "lookups over all zones the token sees. modes: ip {ip}, host {host, days}, ray {ray}, "
+               "whois {ip | host}, events {ip, host, path, ray, action, top}, event_top {by: action|source|rule|ip|host|"
+               "path|country|asn, top}, traffic {host, ip, path, status, by, top}, rules {q}, dns {name, content, type}, "
+               "posture {}.",
+               {"mode": S("lookup", enum=["ip", "host", "ray", "whois", "events", "event_top", "traffic", "rules", "dns",
+                                          "posture"]),
+                "args": {"type": "object", "description": "arguments of the mode"}}, ["mode"])
+    return tools
+
+
+def llm_run_tool(name, a):
+    """Run one agent tool -> result dict. Each call is written to the audit log of the device(s) it reads."""
+    a = a if isinstance(a, dict) else {}
+    s = lambda k: str(a.get(k) or "").strip()
+    devs = llm_devices()
+    if name in ("flow_trace", "policy_check"):
+        for _, d in devs.values():
+            audit(d, "LLM agent ran " + llm_label(name, a))
+        if name == "flow_trace":
+            return do_flow_trace_api({"src": s("src"), "dst": s("dst"), "port": s("port"), "proto": s("proto"),
+                                      "logs": a.get("logs") is True, "within": s("within") or "last 24 hours"})
+        return do_policy_check_all({"src": s("src"), "dst": s("dst"), "port": s("port"), "proto": s("proto"),
+                                    "device": s("device")})
+    pfx, _, name = name.partition("_")
+    v = {x: k for k, x in LLM_PFX.items()}.get(pfx)
+    mine = [(l, ks) for l, ks in devs.items() if ks[1]["vendor"] == v] if v else []
+    if not mine:
+        return {"ok": False, "error": "tool %s_%s: no such device type is connected" % (pfx, name)}
+    want = s("device")
+    pick = ([ks for l, ks in mine if l == want] or [ks for l, ks in mine if want.lower() in l.lower()]) if want else [mine[0][1]]
+    if not pick:
+        return {"ok": False, "error": "no connected %s named '%s'; connected: %s" % (LLM_VNAME[v], want,
+                                                                                      ", ".join(l for l, _ in mine))}
+    sid, sess = pick[0]
+    audit(sess, "LLM agent ran %s_%s" % (pfx, llm_label(name, a)))
+    if name == "run_check":
+        return do_run({"id": sid, "check": s("check"), "params": a.get("params") if isinstance(a.get("params"), dict) else {}})
+    if name == "ip_lookup":
+        if v == "f5":
+            return do_ipcheck({"id": sid, "ip": s("ip")})
+        return do_ipcheck({"id": sid, "ip": s("ip"), "mode": "verdict" if s("peer") else "refs", "peer": s("peer"),
+                           "role": "source", "port": s("port"), "proto": s("proto"), "from": s("from_zone"),
+                           "to": s("to_zone"), "srcintf": s("ingress_interface")})
+    if name == "policy_by_name" and v in ("paloalto", "fortigate"):
+        return do_policy_search({"id": sid, "name": s("name")})
+    if name == "log_search" and v in ("paloalto", "fortigate"):
+        b = {"id": sid, "ip": s("ip"), "dest_ip": s("dest_ip"), "count": s("count") or "50", "blocked": bool(a.get("blocked_only"))}
+        if v == "paloalto":
+            b.update(log_type=s("log_type") or "traffic", period=s("period") or "last-24-hrs")
+            return do_pan_logs(b)
+        return do_fg_logs(dict(b, log_source="disk"))
+    if name == "acc" and v in ("paloalto", "fortigate"):
+        f = a.get("filters") if isinstance(a.get("filters"), dict) else {}
+        return do_acc({"id": sid, "period": s("period") or "last-hour", "sort": "bytes", "scan": "5000",
+                       "log_source": "disk", "filters": {k: str(x) for k, x in f.items() if x not in (None, "")}})
+    if name == "hostname_lookup" and v == "f5":
+        return do_f5_host({"id": sid, "hostname": s("hostname")})
+    if name == "waf_log_search" and v == "f5":
+        return do_f5_asm({"id": sid, "mode": "supportid" if s("support_id") else "search", "support_id": s("support_id"),
+                          "ip": s("ip"), "hostname": s("hostname"), "url": s("url"), "status": s("status"),
+                          "within": s("within") or "last 24 hours", "top": "50"})
+    if name == "lookup" and v == "cloudflare":
+        args = a.get("args") if isinstance(a.get("args"), dict) else {}
+        return do_cf(dict({k: str(x) for k, x in args.items()}, id=sid, mode=s("mode")))
+    return {"ok": False, "error": "tool %s_%s is not available" % (pfx, name)}
+
+
+def do_policy_check_all(b):
+    """Policy verdict for src -> dst:port on every connected firewall (or the one named), in parallel."""
+    src, dst = str(parse_ip(b.get("src"), "Source IP")), str(parse_ip(b.get("dst"), "Destination IP"))
+    port = str(num(b.get("port"), 1, 65535, None, "port")) if str(b.get("port") or "").strip() else ""
+    proto = pstr(b.get("proto"), "protocol").lower() or "tcp"
+    want = str(b.get("device") or "").strip().lower()
+    with LOCK:
+        fws = [(k, s) for k, s in SESSIONS.items() if s["vendor"] in ("paloalto", "fortigate")]
+    if want:
+        fws = [(k, s) for k, s in fws if want in str(s.get("name") or "").lower() or want == s["host"].lower()]
+    if not fws:
+        raise ValueError("no connected firewall%s: connect the Palo Alto / FortiGate first" % (" matches '%s'" % want if want else ""))
+
+    def one(x):
+        k, s = x
+        nm = "%s (%s)" % (s.get("name") or s["host"], s["vendor"])
+        try:
+            r = do_ipcheck({"id": k, "ip": src, "peer": dst, "mode": "verdict", "role": "source", "port": port, "proto": proto})
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            r = {"ok": False, "error": str(getattr(e, "reason", e))}
+        except Exception as e:
+            r = {"ok": False, "error": "unexpected reply: %s: %s" % (type(e).__name__, e)}
+        vd = r.get("verdict") if isinstance(r.get("verdict"), dict) else {}
+        return {"device": nm, "verdict": vd.get("label") or ("NOT CHECKED: " + str(r.get("error") or "no answer")),
+                "kind": vd.get("kind") or "warn", "summary": list(r.get("summary") or []),
+                "notes": list((r.get("data") or {}).get("notes") or []),
+                "flow_test": (r.get("data") or {}).get("flow_test")}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(fws))) as ex:
+        rows = list(ex.map(one, fws))
+    flow = "%s -> %s%s/%s" % (src, dst, ":" + port if port else "", proto)
+    bad = [r for r in rows if r["kind"] == "bad"]
+    unk = [r for r in rows if r["kind"] not in ("ok", "bad")]
+    verdict = ({"label": "BLOCKED on %s" % ", ".join(r["device"] for r in bad), "kind": "bad"} if bad else
+               {"label": "NOT CONCLUSIVE on %s" % ", ".join(r["device"] for r in unk), "kind": "warn"} if unk else
+               {"label": "ALLOWED on %d firewall(s)" % len(rows), "kind": "ok"})
+    return {"ok": True, "status": 200, "request": "policy check " + flow, "verdict": verdict,
+            "summary": ["%s: %s" % (r["device"], r["verdict"]) for r in rows] +
+                       ([] if port else ["No port given: checked without a port, so a port-specific rule may not match."]) +
+                       ["Each firewall is checked on its own policy only; whether the traffic actually passes through it "
+                        "(routing) is not checked."],
+            "data": {"firewalls": rows}}
+
+
+def llm_label(name, a):
+    a = a if isinstance(a, dict) else {}
+    bits = ["%s=%s" % (k, json.dumps(x) if isinstance(x, (dict, list)) else x) for k, x in a.items() if x not in (None, "", {}, [])]
+    return "%s(%s)" % (name, ", ".join(bits))[:300]
+
+
+def do_llm_config(b):
+    if b.get("set"):
+        url = llm_url_ok(b.get("url") or LLM_CFG["url"])
+        model = str(b.get("model") or "").strip()
+        if model and not re.match(r"^[\w.:/@+-]{1,128}$", model):
+            raise ValueError("invalid model name")
+        LLM_CFG.update(url=url, model=model,
+                       budget=num(b.get("budget"), 4000, 400000, 24000, "context budget"))
+        if b.get("key") is not None and str(b.get("key")) != "":
+            LLM_CFG["key"] = str(b["key"]).strip()
+        if b.get("clear_key"):
+            LLM_CFG["key"] = ""
+    return {"ok": True, "url": LLM_CFG["url"], "model": LLM_CFG["model"], "route": llm_route(), "approved": list(LLM_APPROVED),
+            "budget": LLM_CFG["budget"], "has_key": bool(LLM_CFG["key"])}
+
+
+def do_llm_models(b):
+    st, d = llm_http("GET", "/models", timeout=15)
+    if st == 404 and not LLM_CFG["url"].endswith("/v1"):   # address entered without /v1
+        old = LLM_CFG["url"]
+        LLM_CFG["url"] = old + "/v1"
+        st, d = llm_http("GET", "/models", timeout=15)
+        if st == 404:
+            st2, _ = llm_http("GET", "/api/tags", timeout=15, root=True)
+            if st2 >= 300:
+                LLM_CFG["url"] = old
+    if st == 404:   # older Ollama has /v1/chat/completions but not /v1/models: use its own model list
+        st2, d2 = llm_http("GET", "/api/tags", timeout=15, root=True)
+        if st2 < 300 and isinstance(d2, dict):
+            return {"ok": True, "url": LLM_CFG["url"], "models": sorted(str(m.get("name")) for m in d2.get("models") or []
+                                                                        if isinstance(m, dict) and m.get("name"))}
+    if st >= 300:
+        raise ValueError(llm_404(st, "/models", d))
+    ids = sorted(str(m.get("id")) for m in (d.get("data") or []) if isinstance(m, dict) and m.get("id"))
+    return {"ok": True, "url": LLM_CFG["url"], "models": ids}
+
+
+def llm_404(st, path, d):
+    err = (d or {}).get("error") if isinstance(d, dict) else d
+    if st == 404 and path != "/models":
+        return ("%s%s was not found (HTTP 404). The address must be the base of an OpenAI-compatible API, ending in /v1 "
+                "(Ollama: http://127.0.0.1:11434/v1, LM Studio: http://127.0.0.1:1234/v1); for Ollama, check the model name "
+                "with 'ollama list' and update Ollama if it is old. Server said: %s" % (LLM_CFG["url"], path, err))
+    if st == 404 and path == "/models":
+        return ("%s does not list its models (HTTP 404). Type the model name in Model (e.g. oci/Qwen3-8-27B) and Save."
+                % LLM_CFG["url"])
+    if st in (401, 403):
+        return ("the model server refused the access token (HTTP %s). Paste a valid token in API key and Save. "
+                "Server said: %s" % (st, err))
+    return "model server answered HTTP %s: %s" % (st, err)
+
+
+LLM_NAME_TOKEN = re.compile(r"[A-Za-z0-9](?:[\w.:/@-]|,(?=\d{3}))*[\w]")   # 5,000 stays one token
+LLM_IP_TOKEN = re.compile(r"\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?(:\d{1,5})?")
+
+
+def llm_unseen_names(answer, corpus):
+    """Names / IPs the answer states that appear nowhere in what the model was given (a sign it invented them).
+    Checked: `code` spans and **bold** values without spaces, and any token that holds a digit or '_' (rule names,
+    IPs, virtual servers like vs_web01). Plain words are not checked, so ordinary prose is never flagged."""
+    low = corpus.lower()
+    cands = set(re.findall(r"`([^`\s]{3,80})`", answer)) | set(re.findall(r"\*\*([^*\s:]{3,80})\*\*", answer))
+    cands |= {t for t in LLM_NAME_TOKEN.findall(re.sub(r"`[^`]*`", " ", answer)) if re.search(r"[\d_]", t) and len(t) >= 4}
+    out = []
+    for c in sorted(cands):
+        c = c.strip(".,;:()[]'\"")
+        if not re.search(r"[\d_./:-]", c):
+            continue   # a plain word (a heading such as **Conclusion**, or `tmsh`) is not a device name
+        if not LLM_IP_TOKEN.fullmatch(c) and re.fullmatch(r"[\d.,%/:-]+(-?[a-z]+)?", c, re.I):
+            continue   # numbers, sizes, durations, '5,000-entry', '24-hour': often computed, not copied (IPs are checked)
+        if len(c) < 3:
+            continue
+        if c.lower() not in low and c.lower().replace("\\", "") not in low:
+            out.append(c)
+    return out[:8]
+
+
+def do_llm_chat(b):
+    t0 = time.time()
+    if not LLM_CFG["model"]:
+        raise ValueError("pick a model first (List models, then Save)")
+    mode = b.get("mode") or "chat"
+    if mode not in ("explain", "chat", "agent"):
+        raise ValueError("invalid mode")
+    sid = b.get("id")
+    sess = SESSIONS.get(sid)
+    budget = LLM_CFG["budget"]
+    sysmsg = LLM_SYSTEM
+    if sess:
+        sysmsg += "\nSelected device: %s (%s, %s)." % (sess.get("name") or sess["host"], sess["vendor"], sess["host"])
+    alldev = llm_devices()
+    if alldev:
+        sysmsg += "\nConnected devices: %s." % "; ".join("%s (%s, %s)" % (l, d["vendor"], d["host"])
+                                                         for l, (_, d) in alldev.items())
+    msgs, trimmed, sent = [{"role": "system", "content": sysmsg}], False, ""
+    ctx = b.get("context")
+    if isinstance(ctx, dict) and (ctx.get("data") is not None or ctx.get("summary") or ctx.get("error")):
+        txt, trimmed = llm_pack(ctx, budget if mode != "agent" else budget // 2)
+        sent = txt
+        odev = str(b.get("device") or "")[:100]
+        sname = (sess.get("name") or sess["host"]) if sess else ""
+        other = (" NOTE: this output is from %s, not from the selected device %s; say so if it matters." % (odev, sname)
+                 if odev and sname and odev != sname else "")
+        msgs.append({"role": "user", "content": "Current console output: %s%s (run %s).%s\n```json\n%s\n```" % (
+            str(b.get("label") or "check")[:200], (" from device %s" % odev) if odev else "", str(b.get("time") or "")[:40],
+            other, txt)})
+        msgs.append({"role": "assistant", "content": "I have the output and will answer from it."})
+    hist = [m for m in (b.get("history") or []) if isinstance(m, dict) and m.get("role") in ("user", "assistant")][-12:]
+    msgs += [{"role": m["role"], "content": str(m.get("content") or "")[:8000]} for m in hist]
+    q = str(b.get("question") or "").strip()[:4000]
+    if mode == "explain" and not q:
+        q = ("Explain this output for a network / security engineer: what it shows, what is wrong or unusual (with the "
+             "values), the likely cause, and the next checks to run in this console.")
+    if not q:
+        raise ValueError("type a question")
+    msgs.append({"role": "user", "content": q})
+    steps, usage, seen_txt = [], {}, []
+    for _, d in (alldev.values() if mode == "agent" else ([(sid, sess)] if sess else [])):
+        audit(d, "LLM %s (%s): %s" % (mode, LLM_CFG["model"], q[:200]))
+    if mode != "agent":
+        msgs[0]["content"] += ("\nAnswer only from the console output and the conversation. If they do not contain what is "
+                               "needed (e.g. a question about a rule, flow or log that is not in the output), say so in one "
+                               "sentence and suggest the 'Ask & run checks' button, which can query the device.")
+        msg, usage = llm_chat(msgs)
+        answer = msg.get("content") or ""
+    else:
+        if not alldev:
+            raise ValueError("connect a device first: the model runs its checks on the connected devices")
+        tools, answer, seen = llm_tools(), "", set()
+        msgs[0]["content"] += ("\nYou can run read-only checks on ALL the connected devices listed above with the tools, "
+                               "whichever device is selected. Tool names start with the device type: pa_ = Palo Alto, "
+                               "fg_ = FortiGate, f5_ = F5 BIG-IP, cf_ = Cloudflare; pick the device with the 'device' "
+                               "field when several of a type are connected. Decide which devices and checks the question "
+                               "needs, combine them across devices when needed (e.g. Cloudflare event -> F5 WAF log -> "
+                               "firewall log for the same IP), and run only what you need (at most 8 calls; several "
+                               "independent calls may be made at once). Never repeat a call with the same arguments. "
+                               "For 'can A reach B' / 'is there a rule allowing A to B' between two IP addresses (e.g. "
+                               "internal ones), call policy_check: it asks every connected firewall. For an internet "
+                               "client or a published hostname, call flow_trace (Cloudflare -> FortiGate -> F5 -> Palo "
+                               "Alto). For 'top / most / highest' questions use a check that ranks (e.g. f5_run_check "
+                               "vstop); ACC and log searches read a sample of recent log entries; for traffic volume or "
+                               "totals over hours or days on Palo Alto use pa_run_check apptraffic (whole period). If no "
+                               "result holds what was asked, say so. The console output shown above may be about "
+                               "something else: if it does not answer the question, run checks instead of saying the "
+                               "data is missing. Answer from the results, per device with the rule / object names, and "
+                               "say which checks you ran. Nothing can be changed on any device.")
+        for rnd in range(9):
+            msg, usage = llm_chat(msgs, tools if rnd < 8 else None)
+            calls = msg.get("tool_calls") or []
+            if not calls:
+                answer = msg.get("content") or ""
+                break
+            msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
+            for c in calls[:4]:
+                fn = c.get("function") or {}
+                name, raw = str(fn.get("name") or ""), fn.get("arguments")
+                try:
+                    args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                except ValueError:
+                    args = {}
+                key = name + json.dumps(args, sort_keys=True, default=str)
+                if key in seen or len(steps) >= 8:
+                    res = {"ok": False, "error": "not run: repeated call or the 8-check limit was reached"}
+                else:
+                    seen.add(key)
+                    try:
+                        res = llm_run_tool(name, args)
+                    except ValueError as e:
+                        res = {"ok": False, "error": str(e)}
+                    except (urllib.error.URLError, OSError) as e:
+                        res = {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+                    steps.append({"call": llm_label(name, args), "ok": bool(res.get("ok")),
+                                  "verdict": (res.get("verdict") or {}).get("label", "") if isinstance(res.get("verdict"), dict) else "",
+                                  "error": res.get("error", ""),
+                                  "result": res if len(json.dumps(res, default=str)) < 3000000 else None})
+                txt, tr = llm_pack(res, max(3000, budget // 4))
+                seen_txt.append(txt)
+                trimmed = trimmed or tr
+                msgs.append({"role": "tool", "tool_call_id": c.get("id") or name, "name": name, "content": txt})
+        if not answer:
+            answer = "(The model stopped without a final answer.)"
+    answer = re.sub(r"(?s)<think>.*?</think>", "", answer).strip() or answer   # reasoning models' scratchpad
+    warn = ""
+    pt, est = usage.get("prompt_tokens") or 0, usage.pop("_est", 0)
+    if pt and est and pt < est * 0.5 and not usage.get("num_ctx"):
+        warn = ("The model server read only about %d of the roughly %d tokens sent: its context window is too small, so "
+                "the answer may not be based on the output. Raise the model's context length (LM Studio: Context "
+                "Length in the model settings; llama.cpp: -c) or lower the context budget here." % (pt, est))
+    corpus = "\n".join([m.get("content") or "" for m in msgs if isinstance(m.get("content"), str)] + seen_txt +
+                        [json.dumps(t, default=str) for t in (llm_tools() if mode == "agent" else [])])
+    unseen = llm_unseen_names(answer, corpus)
+    if unseen:
+        warn = ((warn + " ") if warn else "") + (
+            "Not found in the data the model was given: %s. The model may have made these up, so do not rely on them; "
+            "check the output panel or run the check yourself." % ", ".join(unseen))
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "answer": answer, "steps": steps,
+            "model": LLM_CFG["model"], "trimmed": trimmed, "usage": usage, "warning": warn, "sent": sent,
+            "unseen": unseen}
+
+
+def llm_wrap(fn):
+    def run(b):
+        try:
+            return fn(b)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        except (urllib.error.URLError, OSError) as e:
+            if isinstance(e, socket.timeout) or isinstance(getattr(e, "reason", None), socket.timeout):
+                return {"ok": False, "error": "the model server is running but %s sent nothing for %d s, so the request was "
+                        "stopped. The model is too slow on this PC: run 'ollama ps' (100%% CPU means no GPU is used), "
+                        "try a smaller model such as qwen2.5:7b, or lower the context budget in Model settings."
+                        % (LLM_CFG["model"] or "the model", LLM_WAIT)}
+            return {"ok": False, "error": "cannot reach the model server at %s: %s. Is it running (e.g. 'ollama serve')?"
+                                          % (LLM_CFG["url"], getattr(e, "reason", e))}
+    return run
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ITSecOps"
 
@@ -7622,19 +9429,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": "forbidden"})
         try:
             n = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(max(0, min(n, 1_000_000))) or b"{}")
+            lim = 20_000_000 if self.path == "/api/llm/chat" else 1_000_000   # the chat carries the current output
+            body = json.loads(self.rfile.read(max(0, min(n, lim))) or b"{}")
         except ValueError:
             return self._send(400, {"error": "bad json"})
         if not isinstance(body, dict):
             return self._send(400, {"error": "body must be a JSON object"})
         routes = {"/api/connect": do_connect, "/api/run": do_run,
                   "/api/raw": do_raw, "/api/disconnect": do_disconnect,
-                  "/api/ipcheck": do_ipcheck, "/api/f5host": do_f5_host, "/api/f5logs": do_f5_logs,
+                  "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/f5host": do_f5_host, "/api/f5logs": do_f5_logs,
                   "/api/f5capture": do_f5_capture, "/api/f5file": do_f5_file, "/api/policy": do_policy_search, "/api/profile/save": do_profile_save,
-                  "/api/profile/delete": do_profile_delete, "/api/health": do_health,
+                  "/api/profile/delete": do_profile_delete, 
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
                   "/api/fglogs": do_fg_logs, "/api/adminaudit": do_admin_audit, "/api/f5sync": do_f5_sync, "/api/pancapture": do_pan_capture,
-                  "/api/backup": do_backup, "/api/cf": do_cf, "/api/acc": do_acc}
+                  "/api/backup": do_backup, "/api/cf": do_cf, "/api/acc": do_acc,
+                  "/api/llm/config": llm_wrap(do_llm_config), "/api/llm/models": llm_wrap(do_llm_models),
+                  "/api/llm/chat": llm_wrap(do_llm_chat)}
         fn = routes.get(self.path)
         if not fn:
             return self._send(404, {"error": "not found"})
@@ -7662,7 +9472,15 @@ header{padding:14px 24px;border-bottom:1px solid var(--line);display:flex;align-
 header .logo{width:38px;height:38px;flex:none;filter:drop-shadow(0 0 8px #7C6CFF55)}
 header small{color:var(--dim)}
 .wrap{display:grid;grid-template-columns:320px 1fr;gap:18px;padding:18px 24px}
+.wrap>.outcard{grid-column:1/-1;min-width:0;margin-bottom:0}  /* Output spans the full width below both columns */
 @media(max-width:900px){.wrap{grid-template-columns:1fr}}
+/* Decorative emblem in the empty space below the sidebar; stays in view while the right column scrolls. */
+.bglogo{position:sticky;top:24px;margin:28px 12px 0;opacity:.6;pointer-events:none;user-select:none}
+.bglogo svg{width:100%;height:auto;display:block;font-family:system-ui,Segoe UI,Roboto,sans-serif}
+.bglogo .sweep{transform-origin:140px 150px;animation:bglspin 9s linear infinite}
+@keyframes bglspin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.bglogo .sweep{animation:none}}
+@media(max-width:900px){.bglogo{display:none}}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:16px}
 .card h3{margin:0 0 10px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
 label{display:block;font-size:12px;color:var(--dim);margin:8px 0 3px}
@@ -7711,7 +9529,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .nv{color:var(--dim)}
 #pretty details{margin:4px 0;border-left:2px solid var(--line);padding-left:10px}
 #pretty summary{cursor:pointer;color:var(--mint);padding:3px 0}
-#pretty .tw{overflow:auto;max-width:100%}
+#pretty .tw{overflow:auto;max-width:100%}#pretty table.wide td{min-width:90px}#pretty table.wide td:nth-child(n+6){min-width:140px}
 #pretty table{border-collapse:collapse;width:100%;font-size:12.5px}
 #pretty th{text-align:left;color:var(--mint);font-weight:600;border-bottom:1px solid var(--line);padding:5px 8px;white-space:nowrap;position:sticky;top:0;background:#0d0b22}
 #pretty td{padding:6px 10px;border-bottom:1px dashed #2a285088;vertical-align:top;overflow-wrap:break-word;line-height:1.5}
@@ -7720,6 +9538,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty tr:hover td{background:#7C6CFF14}
 #pretty .pill{display:inline-block;padding:1px 10px;border-radius:99px;font-size:12px;border:1px solid currentColor;white-space:nowrap}
 #pretty .pill.info{color:#b3a9ff}
+#pretty td .expired{color:var(--coral);font-weight:600}#pretty .chip.expired{background:#FF7A5926;border-color:var(--coral);color:var(--coral);font-weight:600}
 #pretty tr.deny td{background:#FF7A5920!important;color:var(--coral)}#pretty .logln.deny,#pretty .kvr.deny .v{color:var(--coral);font-weight:600}
 #pretty .chip{display:inline-block;margin:2px 4px 2px 0;padding:1px 8px;border-radius:6px;background:var(--panel2);white-space:nowrap}
 #pretty td:has(.chip){min-width:180px}#pretty .sev-high{color:var(--coral);font-weight:700}#pretty .sev-medium{color:#ffc857;font-weight:700}#pretty .sev-low{color:var(--dim)}
@@ -7747,6 +9566,64 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .dtop .dn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#pretty .dtop .dn.lnk{cursor:pointer;color:var(--mint)}
 #pretty .dtop .db{height:6px;border-radius:3px;background:var(--panel2)}#pretty .dtop .db span{display:block;height:6px;border-radius:3px;background:#3987e5}
 #pretty .dtabs{display:flex;gap:6px;flex-wrap:wrap}#pretty .dtabs button.on{border-color:var(--violet);box-shadow:0 0 12px #7C6CFF33;color:var(--mint)}
+#aicard{position:fixed;right:20px;bottom:84px;z-index:60;width:min(420px,calc(100vw - 32px));height:min(640px,calc(100vh - 110px));margin:0;padding:0;display:flex;flex-direction:column;background:#fff;color:#1d1d1f;border:0;border-radius:14px;overflow:hidden;box-shadow:0 16px 48px #000a}
+#aicard[hidden]{display:none}
+#aicard .aihead{display:flex;align-items:center;gap:12px;padding:12px 14px;background:#2b2b2e;color:#fff;flex:0 0 auto}
+#aicard .aihead .aititle{flex:1;min-width:0}#aicard .aihead b{display:block;font-size:15px;font-weight:600}
+#aicard .aihead small{display:block;font-size:12px;color:#b8b8c0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#aicard .aihead button{background:transparent;border:0;color:#d8d8de;font-size:16px;padding:4px 8px;border-radius:6px;box-shadow:none}
+#aicard .aihead button:hover{background:#ffffff1a;color:#fff}
+.aiav{position:relative;flex:0 0 auto;width:34px;height:34px;border-radius:50%;display:grid;place-items:center;font-size:16px;color:#04201c;background:linear-gradient(135deg,#1f8a7a,#2EE6C5)}
+.aiav.big::after{content:"";position:absolute;right:-1px;bottom:-1px;width:10px;height:10px;border-radius:50%;background:#22c55e;border:2px solid #2b2b2e}
+.aiav.big.off::after{background:#9ca3af}
+#aicard .aibody{overflow:auto;padding:14px 14px 6px;flex:1;min-height:0;background:#fff}
+#ai_log{margin:0}
+.airow{display:flex;gap:8px;align-items:flex-end;margin:8px 0}.airow.user{justify-content:flex-end}
+.airow .aiav{width:30px;height:30px;font-size:14px}
+.aimsg{padding:10px 14px;border-radius:16px;line-height:1.5;font-size:14px;max-width:85%;overflow-wrap:anywhere;min-width:0}
+.aimsg.bot{background:#f0f2f5;color:#1d1d1f;border-bottom-left-radius:4px}
+.aimsg.user{background:#2b2b2e;color:#fff;white-space:pre-wrap;border-bottom-right-radius:4px}
+.aimsg.err{background:#fff1f1;color:#b42318;border:1px solid #f3b4ae;border-bottom-left-radius:4px}
+.aimsg.aiwait{padding:12px 16px}
+.aimsg p{margin:4px 0}.aimsg ul{margin:4px 0 4px 20px;padding:0}.aimsg .aih{font-weight:600;margin:10px 0 2px}
+.aimsg pre{white-space:pre-wrap;background:#e4e7ec;color:#1d1d1f;padding:8px;border-radius:6px;font-size:12.5px}
+.aimsg code{background:#e4e7ec;color:#1d1d1f;padding:0 4px;border-radius:4px;font-size:12.5px}
+.aiwarn{background:#fff7e6;color:#8a4b00;border:1px solid #f5c26b;border-radius:8px;padding:6px 10px;margin:0 0 8px;font-size:12.5px;line-height:1.4}
+.aimeta{font-size:11.5px;color:#6b7280;margin-top:6px}.aimeta.bad{color:#b42318}.aimeta.lnk{color:#0b7a6a!important;text-decoration:underline}
+.aistep{font-size:12.5px;display:flex;gap:6px;align-items:center;margin:2px 0 6px;flex-wrap:wrap}.aistep .ok{color:#15803d}.aistep .bad{color:#b42318}.aistep .muted{color:#6b7280}
+#aicard .aistep button{padding:1px 10px;font-size:12px;background:#fff;color:#1d1d1f;border:1px solid #c4c8cf;border-radius:6px;box-shadow:none}
+.aidots{display:inline-flex;gap:5px}.aidots i{width:8px;height:8px;border-radius:50%;background:#6b7280;opacity:.25;animation:aidot 1.2s infinite ease-in-out}
+.aidots i:nth-child(2){animation-delay:.2s}.aidots i:nth-child(3){animation-delay:.4s}
+@keyframes aidot{0%,80%,100%{opacity:.25;transform:scale(.8)}40%{opacity:1;transform:scale(1.1)}}
+#ai_chips{display:flex;flex-direction:column;align-items:flex-end;gap:8px;margin:12px 0 6px}
+#aicard #ai_chips button{background:#fff;color:#1d1d1f;border:1.5px solid #2b2b2e;border-radius:10px;padding:8px 14px;font-size:14px;font-weight:400;box-shadow:none;width:auto}
+#aicard #ai_chips button:hover{background:#2b2b2e;color:#fff}
+#aicard.busy #ai_chips{display:none}
+#aicard button:disabled{opacity:.45;cursor:wait}
+#ai_cfg{background:#f7f7f9;border:1px solid #e3e5e8;border-radius:10px;padding:4px 12px 12px;margin-bottom:10px}
+#ai_cfg:not([open]){display:none}#ai_cfg summary{cursor:pointer;color:#4b5563;font-size:13px;padding:6px 0;font-weight:600}
+#aicard #ai_cfg label{color:#4b5563}#aicard #ai_cfg .chk{color:#4b5563;font-size:13px}#aicard #ai_cfg .row3{grid-template-columns:1fr 1fr}
+#aicard #ai_cfg input{background:#fff;color:#1d1d1f;border:1px solid #c4c8cf}
+#aicard #ai_cfg button{background:#fff;color:#1d1d1f;border:1px solid #c4c8cf;box-shadow:none;padding:6px 12px}
+#aicard #ai_cfg button.primary{background:#2b2b2e;color:#fff;border-color:#2b2b2e}
+#aicard #ai_cfg .row{align-items:center}#aicard #ai_cfg .row button{flex:0 0 auto;width:auto;min-width:110px}
+#ai_cfgmsg{font-size:12.5px;margin-top:8px}#ai_cfgmsg:empty{display:none}
+#ai_mlist{display:flex;flex-direction:column;gap:4px;margin-top:6px}#ai_mlist:empty{display:none}
+#aicard #ai_mlist button{text-align:left;width:100%;padding:6px 10px;font-size:13px;background:#fff;color:#1d1d1f;border:1px solid #d0d5dd;border-radius:8px;box-shadow:none;font-family:ui-monospace,Consolas,monospace}
+#aicard #ai_mlist button:hover{border-color:#2b2b2e}#aicard #ai_mlist button.cur{border-color:#1f8a7a;background:#ecfdf8;font-weight:600}
+#ai_cfgmsg.ok{color:#15803d}#ai_cfgmsg.bad{color:#b42318}#ai_cfgmsg.muted{color:#6b7280}
+#aicard .aifoot{flex:0 0 auto;border-top:1px solid #e5e7eb;background:#fff;padding:10px 12px 6px}
+#aicard .aiinput{display:flex;gap:8px;align-items:flex-end}
+#aicard textarea{flex:1;box-sizing:border-box;height:42px;min-height:42px;max-height:140px;resize:none;overflow-y:hidden;scrollbar-width:thin;line-height:20px;background:#fff;color:#1d1d1f;border:1px solid #d0d5dd;border-radius:10px;padding:10px 12px;font:inherit;font-size:14px}
+#aicard textarea:focus{outline:none;border-color:#2b2b2e}
+#aicard #ai_send{flex:0 0 auto;width:42px;height:42px;padding:0;border-radius:50%;border:0;background:#2b2b2e;color:#fff;font-size:17px;box-shadow:none}
+#aicard #ai_send:hover{background:#1f8a7a}
+#aicard .aiby{text-align:center;font-size:11.5px;color:#6b7280;padding:6px 0 2px}#aicard .aiby b{color:#1f8a7a;font-weight:600}
+#aifab{position:fixed;right:20px;bottom:20px;z-index:61;width:auto;height:52px;padding:0 20px;border-radius:26px;border:0;display:flex;flex-direction:row;align-items:center;gap:8px;background:linear-gradient(135deg,#1f8a7a,#2EE6C5);color:#04201c;box-shadow:0 6px 20px #0009;cursor:pointer;font-weight:700;font-size:15px;letter-spacing:.06em}
+#aifab:hover{filter:brightness(1.1);transform:translateY(-2px)}#aifab .fi{font-size:18px}
+@media(max-width:700px){#aicard{right:52px;width:calc(100vw - 68px)}#aicard #ai_cfg .row3{grid-template-columns:1fr}}
+#pretty .dwide{grid-column:span 2}@media(max-width:1180px){#pretty .dwide{grid-column:auto}}
+#pretty .dgauge{max-width:150px;margin:2px auto 0}#pretty .dgauge svg{width:100%;height:auto;display:block}
 #pretty .dtile.bad{border-color:var(--coral);box-shadow:0 0 10px #FF7A5933}#pretty .dtile.warn{border-color:#c98500}
 #pretty .fchip{display:inline-block;border:1px solid var(--line);border-radius:99px;padding:0 9px;margin:0 0 4px 6px;cursor:pointer;color:var(--mint)}
 #pretty .fchip:hover{border-color:var(--coral)}
@@ -7784,16 +9661,32 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
   <div class="card"><h3>Session</h3>
     <button onclick="showAudit()">View audit log</button>
     <p class="muted" style="margin:8px 0 0">Credentials stay in memory of the Python process. Closing it clears everything.</p></div>
+  <div class="bglogo" aria-hidden="true"><svg viewBox="0 0 280 350">
+    <defs><linearGradient id="bgl-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient>
+    <linearGradient id="bgl-sw" x1="1" y1="0" x2="0" y2="0"><stop offset="0" stop-color="#2EE6C5" stop-opacity=".28"/><stop offset="1" stop-color="#2EE6C5" stop-opacity="0"/></linearGradient></defs>
+    <g fill="none" stroke="#2a2850" stroke-width="1.2"><circle cx="140" cy="150" r="60"/><circle cx="140" cy="150" r="95" stroke-dasharray="3 5"/><circle cx="140" cy="150" r="130"/></g>
+    <path class="sweep" d="M140 150 L270 150 A130 130 0 0 0 239.6 66.4 Z" fill="url(#bgl-sw)"/>
+    <g stroke="#7C6CFF" stroke-opacity=".45" stroke-width="1.2" stroke-dasharray="2 4"><path d="M88 120 50 98M192 120 230 98M192 180 230 202M88 180 50 202"/></g>
+    <g font-size="9" font-weight="600" text-anchor="middle" fill="#8f8cb8" letter-spacing=".08em">
+      <circle cx="38" cy="91" r="16" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.5"/><text x="38" y="94.5">F5</text>
+      <circle cx="242" cy="91" r="16" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.5"/><text x="242" y="94.5">PAN</text>
+      <circle cx="242" cy="209" r="16" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.5"/><text x="242" y="212.5">FGT</text>
+      <circle cx="38" cy="209" r="16" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.5"/><text x="38" y="212.5">CF</text></g>
+    <g transform="translate(82.4 92.4) scale(3.2)"><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.4" stroke-linejoin="round"/>
+    <path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2" stroke-linecap="round"/></g>
+    <text x="140" y="318" text-anchor="middle" font-size="22" font-weight="700" fill="url(#bgl-g)">ITSec Ops</text>
+    <text x="140" y="340" text-anchor="middle" font-size="10" fill="#8f8cb8" letter-spacing=".25em">OBSERVE · TRACE · VERIFY</text>
+  </svg></div>
 </div>
 <div>
-  <div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
+  <div id="flowtrace"></div><div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
   <div id="iplookup"></div><div id="f5tools"></div>
-  <div id="health"></div>
   <div class="card" id="main"><h3>Checks</h3><div class="muted">Connect a device to begin.</div></div>
   <div class="card"><h3>Raw read-only query</h3>
     <div class="row"><input id="raw" placeholder="" style="flex:5"><button style="flex:1" onclick="runRaw()">Run</button></div>
     <div id="rawhint" class="muted" style="margin-top:6px"></div></div>
-  <div class="card"><h3>Output</h3>
+</div>
+  <div class="card outcard" id="outcard"><h3>Output</h3>
     <div class="meta"><span id="ometa">nothing run yet</span>
     <span id="fcount" class="muted" style="margin-left:auto"></span>
     <select id="stscope" style="display:none;max-width:150px" onchange="renderOut()" title="Which status column to test"><option value="">any status column</option><option value="vs">VS status</option><option value="pool">Pool status</option><option value="member">Member status</option></select>
@@ -7802,7 +9695,33 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
     <button onclick="copyOut()">Copy</button>
     <button onclick="exportCsv()">Findings CSV</button><button onclick="exportHtml()">HTML report</button></div>
     <div id="verdict"></div><div id="pretty"></div></div>
-</div></div>
+</div>
+  <div id="aicard" role="dialog" aria-label="AI assistant" hidden>
+    <div class="aihead"><span class="aiav big off" id="ai_av">✦</span>
+      <div class="aititle"><b>ITSec Assistant</b><small id="ai_sub">local LLM · no model set</small></div>
+      <button onclick="aiCfg()" title="Model settings" aria-label="Model settings">⚙</button>
+      <button onclick="aiClear()" title="New conversation" aria-label="New conversation">↻</button>
+      <button onclick="aiToggle(false)" title="Close (Esc)" aria-label="Close">✕</button></div>
+    <div class="aibody">
+    <details id="ai_cfg"><summary>Model settings</summary>
+      <div class="row3" style="margin-top:4px">
+        <div><label>Model server (OpenAI-compatible API)</label><input id="ai_url" placeholder="http://127.0.0.1:11434/v1"></div>
+        <div><label>Model</label><input id="ai_model" list="ai_models" placeholder="qwen2.5:7b"><datalist id="ai_models"></datalist></div>
+        <div><label>API key (optional, kept in memory only)</label><input id="ai_key" type="password" placeholder="(none)" autocomplete="off"></div>
+        <div><label>Context budget (characters sent per output)</label><input id="ai_budget" value="24000"></div>
+      </div>
+      <div id="ai_route" class="muted" style="font-size:12.5px;margin-top:6px"></div>
+      <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px"><button onclick="aiModels()">List models</button><button class="primary" onclick="aiSave(true)">Save</button></div>
+      <div id="ai_cfgmsg" class="muted"></div><div id="ai_mlist"></div>
+    </details>
+    <div id="ai_log"></div>
+    <div id="ai_chips"><button onclick="aiAsk('explain')">Explain the current output</button><button onclick="aiAsk('chat')">Ask about the current output</button><button onclick="aiAsk('agent')">Ask &amp; run read-only checks</button><button onclick="aiClear()">Start a new conversation</button></div>
+    </div>
+    <div class="aifoot"><div class="aiinput"><textarea id="ai_q" rows="1" placeholder="Type your message…" title="Enter sends, Shift+Enter adds a new line"></textarea>
+      <button id="ai_send" onclick="aiSend()" title="Send" aria-label="Send">➤</button></div>
+      <div class="aiby">Powered by <b>✦ <span id="ai_by">local LLM</span></b> · read-only</div></div>
+  </div>
+<button id="aifab" onclick="aiToggle()" title="AI assistant (local LLM)" aria-label="AI assistant"><span class="fi">✦</span><span class="ft">AI</span></button>
 <script>
 const T="__TOKEN__";const $=s=>document.querySelector(s);let catalog={},devices=[],cur=null,last=null;
 const hints={f5:"GET path, e.g. /mgmt/tm/ltm/virtual?$select=name,destination",
@@ -7854,9 +9773,24 @@ async function disconnect(id,ev){ev.stopPropagation();await api("/api/disconnect
  devices=devices.filter(d=>d.id!==id);if(cur===id)cur=devices.length?devices[0].id:null;renderAll()}
 function select(id){cur=id;renderAll()}
 function dev(){return devices.find(d=>d.id===cur)}
-function renderAll(){renderDevs();renderChecks();renderCf();renderAcc();renderAppsec();renderIp();renderF5();renderHealth();const d=dev();
+function renderAll(){renderDevs();renderChecks();renderCf();renderAcc();renderAppsec();renderIp();renderF5();const d=dev();
  $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:""}
-function renderDevs(){const el=$("#devs");el.innerHTML="";
+function renderFlow(){const box=$("#flowtrace");if(!devices.length){box.innerHTML="";return}
+ const vs=[...new Set(devices.map(d=>d.vendor))].map(v=>({cloudflare:"Cloudflare",f5:"F5",paloalto:"Palo Alto",fortigate:"FortiGate"})[v]||v).join(" · ");
+ if(!$("#ft_dst")){box.innerHTML='<div class="card"><h3>Flow trace · one flow on every connected device</h3><div class="row3">'+
+  fld("ft_src","Source / client IP","203.0.113.5")+fld("ft_dst","Destination IP or hostname","shop.example.com or 10.5.1.20")+
+  fld("ft_port","Destination port (optional)","443")+
+  '<div><label>Protocol</label><select id="ft_proto"><option>tcp</option><option>udp</option><option>icmp</option></select></div>'+
+  '<div><label>Events / logs time range</label><select id="ft_within"><option>last 15 minutes</option><option>last hour</option><option>last 6 hours</option><option>last 12 hours</option><option selected>last 24 hours</option></select></div></div>'+
+  '<div class="chk"><input type="checkbox" id="ft_logs"><span>Also search logs (F5 WAF log, Palo Alto / FortiGate traffic logs). Slower: up to a few minutes.</span></div>'+
+  '<div class="row" style="margin-top:10px"><button class="primary" onclick="flowTrace()">Trace flow</button></div>'+
+  '<p class="muted" style="margin:8px 0 0" id="ft_note"></p></div>'}
+ $("#ft_note").textContent="Follows the path Cloudflare → FortiGate DMZ → F5 DMZ → Palo Alto on the "+devices.length+" connected device(s) ("+vs+"). Each device is tested with the addresses it sees: Cloudflare edge address → origin IP on the FortiGate, the VIP's mapped address on the F5, the F5 SNAT address → pool member on the Palo Alto. Devices not connected are skipped. Read-only."}
+async function flowTrace(){if(!g("ft_dst").trim())return show({ok:false,error:"enter the destination IP or hostname"},"flow trace");
+ setBusy("flow trace on "+devices.length+" device(s)"+($("#ft_logs").checked?" + logs (up to a few minutes)":""));
+ show(await api("/api/flowtrace",{src:g("ft_src").trim(),dst:g("ft_dst").trim(),port:g("ft_port"),proto:g("ft_proto"),
+  within:g("ft_within"),logs:$("#ft_logs").checked}),"flow trace (all devices)")}
+function renderDevs(){const el=$("#devs");el.innerHTML="";renderFlow();
  if(!devices.length){el.textContent="No devices connected.";return}
  devices.forEach(d=>{const x=document.createElement("div");x.className="dev"+(d.id===cur?" sel":"");
   x.onclick=()=>select(d.id);
@@ -7865,24 +9799,6 @@ function renderDevs(){const el=$("#devs");el.innerHTML="";
   const h=document.createElement("small");h.className="muted";h.textContent=" "+d.host;l.appendChild(h);
   const b=document.createElement("button");b.textContent="✕";b.onclick=e=>disconnect(d.id,e);
   x.appendChild(l);x.appendChild(b);el.appendChild(x)})}
-function renderHealth(){const box=$("#health");box.innerHTML="";const d=dev();if(!d)return;
- const card=document.createElement("div");card.className="card";
- const title=document.createElement("h3");title.textContent="Read-only health snapshot";card.appendChild(title);
- const note=document.createElement("p");note.className="muted";
- note.textContent="Runs a small vendor-specific check set. This reports API response success, not whether device metrics meet your operational thresholds.";
- card.appendChild(note);const button=document.createElement("button");button.className="primary";
- button.textContent="Run snapshot";button.onclick=runHealth;card.appendChild(button);
- if(d.vendor==="paloalto"||d.vendor==="fortigate"){const rb=document.createElement("button");rb.className="primary";rb.style.marginLeft="8px";
-  rb.textContent="Resource utilization";rb.onclick=resUtil;card.appendChild(rb);
-  const rs=document.createElement("select");rs.id="ru_range";rs.style.cssText="width:auto;margin-left:8px";
-  rs.title=d.vendor==="paloalto"?"PAN-OS keeps dataplane history per minute (60), hour (24), day (7) and week (13)":
-   "FortiOS keeps resource history for 24 hours; longer ranges add memory conserve-mode events from the event log";
-  [["1h","last hour"],["6h","last 6 hours"],["24h","last 24 hours"],["3d","last 3 days"],["7d","last 7 days"]].concat(
-   d.vendor==="paloalto"?[["4w","last 4 weeks"],["13w","last 13 weeks"]]:[["30d","last 30 days (events)"]]).forEach(([v,l])=>{
-   const o=document.createElement("option");o.value=v;o.textContent=l;rs.appendChild(o)});card.appendChild(rs)}
- box.appendChild(card)}
-async function resUtil(){const c=(catalog[(dev()||{}).vendor]||[]).find(x=>x.id==="resutil");if(c)run(c,{range:$("#ru_range")||{value:"1h"}})}
-async function runHealth(){setBusy("health snapshot");const r=await api("/api/health",{id:cur});show(r,"health snapshot")}
 function renderChecks(){const m=$("#main");m.innerHTML="<h3>Checks</h3>";const d=dev();
  if(!d){m.innerHTML+="<div class='muted'>Connect a device to begin.</div>";return}
  const list=catalog[d.vendor];const groups=[...new Set(list.map(c=>c.group))];
@@ -7894,7 +9810,7 @@ function renderChecks(){const m=$("#main");m.innerHTML="<h3>Checks</h3>";const d
    const b=document.createElement("button");b.textContent="Run";
    b.onclick=()=>run(c,ins);r.appendChild(b);m.appendChild(r)})})}
 async function run(c,ins){const p={};for(const k in ins)p[k]=ins[k].value;
- setBusy(c.label);const r=await api("/api/run",{id:cur,check:c.id,params:p});show(r,c.label)}
+ setBusy(c.label);const r=await api("/api/run",{id:cur,check:c.id,params:p,ack:!!($("#f5ack")&&$("#f5ack").checked)});show(r,c.label)}
 async function runRaw(){const q=$("#raw").value;if(!q)return;setBusy("raw query");
  const r=await api("/api/raw",{id:cur,query:q});show(r,"raw")}
 function setBusy(l){$("#ometa").textContent="running "+l+"…";$("#pretty").textContent="";$("#verdict").innerHTML=""}
@@ -7938,6 +9854,7 @@ function tableSec(title,rows){
  const data=rows.map(r=>{const o={};cols.forEach(c=>o[c]=cellv(r[c]));return o});
  cols=cols.filter(c=>data.some(r=>r[c]!==""));
  if(cols.includes("vs_name")||cols.includes("pool_member_ip")||cols.includes("policy_name")||cols.includes("cf_zone")||cols.includes("pool_enabled"))return {t:"table",title,cols,data};  // F5 VS overview, Cloudflare: keep the column order given
+ if(cols.includes("negate_destination"))return {t:"table",title,cols,data,wide:true};  // PAN / FortiGate policies: every column, in rule order (source, destination, service, ...)
  const lead=/^(name|fullPath|@name|label|object|rule|policy|id|policyid|time|t|severity|support_id|hostname|block_reason)$/i;
  const head=cols.filter(c=>lead.test(c)),rest=cols.filter(c=>!lead.test(c));
  const pr=/(status|state|avail|enabled|conn|bits|pkts|cpu|usage|used|total|address|ip|action|port|type)/i;
@@ -7979,7 +9896,7 @@ function secNode(s){const w=mk("div","rsec");
  if(s.title)w.appendChild(mk("div","sec",s.title+(s.t==="table"?" ("+s.data.length+")":s.t==="list"?" ("+s.items.length+")":"")));
  if(s.t==="kv"){const b=mk("div","kv");s.rows.forEach(([k,v])=>{const r=mk("div","kvr");r.appendChild(mk("div","k",k));
    const c=mk("div","v");c.appendChild(cellNode(v));r.appendChild(c);b.appendChild(r)});w.appendChild(b)}
- else if(s.t==="table"){const box=mk("div","tw"),t=mk("table"),h=mk("tr");
+ else if(s.t==="table"){const box=mk("div","tw"),t=mk("table",s.wide?"wide":null),h=mk("tr");
   s.cols.forEach(c=>h.appendChild(mk("th",null,hum(c))));t.appendChild(h);
   s.data.forEach(r=>{const tr=mk("tr");s.cols.forEach(c=>{const td=mk("td");
    if(c==="severity"&&r[c])td.appendChild(mk("span","sev-"+String(r[c]).toLowerCase(),String(r[c]).toUpperCase()));
@@ -7991,17 +9908,23 @@ function secNode(s){const w=mk("div","rsec");
  return w}
 function renderOut(){const box=$("#pretty");box.textContent="";if(!last)return;
  if(last.error){box.appendChild(mk("div","bad",last.error));return}
- box.classList.toggle("tall",!!(last.dashboard||last.charts||last.acc||last.tiles));
+ box.classList.toggle("tall",!!(last.dashboard||last.charts||last.acc||last.tiles||last.bars));
  if(Array.isArray(last.tiles)&&last.tiles.length)box.appendChild(tilesNode(last.tiles));
+ if(Array.isArray(last.charts)&&last.charts.length&&last.bars)box.appendChild(chartsNode(last.charts,last.heat));
+ if(Array.isArray(last.bars)&&last.bars.length)box.appendChild(barsNode(last.bars));
  if(last.dashboard)box.appendChild(dashNode(last.dashboard));
  if(last.acc)box.appendChild(accNode(last.acc));  // charts first; the tables below are the table view
- if(Array.isArray(last.charts)&&last.charts.length)box.appendChild(chartsNode(last.charts));
+ if(Array.isArray(last.charts)&&last.charts.length&&!last.bars)box.appendChild(chartsNode(last.charts,last.heat));
  buildSections(last.data).forEach(s=>box.appendChild(secNode(s)));
  if(!box.childNodes.length)box.appendChild(mk("div","nv","Nothing to show for this check."));
  // Blocked / denied traffic in red: table rows with a deny-type cell, and log lines whose action precedes " -> ".
  const DENY=/^(deny|denied|drop|dropped|block|blocked|block-\w+|reset|reset-\w+|blackhole|sinkhole)$/i,DENYW=/\b(deny|denied|drop|dropped|block|blocked|block-\w+|reset-\w+)\b/i;
  box.querySelectorAll("tr:not(:first-child)").forEach(tr=>{if([...tr.children].some(td=>DENY.test(td.textContent.trim())))tr.classList.add("deny")});
  box.querySelectorAll(".logln").forEach(l=>{if(DENYW.test(l.textContent.split(" -> ")[0]))l.classList.add("deny")});
+ // Expired certificates: the row when a cell says EXPIRED, only the chip when one entry of a list is expired
+ box.querySelectorAll("td").forEach(td=>{const t=td.textContent.trim();if(t==="EXPIRED"){td.parentElement.classList.add("deny");return}
+  if(/\bEXPIRED\b/.test(t)&&!td.querySelector(".chip")){td.textContent="";t.split(/, (?=\/)/).forEach(x=>td.appendChild(mk("div",/\bEXPIRED\b/.test(x)?"expired":"",x)))}});
+ box.querySelectorAll(".chip").forEach(c=>{if(/\bEXPIRED\b/.test(c.textContent))c.classList.add("expired")});
  box.querySelectorAll(".kvr").forEach(r=>{const v=r.querySelector(".v");if(v&&DENY.test(v.textContent.trim()))r.classList.add("deny")});
  // Filter: words are ANDed, a leading "-" excludes a word (e.g.  certificate -expired). Applies to log lines,
  // table rows, key/value rows and list items.
@@ -8037,24 +9960,23 @@ async function showAudit(){const r=await api("/api/audit");last={ok:true,status:
 function fld(id,l,ph,v){return '<div><label>'+l+'</label><input id="'+id+'" placeholder="'+ph+'" value="'+(v||'')+'"></div>'}
 function g(i){const e=$("#"+i);return e?e.value:""}
 function renderIp(){const box=$("#iplookup");box.innerHTML="";const d=dev();if(!d||d.vendor==="cloudflare")return;const v=d.vendor;
- let h='<div class="card"><h3>IP lookup · '+(v==="f5"?"pools, nodes, virtual servers, data groups, local traffic policies":"policy references")+'</h3><div class="row3">'+fld("ip_ip","IP address","203.0.113.7");
- if(v!=="f5"){
-  h+=v==="paloalto"?fld("ip_vsys","vsys","vsys1","vsys1"):fld("ip_vdom","VDOM (optional)","root");
- }
+ if(v==="paloalto"||v==="fortigate"){const pan=v==="paloalto";
+  box.innerHTML='<div class="card"><h3>Policy lookup · by IP, by '+(pan?'rule name, or list all security rules':'policy name or ID, or list all firewall policies')+'</h3><div class="row3">'+
+  (pan?fld("pl_q","IP, subnet or rule name (blank = all rules)","10.1.1.10, 10.1.2.32/28 or allow-web")+fld("pl_vsys","vsys","vsys1","vsys1")
+      :fld("pl_q","IP, subnet, policy name or ID (blank = all policies)","10.1.1.10, 10.1.2.32/28, web-in or 12")+fld("pl_vdom","VDOM (optional)","root"))+'</div>'+
+  '<div class="row" style="margin-top:10px"><button class="primary" onclick="fwLookup()">Look up</button><button onclick="fwLookup(true)">List all policies</button></div>'+
+  '<p class="muted" style="margin:8px 0 0">An IP or subnet shows the address objects and '+(pan?'rules':'policies')+' that reference or overlap it; '+(pan?'any other text finds rules whose name contains it':'a number finds that policy ID, any other text finds policies whose name contains it')+'. Reads the running config (read-only).</p></div>'+
+  '<div class="card"><h3>Flow check · which '+(pan?'rule':'policy')+' allows or blocks source → destination</h3><div class="row3">'+
+  fld("fc_src","Source IP","10.1.1.10")+fld("fc_dst","Destination IP","203.0.113.10")+fld("fc_port","Destination port (optional)","443")+
+  '<div><label>Protocol</label><select id="fc_proto"><option>tcp</option><option>udp</option><option>icmp</option></select></div>'+
+  (pan?fld("fc_from","From zone (optional)","trust")+fld("fc_to","To zone (optional)","untrust")
+      :fld("fc_if","Ingress interface (optional, auto from route)","port1"))+'</div>'+
+  '<div class="row" style="margin-top:10px"><button class="primary" onclick="flowCheck()">Check flow</button></div>'+
+  '<p class="muted" style="margin:8px 0 0">'+(pan?"Runs 'test security-policy-match' (as Device &gt; Test Policy Match), so Panorama-pushed rules are covered. Leave the zones blank to let the firewall evaluate all rules; vsys is taken from the box above.":
+   "Runs FortiOS policy lookup (as Policy &amp; Objects &gt; Policy Lookup). Leave the ingress interface blank to use the interface of the route back to the source; VDOM is taken from the box above.")+
+  ' Read-only.</p></div>';return}
+ let h='<div class="card"><h3>IP lookup · pools, nodes, virtual servers, data groups, local traffic policies</h3><div class="row3">'+fld("ip_ip","IP address","203.0.113.7");
  h+='</div><div style="margin-top:10px"><button class="primary" onclick="ipLookup()">Check</button></div></div>';
- if(v!=="f5"){const pan=v==="paloalto";
-  h+='<div class="card"><h3>Policy lookup · find a '+(pan?"security rule":"firewall policy")+' by name, or which one allows or blocks a flow</h3>'+
-   '<div class="grp">By name</div><div class="row3">'+fld("pm_name",pan?"Rule name (or part of it)":"Policy name (or part of it) or policy ID",pan?"allow-web":"web-in or 12")+'</div>'+
-   '<div style="margin-top:10px"><button class="primary" onclick="policyByName()">Find policy</button></div>'+
-   '<div class="grp">By flow</div><div class="row3">'+
-   fld("pm_src","Source IP","198.51.100.9")+fld("pm_dst","Destination IP","203.0.113.10")+fld("pm_port","Destination port (optional)","443")+
-   '<div><label>Protocol</label><select id="pm_proto"><option>tcp</option><option>udp</option><option>icmp</option></select></div>'+
-   (pan?fld("pm_from","From zone (optional)","untrust")+fld("pm_to","To zone (optional)","trust")+fld("pm_vsys","vsys","vsys1","vsys1")
-       :fld("pm_if","Ingress interface (required)","port1")+fld("pm_vdom","VDOM (optional)","root"))+
-   '</div><div style="margin-top:10px"><button class="primary" onclick="policyLookup()">Look up policy</button></div>'+
-   '<p class="muted" style="margin:8px 0 0">'+(pan?"Runs 'test security-policy-match' (as Device &gt; Test Policy Match), so it also covers Panorama-pushed rules. Zones narrow the match; leave them blank to let the firewall evaluate all rules.":
-    "Runs FortiOS policy lookup (as Policy &amp; Objects &gt; Policy Lookup). The ingress interface is the one the first packet arrives on, e.g. port1 or a VLAN interface.")+
-   ' Read-only: nothing is changed on the device.</p></div>'}
  if(v==="f5")h+='<div class="card"><h3>Hostname lookup · virtual server and local traffic policy</h3><div class="row3">'+fld("fh_host","Hostname","app.example.com")+
   '</div><div style="margin-top:10px"><button class="primary" onclick="f5Host()">Find virtual server / policy</button></div></div>';
  box.innerHTML=h}
@@ -8062,12 +9984,15 @@ async function f5Host(){setBusy("hostname lookup");
  const r=await api("/api/f5host",{id:cur,hostname:g("fh_host")});show(r,"hostname lookup")}
 async function ipLookup(){setBusy("IP lookup");
  const r=await api("/api/ipcheck",{id:cur,ip:g("ip_ip"),mode:"refs",vsys:g("ip_vsys"),vdom:g("ip_vdom")});show(r,"IP lookup")}
-async function policyByName(){setBusy("policy search");
- const r=await api("/api/policy",{id:cur,name:g("pm_name"),vsys:g("pm_vsys"),vdom:g("pm_vdom")});show(r,"policy search")}
-async function policyLookup(){if(!g("pm_src").trim()||!g("pm_dst").trim())return show({ok:false,error:"enter both the source and the destination IP"},"policy lookup");
- setBusy("policy lookup");
- const r=await api("/api/ipcheck",{id:cur,mode:"verdict",ip:g("pm_src"),peer:g("pm_dst"),role:"source",port:g("pm_port"),proto:g("pm_proto"),
-  from:g("pm_from"),to:g("pm_to"),vsys:g("pm_vsys"),srcintf:g("pm_if"),vdom:g("pm_vdom")});show(r,"policy lookup")}
+async function flowCheck(){if(!g("fc_src").trim()||!g("fc_dst").trim())return show({ok:false,error:"enter both the source and the destination IP"},"flow check");
+ setBusy("flow check");
+ show(await api("/api/ipcheck",{id:cur,mode:"verdict",ip:g("fc_src").trim(),peer:g("fc_dst").trim(),role:"source",port:g("fc_port"),proto:g("fc_proto"),
+  from:g("fc_from"),to:g("fc_to"),srcintf:g("fc_if"),vsys:g("pl_vsys"),vdom:g("pl_vdom")}),"flow check")}
+async function fwLookup(all){const q=g("pl_q").trim(),vs=g("pl_vsys"),vd=g("pl_vdom");
+ if(all||!q){setBusy("all policies");return show(await api("/api/policy",{id:cur,all:true,vsys:vs,vdom:vd}),"all policies")}
+ if(/^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(q)||/^[0-9a-f]*:[0-9a-f]*:[0-9a-f:.]*(\/\d{1,3})?$/i.test(q)){setBusy("IP lookup");
+  return show(await api("/api/ipcheck",{id:cur,ip:q,mode:"refs",vsys:vs,vdom:vd}),"IP lookup")}
+ setBusy("policy search");show(await api("/api/policy",{id:cur,name:q,vsys:vs,vdom:vd}),"policy search")}
 function renderF5(){const box=$("#f5tools");box.innerHTML="";const d=dev();if(!d||d.vendor!=="f5")return;
  box.innerHTML='<div class="card warnbox"><h3>F5 active tools · run shell commands on the BIG-IP</h3>'+
  '<p class="muted" style="margin:0 0 8px">Uses POST /mgmt/tm/util/bash (Administrator role). Commands are fixed templates and only validated values are inserted. tcpdump adds CPU load, and captures may contain sensitive data.</p>'+
@@ -8276,9 +10201,29 @@ function dashPick(label,bucket){const secs=DBUCKET[bucket],t=Date.parse(String(l
  if(secs===60)cfRun("requests","Cloudflare sampled requests · "+since+" → "+until+" (UTC+3)",Object.assign(cfHtF(),dashX,{since,until,top:g("cf_t_n")}));
  else cfDash(Object.assign({},dashX,{since,until}))}
 function cfUrl(){cfRun("url","Cloudflare URL response time",{url:g("cf_u_url"),match:g("cf_u_match"),status:g("cf_u_st"),cache:g("cf_u_cache"),ip:g("cf_u_ip"),top:g("cf_u_n")})}
-function chartsNode(list){const grid=mk("div","dgrid");grid.style.marginBottom="16px";
- list.forEach(c=>grid.appendChild(dChart(c.title,c.t,c.series.map(([n,v],i)=>({name:n,color:DC[i],vals:v})),
-  {fmt:DFMT[c.fmt]||dNum,noTotal:c.fmt!=="num"})));return grid}
+function chartsNode(list,heat){const grid=mk("div","dgrid");grid.style.marginBottom="16px";
+ grid.style.gridTemplateColumns="repeat(auto-fill,minmax(min(100%,520px),1fr))";  // a lone chart keeps a column's width instead of stretching
+ list.forEach(c=>grid.appendChild(dChart(c.title,c.t,c.series.map(([n,v],i)=>({name:n,color:DC[i%DC.length],vals:v})),
+  {fmt:DFMT[c.fmt]||dNum,noTotal:c.fmt!=="num",gaps:true})));
+ (heat||[]).forEach(h=>grid.appendChild(dHeat(h)));return grid}
+// Heatmap: one row per core, one column per time bucket, colour = load (dark = idle, blue -> amber -> red)
+function dHeatColor(v){if(v==null)return "transparent";if(v<1)return "#1d1b3a";
+ const st=[[0,[29,27,58]],[30,[57,135,229]],[70,[201,133,0]],[100,[217,89,38]]];v=Math.min(100,v);
+ for(let i=1;i<st.length;i++)if(v<=st[i][0]){const [a,ca]=st[i-1],[b,cb]=st[i],f=(v-a)/(b-a);
+  return "rgb("+ca.map((x,k)=>Math.round(x+(cb[k]-x)*f)).join(",")+")"}return "rgb(217,89,38)"}
+function dHeat(h){const card=mk("div","dcard dwide");card.appendChild(mk("div","sec",h.title));
+ const rows=h.rows,n=h.t.length;if(!rows.length||!n){card.appendChild(mk("div","nv","No data."));return card}
+ const W=1280,L=64,R=8,T=4,rh=Math.max(5,Math.min(40,200/rows.length)),H=T+rh*rows.length+24,cw=(W-L-R)/n,sl=dShort(h.t);
+ let s='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+esc(h.title)+'">';
+ rows.forEach(([name,vals],r)=>{const y=T+r*rh;
+  if(rh>=9||r%Math.ceil(9/rh)===0)s+='<text x="'+(L-6)+'" y="'+(y+rh/2+4).toFixed(1)+'" text-anchor="end" font-size="11" fill="#8f8cb8">'+esc(name)+'</text>';
+  vals.forEach((v,i)=>{s+='<rect x="'+(L+i*cw).toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+Math.max(0.5,cw-(cw>4?1:0)).toFixed(1)+'" height="'+Math.max(1,rh-1).toFixed(1)+'" fill="'+dHeatColor(v)+'"><title>'+esc(name+" · "+h.t[i]+": "+(v==null?"n/a":v+"%"))+'</title></rect>'})});
+ const ticks=Math.min(6,n);for(let k=0;k<ticks;k++){const i=Math.round(k*(n-1)/Math.max(1,ticks-1)),last=k===ticks-1&&ticks>1;
+  s+='<text x="'+(last?W-R:L+cw*i+cw/2).toFixed(1)+'" y="'+(H-6)+'" text-anchor="'+(last?"end":"middle")+'" font-size="12" fill="#8f8cb8">'+esc(sl[i])+'</text>'}
+ const box=mk("div");box.innerHTML=s+'</svg>';card.appendChild(box);
+ const lg=mk("div","dleg");[["idle",0],["30%",30],["70%",70],["100%",100]].forEach(([l,v])=>{const x=mk("span"),sw=mk("i");sw.style.background=dHeatColor(v||0.5);
+  if(!v)sw.style.background="#1d1b3a";x.appendChild(sw);x.appendChild(document.createTextNode(l));lg.appendChild(x)});card.appendChild(lg);
+ return card}
 // ---- Cloudflare traffic dashboard: inline SVG charts (palette validated for the dark chart surface) ----
 const DC=["#3987e5","#d95926","#199e70","#c98500","#d55181","#008300"],DOTHER="#8f8cb8";
 const DKEYS={status:["2xx","3xx","4xx","5xx","1xx"],cache:["hit","miss","dynamic","bypass","none","expired"],ttfb:["p50","p95","p99"]};
@@ -8313,8 +10258,8 @@ function dChart(title,labels,series,o){
   for(let i=0;i<n;i++){let base=0;const x=(L+step*i+(step-bw)/2).toFixed(1);
    series.forEach(sr=>{const v=sr.vals[i]||0;if(!v)return;const y1=y(base+v),seg=y(base)-y1,gap=base&&seg>3?1:0;  // 1px surface gap between segments
     s+='<rect x="'+x+'" y="'+y1.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(0,seg-gap).toFixed(1)+'" fill="'+sr.color+'"/>';base+=v})}}
- else series.forEach(sr=>{const pts=sr.vals.map((v,i)=>(L+step*i+step/2).toFixed(1)+","+y(v||0).toFixed(1)).join(" ");
-  s+='<polyline points="'+pts+'" fill="none" stroke="'+sr.color+'" stroke-width="2" stroke-linejoin="round"/>'});
+ else series.forEach(sr=>{let seg=[];const flush=()=>{if(seg.length)s+='<polyline points="'+seg.join(" ")+'" fill="none" stroke="'+sr.color+'" stroke-width="2" stroke-linejoin="round"/>';seg=[]};
+  sr.vals.forEach((v,i)=>{if(v==null&&o.gaps)return flush();seg.push((L+step*i+step/2).toFixed(1)+","+y(v||0).toFixed(1))});flush()});
  for(let i=0;i<n;i++){const tip=labels[i]+"\n"+series.map(sr=>sr.name+": "+fmt(sr.vals[i]||0)).join("\n")+(o.pick?"\n"+o.pickTip:"");
   s+='<rect class="hv" data-i="'+i+'" x="'+(L+step*i).toFixed(1)+'" y="'+T+'" width="'+Math.max(step,1).toFixed(1)+'" height="'+ph+'"'+
    (o.pick?' style="cursor:pointer"':'')+'><title>'+esc(tip)+'</title></rect>'}
@@ -8366,11 +10311,107 @@ function renderAcc(){const box=$("#acc");box.innerHTML="";const d=dev();if(!d||(
   '<p class="muted" style="margin:8px 0 0">Reads the newest '+(pan?'traffic, threat and URL':'traffic, IPS, antivirus and web-filter')+
   ' logs in the time range (filters are applied by the firewall) and summarises them: network, threat, blocked and URL activity. '+
   'On a busy firewall the read limit can cover less than the whole range; the output says how much was covered.</p></div>'}
+// Arc gauge (240 degrees) for a percentage tile: green, amber at the warning threshold, red at the high one
+function dGauge(v,kind){const cx=60,cy=56,r=44,A0=210,SW=240,p=Math.max(0,Math.min(100,v))/100;
+ const pt=a=>[(cx+r*Math.cos(a*Math.PI/180)).toFixed(2),(cy-r*Math.sin(a*Math.PI/180)).toFixed(2)];
+ const arc=(a1,a2)=>{const s=pt(a1),e=pt(a2);return "M"+s[0]+" "+s[1]+" A"+r+" "+r+" 0 "+(a1-a2>180?1:0)+" 1 "+e[0]+" "+e[1]};
+ const col=kind==="bad"?DC[1]:kind==="warn"?DC[3]:DC[2];
+ return '<svg viewBox="0 0 120 92" role="img" aria-label="'+v.toFixed(1)+'%">'+
+  '<path d="'+arc(A0,A0-SW)+'" fill="none" stroke="#2a2850" stroke-width="9" stroke-linecap="round"/>'+
+  (p>0.004?'<path d="'+arc(A0,A0-SW*p)+'" fill="none" stroke="'+col+'" stroke-width="9" stroke-linecap="round"/>':'')+
+  '<text x="'+cx+'" y="'+(cy+7)+'" text-anchor="middle" font-size="19" font-weight="600" fill="'+col+'">'+v.toFixed(1)+'%</text>'+
+  '<text x="'+(cx-34)+'" y="88" text-anchor="middle" font-size="9" fill="#8f8cb8">0</text><text x="'+(cx+34)+'" y="88" text-anchor="middle" font-size="9" fill="#8f8cb8">100</text></svg>'}
 function tilesNode(list){const w=mk("div","dtiles");w.style.marginBottom="12px";
  list.forEach(t=>{const x=mk("div","dtile"+(t.kind?" "+t.kind:""));x.appendChild(mk("div","dl",t.label));
-  x.appendChild(mk("div","dv",t.value==null?"n/a":t.fmt==="pct"?(+t.value).toFixed(1)+"%":(DFMT[t.fmt]||dNum)(t.value)));
+  if(t.fmt==="pct"&&t.value!=null){const gg=mk("div","dgauge");gg.innerHTML=dGauge(+t.value,t.kind);x.appendChild(gg)}
+  else x.appendChild(mk("div","dv",t.value==null?"n/a":t.fmt==="pct"?(+t.value).toFixed(1)+"%":(DFMT[t.fmt]||dNum)(t.value)));
   if(t.sub)x.appendChild(mk("div","dl",t.sub));
   if(t.spark&&t.spark.length>1){const sp=mk("div");sp.innerHTML=dSpark(t.spark);x.appendChild(sp)}w.appendChild(x)});return w}
+// ---- AI assistant (local LLM): explain / chat about the current output, or let the model run read-only checks ----
+let aiHist=[];
+async function aiInit(){const r=await api("/api/llm/config",{});if(!r.ok)return;
+ $("#ai_url").value=r.url;$("#ai_model").value=r.model||"";aiRoute(r);$("#ai_budget").value=r.budget;
+ $("#ai_key").placeholder=r.has_key?"(set · type to replace)":"(none)";if(!r.model)$("#ai_cfg").open=true;aiStatus(r.model);aiWelcome()}
+function aiRoute(r){if(r&&r.route)$("#ai_route").textContent="Data goes to: "+r.route+" · approved servers: "+(r.approved||[]).join(", ")+" or this PC"}
+function aiStatus(m){$("#ai_sub").textContent=m?"online · "+m:"local LLM · no model set";$("#ai_by").textContent=m||"local LLM";$("#ai_av").classList.toggle("off",!m)}
+function aiCfg(){const c=$("#ai_cfg");c.open=!c.open;if(c.open)$("#aicard .aibody").scrollTop=0}
+function aiWelcome(){if($("#ai_log").children.length)return;
+ aiAdd("bot","Welcome to the ITSec assistant 👋 How can I help?\n\nI can explain the output on screen, answer questions about it, or run **read-only** checks on all the connected devices (firewalls, F5, Cloudflare) to answer any question. Just type it and press Enter.",{welcome:true})}
+// Enter / Send: run read-only checks on all connected devices whenever one is connected (the output on screen is still sent as context);
+// without a device it can only talk about the output.
+function aiSend(){aiAsk(devices.length?"agent":"chat")}
+async function aiSave(loud){const r=await api("/api/llm/config",{set:true,url:g("ai_url"),model:g("ai_model"),key:g("ai_key"),
+  budget:g("ai_budget")});const m=$("#ai_cfgmsg");
+ if(r.ok){aiStatus(r.model);aiRoute(r);$("#ai_key").value="";$("#ai_key").placeholder=r.has_key?"(set · type to replace)":"(none)";if(loud){m.className="ok";m.textContent="saved · "+(r.model||"no model picked yet")}}
+ else{m.className="bad";m.textContent="error: "+r.error;$("#ai_cfg").open=true}return r.ok}
+async function aiModels(){if(!await aiSave(false))return;const m=$("#ai_cfgmsg");m.className="muted";m.textContent="asking the model server…";
+ const r=await api("/api/llm/models",{});if(!r.ok){m.className="bad";m.textContent="error: "+r.error;return}
+ if(r.url)$("#ai_url").value=r.url;const dl=$("#ai_models");dl.innerHTML="";r.models.forEach(x=>{const o=document.createElement("option");o.value=x;dl.appendChild(o)});
+ m.className=r.models.length?"muted":"bad";m.textContent=r.models.length?"Models on the server (click one to use it):":"No models on the server. Pull one first, e.g. ollama pull qwen2.5:7b";
+ if(!g("ai_model")&&r.models[0]){$("#ai_model").value=r.models[0];await aiSave(false)}aiModelList(r.models)}
+function aiModelList(ms){const box=$("#ai_mlist");box.innerHTML="";
+ ms.forEach(x=>{const b=mk("button",x===g("ai_model")?"cur":"",(x===g("ai_model")?"✓ ":"")+x);
+  b.onclick=async()=>{$("#ai_model").value=x;if(await aiSave(false)){aiModelList(ms);const m=$("#ai_cfgmsg");m.className="ok";m.textContent="Using "+x+" (saved)"}};box.appendChild(b)})}
+function aiMd(t){const out=[];let inCode=false,code=[],list=null;
+ const inl=s=>esc(s).replace(/`([^`]+)`/g,"<code>$1</code>").replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>");
+ const endList=()=>{if(list){out.push("<ul>"+list.join("")+"</ul>");list=null}};
+ String(t||"").split("\n").forEach(l=>{
+  if(/^\s*```/.test(l)){if(inCode){out.push("<pre>"+esc(code.join("\n"))+"</pre>");code=[];inCode=false}else{endList();inCode=true}return}
+  if(inCode){code.push(l);return}
+  const m=l.match(/^\s*(?:[-*]|\d+[.)])\s+(.*)/);if(m){(list=list||[]).push("<li>"+inl(m[1])+"</li>");return}
+  endList();const h=l.match(/^#{1,6}\s+(.*)/);if(h){out.push('<div class="aih">'+inl(h[1])+"</div>");return}
+  if(l.trim())out.push("<p>"+inl(l)+"</p>")});
+ if(inCode)out.push("<pre>"+esc(code.join("\n"))+"</pre>");endList();return out.join("")}
+function aiRow(kind,d){const row=mk("div","airow "+(kind==="user"?"user":"bot"));if(kind!=="user")row.appendChild(mk("span","aiav","✦"));row.appendChild(d);return row}
+function aiAdd(kind,text,r){const box=$("#ai_log"),d=mk("div","aimsg "+kind);
+ if(kind==="bot"&&r&&r.welcome)d.innerHTML=aiMd(text);
+ else if(kind==="bot"){d.innerHTML=aiMd(text);
+  (r.steps||[]).forEach(s=>{const x=mk("div","aistep");x.appendChild(mk("span",s.ok?"ok":"bad",s.ok?"✓":"✕"));
+   x.appendChild(mk("code",null,s.call));if(s.verdict||s.error)x.appendChild(mk("span","muted",s.verdict||s.error));
+   if(s.result){const b=mk("button",null,"show");b.onclick=()=>{show(s.result,"AI ran "+s.call);$("#outcard").scrollIntoView({behavior:"smooth"})};x.appendChild(b)}
+   d.insertBefore(x,d.firstChild)});
+  d.appendChild(mk("div","aimeta",r.model+" · "+(r.ms/1000).toFixed(1)+" s"+(r.steps&&r.steps.length?" · "+r.steps.length+" check(s) run":"")+
+   (r.trimmed?" · output was trimmed to fit the context budget":"")+(r.usage&&r.usage.total_tokens?" · "+r.usage.total_tokens+" tokens":"")+(r.usage&&r.usage.num_ctx?" · context window "+r.usage.num_ctx:"")));
+  if(r.warning)d.insertBefore(mk("div","aiwarn","⚠ "+r.warning),d.firstChild);
+  if(r.sent){const lk=mk("span","aimeta lnk"," data sent to the model ("+r.sent.length.toLocaleString()+" characters)");lk.style.cursor="pointer";lk.style.color="var(--mint)";
+   const pre=mk("pre",null,r.sent);pre.style.display="none";pre.style.maxHeight="300px";pre.style.overflow="auto";
+   lk.onclick=()=>{pre.style.display=pre.style.display?"":"none"};d.appendChild(lk);d.appendChild(pre)}}
+ else d.textContent=text;box.appendChild(aiRow(kind,d));aiScroll()}
+function aiScroll(){const sc=$("#aicard .aibody");sc.scrollTop=sc.scrollHeight}
+function aiToggle(force){const c=$("#aicard"),open=force==null?c.hidden:!!force;c.hidden=!open;$("#aifab").classList.toggle("on",open);
+ try{localStorage.setItem("ai_open",open?"1":"")}catch(e){}if(open)setTimeout(()=>$("#ai_q").focus(),0)}
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#aicard").hidden)aiToggle(false)});
+function aiClear(){aiHist=[];$("#ai_log").innerHTML="";aiWelcome()}
+async function aiAsk(mode){const q=g("ai_q").trim();
+ if(mode!=="explain"&&!q)return aiAdd("err","Type a question first.");
+ if(mode!=="agent"&&!last)return aiAdd("err","Run a check first: there is no output to talk about yet.");
+ if(mode==="agent"&&!devices.length)return aiAdd("err","Connect a device first: the checks run on the connected devices.");
+ if(!await aiSave(false))return;
+ if(mode==="explain"){aiHist=[];$("#ai_log").innerHTML=""}
+ const shown=q||"Explain the current output ("+(lastCtx.label||"output")+")";
+ aiAdd("user",shown+(mode==="agent"?"  · may run read-only checks on the connected devices":mode==="chat"?"  · answers from the output on screen only":""));
+ $("#ai_q").value="";
+ // a visible "waiting" bubble with a timer; the buttons stay disabled so the same question is not sent twice
+ const wait=mk("div","aimsg bot aiwait");wait.innerHTML='<span class="aidots"><i></i><i></i><i></i></span>';
+ const t0=Date.now(),btns=[...document.querySelectorAll("#ai_chips button,#ai_send")],card=$("#aicard"),wrow=aiRow("bot",wait);
+ const tick=()=>{wait.title=Math.round((Date.now()-t0)/1000)+" s"};
+ tick();$("#ai_log").appendChild(wrow);card.classList.add("busy");aiScroll();const iv=setInterval(tick,1000);btns.forEach(b=>b.disabled=true);
+ let r;try{r=await api("/api/llm/chat",{id:cur,mode,question:q,history:aiHist,context:last,label:lastCtx.label,device:lastCtx.device,time:lastCtx.time})}
+ catch(e){r={ok:false,error:"no answer from the console: "+e.message+" (is netops_console.py still running?)"}}
+ finally{clearInterval(iv);wrow.remove();card.classList.remove("busy");btns.forEach(b=>b.disabled=false)}
+ if(!r.ok)return aiAdd("err",r.error||"error");
+ aiAdd("bot",r.answer,r);aiHist.push({role:"user",content:shown},{role:"assistant",content:r.answer})}
+document.addEventListener("keydown",e=>{if(e.target&&e.target.id==="ai_q"&&e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();if(!$("#ai_send").disabled)aiSend()}});
+document.addEventListener("input",e=>{if(e.target&&e.target.id==="ai_q"){e.target.style.height="auto";e.target.style.height=Math.min(e.target.scrollHeight+2,140)+"px";e.target.style.overflowY=e.target.scrollHeight>138?"auto":"hidden"}});
+function barsNode(list){const grid=mk("div","dgrid tops");grid.style.marginBottom="16px";
+ list.forEach(b=>{const card=mk("div","dcard");card.appendChild(mk("div","sec",b.title));
+  if(!b.rows.length){card.appendChild(mk("div","nv","No data."));grid.appendChild(card);return}
+  const f=b.fmt==="pct"?(v=>(+v||0).toFixed(1)+"%"):(DFMT[b.fmt]||dNum),m=b.fmt==="pct"?Math.max(100,...b.rows.map(r=>r[1])):Math.max(...b.rows.map(r=>r[1]),1),gr=mk("div","dtop");
+  b.rows.forEach(([name,v])=>{const nm=mk("div","dn",name);nm.title=name;const bar=mk("div","db"),fill=mk("span");
+   fill.style.width=(100*v/m).toFixed(1)+"%";
+   if(/^idle$|^not resident/.test(name))fill.style.background=DOTHER;else if(b.fmt==="pct"&&v>=80)fill.style.background=v>=90?DC[1]:DC[3];
+   bar.appendChild(fill);gr.appendChild(nm);gr.appendChild(bar);gr.appendChild(mk("div","dvv",f(v)))});
+  card.appendChild(gr);grid.appendChild(card)});return grid}
 function accFilt(){const f={};ACC_F.forEach(([k])=>{const v=g("acc_f_"+k).trim();if(v)f[k]=v});return f}
 async function accRun(){const f=accFilt(),ks=Object.keys(f);
  setBusy("ACC (reads up to "+g("acc_scan")+" log entries per log type; can take a minute)");
@@ -8456,7 +10497,7 @@ function exportHtml(){if(!last||last.error||!last.data){alert("Run a check first
  (f?'<h2>Findings</h2>'+table(f)+'<h2>Inventory</h2>'+table(d.inventory)+
  '<h2>Notes</h2>'+(d.notes||[]).map(n=>"<p>"+esc(n)+"</p>").join(""):sectionsHtml())+'</body></html>';
  dlText(fname("html"),"text/html",html)}
-api("/api/catalog").then(c=>catalog=c);loadProfiles();
+api("/api/catalog").then(c=>catalog=c);loadProfiles();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true)}catch(e){}
 </script></body></html>
 """
 
