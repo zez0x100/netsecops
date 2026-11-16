@@ -13,23 +13,56 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
 - PAN-OS / FortiGate flow check: source and destination IP (optional port, protocol; zones on PAN-OS) show which rule
   allows or blocks the flow; on FortiGate the ingress interface is optional and taken from the route to the source
 - Flow trace (one card, shown once a device is connected): one flow (client IP -> destination IP or hostname, port,
-  protocol) followed along the path Cloudflare -> FortiGate DMZ -> F5 DMZ -> Palo Alto, each device tested with the
-  addresses it sees:
-  1. Cloudflare: DNS record (origin IP, proxied or not) and WAF events for the client IP. When proxied, the next
-     devices are tested with a Cloudflare edge address as source (from Cloudflare's published ranges)
-  2. FortiGate: policy verdict for that source -> origin IP:port, then the VIP that maps it to the F5 virtual address
-     (a policy with NAT enabled is flagged)
-  3. F5: virtual server on the mapped address (or for the hostname), enabled, pool members up / down, and the SNAT
-     address it uses (automap: the self IP in the member's subnet, floating preferred; SNAT pool: its first member)
-  4. Palo Alto: policy verdict for F5 SNAT address -> pool member IP:port
-  A hostname not in Cloudflare is resolved through the F5 virtual server and the FortiGate VIP. Optional log search
-  (F5 WAF log by the client IP header when proxied; FortiGate and Palo Alto traffic logs). The result is one row per
-  device and check, and the first block found ("STOPS AT ..."). Devices not connected are skipped; routing between
-  the devices is not checked; FortiOS policy lookup on a VIP's external address is not yet verified on a real unit
+  protocol) traced through the connected devices it actually crosses. Nothing is tied to device names, vendors or
+  a fixed order: the path is found from each device's own configuration, so it fits any mix of FortiGate, Palo Alto
+  and F5 (and Cloudflare). Only the devices on the path are shown, each tested with the addresses it sees; a device
+  that does not answer is left out. The steps, each only where it applies:
+  1. Edge: Cloudflare, for a hostname in its zones or a Cloudflare address: DNS record (origin IP, proxied or not)
+     and WAF events for the client IP. When proxied, the next devices are tested with a Cloudflare edge address
+  2. Upstream 1:1 NAT (cloud public IPs, a provider router): public -> private IP from the optional NAT list
+     (`nat_map.txt`) or the optional VIP list (`vip_map.txt`: name or hostname, firewall VIP, F5 VIP, pasted from a
+     spreadsheet; both git-ignored), or inferred when exactly one FortiGate VIP maps to the F5 virtual server
+  3. Edge firewall: whichever connected firewall translates the destination: a FortiGate VIP or a Palo Alto
+     destination / bi-directional static NAT rule. Policy verdict for the address it receives, then the translation
+  4. Load balancer: the F5 whose virtual server is the translated address (or that serves the hostname): enabled,
+     pool members up / down, and the source address it uses (automap: the self IP in the member's subnet or towards
+     the route's gateway; SNAT pool: its first member)
+  5. Firewall between the F5 (or the edge NAT) and the servers, e.g. a DC firewall: policy verdict for the address
+     pair it sees
+  A flow without a destination NAT (two internal addresses) starts at the firewall the client's subnet is connected to.
+  How a firewall is placed on the path, strongest evidence first: the next hops from the device before it (route
+  gateway = an interface address of a connected device: FortiOS `router/lookup`, PAN-OS `test routing fib-lookup`,
+  F5 self IPs and static routes; all read-only); the flow crosses it (different interfaces towards the source and the
+  destination) and the destination's subnet (or, at the start, the source's) is directly connected to it; with "Also
+  search logs", its traffic log shows the flow; only when none of these finds anything for an internal flow, the
+  routes alone. Cloud subnet routers (OCI, AWS, Azure) are not connected devices, which is why the "directly
+  connected" evidence matters. Not taken into account: policy-based routing, SD-WAN rules, asymmetric return paths.
+  The result opens with a diagram of the path (client → the devices crossed, in order → server): each device
+  green / red / amber, animated flow up to where it stops, and next to each device the source → destination it sees;
+  then one row per device and check, and the first block found ("STOPS AT ..."). FortiOS policy lookup on a VIP's
+  external address and the PAN-OS route lookup reply are not yet verified on real units
 - F5 ASM/WAF request-log search (incl. by any HTTP header: value, IP, True-Client-IP, hostname, URL, time, support ID, POST body), top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
 - FortiGate lookups: Virtual IPs (name / external / mapped IP filter), static routes (IP, gateway, interface filter)
 - PAN-OS lookups: destination / static NAT rules (the Virtual IP equivalent), configured static routes, session list
   with source / destination filter (URL category lookup was already available)
+- SSH to F5, FortiGate and Palo Alto from the "SSH" card of the selected device, with this PC's OpenSSH client
+  (`ssh -p <port> -l <user> <device>`; user name prefilled from the login when known):
+  - "Open SSH in this page": a terminal inside the console (Windows 10 1809+; several at once). Click it to type;
+    copy with a selection + Ctrl+C, paste with Ctrl+V; Disconnect ends the session
+  - "Open in a separate window": a normal Windows terminal window; other systems get the command to copy
+  - Every connection allows the hmac-sha1 MAC (`-o MACs=+hmac-sha1`), which older devices still need and OpenSSH 10
+    no longer offers by default; devices with SHA-2 MACs still use those
+  - "Allow older algorithms" (tick-box) is for old devices that answer "Unable to negotiate ... no matching key
+    exchange / host key type / cipher": it adds SHA-1 key exchange, ssh-rsa and AES-CBC to that one connection
+    only (MD5, DH group 1, 3DES and DSA stay off)
+- Source NAT for an IP (check "Source NAT for an IP" on each device; the AI can run it too): what the IP is translated
+  to when it is the source
+  - Palo Alto: NAT rules that cover it in evaluation order (shared pre, local, shared post), objects / groups resolved,
+    translated address or interface; with a destination, the firewall's own answer (`test nat-policy-match`, zones
+    optional)
+  - FortiGate: policies with NAT (IP pool with its range, or the egress interface address), central SNAT map in
+    central-NAT mode, VIPs with nat-source-vip; with a destination, the policy the firewall's policy lookup picks
+  - F5: standalone SNAT objects whose origins include the IP (virtual-server SNAT is in the flow trace)
 - Resource utilization for PAN-OS and FortiGate (Checks, or the button on the health card): tiles, charts and findings
   with warning / high thresholds. PAN-OS: management CPU and memory (cache excluded), load, top processes, dataplane
   CPU per data processor (average of active cores, the busiest core, the highest core maximum), session table,
@@ -89,10 +122,11 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
 - F5 file download (same tick-box): list a BIG-IP folder, download any file (or a folder as .tar.gz) up to 500 MB
   over iControl REST, MD5-checked; files holding secrets (password hashes, keys, master key, bigip.conf, UCS) need
   a second tick-box
-- Optional PAN-OS packet capture (packet-diag, explicit tick-box required), downloaded as .pcap
+- PAN-OS packet capture is disabled (the console refuses it; F5 tcpdump capture is unchanged)
 - Configuration backup (F5: explicit tick-box required, the UCS archive is also kept on the BIG-IP;
   PAN-OS / FortiGate: read-only export)
-- Cloudflare (API token; every lookup runs over all zones the token sees, or one zone, for a time range):
+- Cloudflare (API token; every lookup runs over all zones the token sees, for the last 24 hours; the traffic
+  dashboard can zoom into a shorter period):
   - Investigate an IP (security events, traffic, IP Access Rules incl. ranges / ASN / country, IP lists, rules and
     DNS records that involve it, whether it is a Cloudflare edge address), a hostname (DNS and proxy status,
     certificates, zone settings, rules, Workers routes, page rules, load balancers, 5xx / 52x origin errors) or a
@@ -117,8 +151,8 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
   - Rule search (text, IP, `$list`, rule or ruleset ID, incl. managed rules a zone deploys), DNS search, security
     posture (SSL mode, minimum TLS, HTTPS redirect, security level, True-Client-IP header, certificates, DNS-only records),
     load balancer origin health and health checks, account audit log
-  - Cross-check with a connected F5: a Ray ID is looked up in the ASM log by the `CF-Ray` header, an IP by
-    True-Client-IP, so one lookup shows whether Cloudflare or the F5 blocked a request
+  - The Ray ID trace uses the connected F5 (the first one if several are connected) to find the request in the ASM
+    log by its `CF-Ray` header, so one lookup shows whether Cloudflare or the F5 blocked it
   - The raw box accepts `/client/v4/...` GET paths or GraphQL queries (mutations are refused)
 
 ## Run
@@ -129,13 +163,19 @@ Open the URL printed in the terminal.
 
 ## Security model
 - Binds to `127.0.0.1` only; random per-launch token plus Host-header check (CSRF / DNS-rebinding protection).
-- Credentials live in memory only and are never written to disk.
+- Credentials live in memory only, unless you tick "Remember this login on this PC" when connecting. Remembered
+  logins are encrypted with Windows DPAPI for your Windows account and with a passphrase (PBKDF2, 300k rounds), in
+  `saved_logins.dat` next to the console (git-ignored). After a restart, enter the passphrase in the Devices card to
+  reconnect every saved device. Without the passphrase, or under another Windows account, the file cannot be read.
+  "Forgot the passphrase?" deletes it.
 - Saved profiles (`device_profiles.json`) hold only label, vendor, address, port and TLS setting.
 - Checks are read-only (GET, or PAN-OS `<show>`/allow-listed `<test>`). Exceptions are documented in the script
   header and require an explicit tick-box:
   - F5 active tools and F5 backup run fixed shell commands through `util/bash` (Administrator role).
-  - PAN-OS packet capture changes packet-diag state and clears all packet-diag settings before and after,
-    which ends any capture another admin has running.
+  - PAN-OS packet capture is disabled: the console refuses it, so no packet-diag state is ever changed.
+- SSH: in the page, keystrokes (the password too) pass through the console process to `ssh` and are never stored,
+  logged or shown to the AI; only opening and closing a session go to the audit log. The session is a normal CLI
+  session (not read-only). The AI has no SSH tool.
 - AI assistant: device data is sent only to an approved model server: this PC (127.0.0.1 / localhost) or a host in
   `llm_approved.txt` next to `netops_console.py` (one host name per line; kept out of git, none by default). Any other address is refused, checked before
   every request. The model server is always reached directly (never through the system or a cloud web proxy), and a
@@ -159,18 +199,17 @@ for the features that need one, and only when you need them.
 | Active tools (log search, tcpdump, .pms), admin audit, config sync review, configuration backup | **Administrator**. These run fixed commands through `/mgmt/tm/util/bash` |
 
 ### Palo Alto PAN-OS
-Built-in read-only roles cover the checks. For packet capture and backup, use a custom Admin Role
+Built-in read-only roles cover the checks. For backup, use a custom Admin Role
 Profile with only these XML API permissions:
 
 | XML API permission | Used for |
 |---|---|
-| Operational Requests | `<show>` / allow-listed `<test>` checks, packet capture (`debug dataplane packet-diag`) |
+| Operational Requests | `<show>` / allow-listed `<test>` checks |
 | Configuration | IP lookup, NAT rules, static routes (reads the running config) |
 | Log | Log search, ACC, admin audit |
-| Export | Packet capture download, configuration backup |
+| Export | Configuration backup |
 
-Leave Commit, Import and User-ID off. Packet capture changes packet-diag state, so read-only
-roles are refused.
+Leave Commit, Import and User-ID off.
 
 ### FortiGate
 Use a REST API admin with an admin profile limited to what you need, and set **Trusted hosts** to

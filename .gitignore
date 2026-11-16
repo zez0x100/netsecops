@@ -2,3 +2,9 @@ device_profiles.json
 captures
 __pycache__/
 llm_approved.txt
+nat_map.txt
+nat_map.txt.tmp
+vip_map.txt
+vip_map.txt.tmp
+saved_logins.dat
+saved_logins.dat.tmp

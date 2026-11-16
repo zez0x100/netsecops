@@ -11,7 +11,9 @@ Design notes
 - Credentials live in process memory only and are never written to disk. Packet captures
   you explicitly request are saved to ./captures next to this script.
 - Saved device profiles keep only a label, vendor, management address/port, and TLS setting
-  in device_profiles.json; usernames, passwords, and API keys are never saved.
+  in device_profiles.json; usernames, passwords, and API keys are never saved there.
+- Optional saved logins (opt-in per device): credentials encrypted with Windows DPAPI, bound to the Windows
+  account AND to a passphrase, in saved_logins.dat (git-ignored). One passphrase reconnects every device.
 - Read-only by construction: every check is a GET (F5, FortiGate) or a <show>/<test>
   operational command (PAN-OS; <test> limited to an allowlist). The raw box enforces the same rules.
 - EXCEPTION: the 'F5 active tools' (log search, tcpdump) run fixed shell-command templates
@@ -19,10 +21,15 @@ Design notes
   The capture (and .pms key file) is kept in /var/tmp on the BIG-IP, readable by root only.
 - EXCEPTION: 'Configuration backup' on F5 saves a UCS archive on the BIG-IP (same tick-box); on PAN-OS and
   FortiGate it is a read-only export with no tick-box. Backups are saved in ./captures and downloaded by the browser.
-- EXCEPTION: the PAN-OS packet capture runs <debug><dataplane><packet-diag> commands (needs a tick-box). It
-  clears all packet-diag settings before and after, which also ends any capture another admin has running.
+- PAN-OS packet capture (<debug><dataplane><packet-diag>) is DISABLED (PAN_CAPTURE_ENABLED = False): the API
+  refuses it and the page does not offer it, so nothing on a Palo Alto is changed by this console.
 - EXCEPTION: 'Download a file or folder' on F5 reads any path through util/bash (same tick-box); a folder is
   packed into a .tar.gz in /var/tmp first and removed afterwards. Files holding secrets need a second tick-box.
+- SSH (F5, FortiGate, Palo Alto) runs this PC's own OpenSSH client (ssh -p <port> -l <user> <device>), either in
+  a terminal inside the page (a Windows pseudo-console, ConPTY, relayed to the page) or in a separate window. In the
+  page, keystrokes, the password too, pass through this process to ssh: they are never stored, logged or shown to the
+  AI, and only "opened" / "closed" go to the audit log. What is done in that session is up to the person typing:
+  it is not read-only. The AI assistant has no SSH tool.
 - The tool talks to device management APIs over HTTPS from THIS machine.
 - AppSec checks (WAF / profile coverage, SSL posture, ASM request log,
   PAN log search) are read-only.
@@ -30,8 +37,10 @@ Design notes
   are POSTed to the GraphQL Analytics API, which only answers queries (the raw box refuses mutations).
 """
 import argparse
+import atexit
 import base64
 import calendar
+import codecs
 import collections
 import concurrent.futures
 import datetime
@@ -42,8 +51,10 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import socket
 import ssl
+import subprocess
 import threading
 import time
 import urllib.error
@@ -98,6 +109,8 @@ CATALOG = {
         {"id": "polsearch", "group": "LTM", "label": "Local traffic policy search (rules and conditions)",
          "path": "/mgmt/tm/ltm/policy?expandSubcollections=true",
          "params": [P("policy", "Policy name (or part of it)", "my_policy")]},
+        {"id": "snat", "group": "LTM", "label": "Source NAT for an IP (standalone SNAT objects whose origins include it)",
+         "handler": "f5_snat", "params": [P("ip", "Source IP", "10.1.1.10")]},
         {"id": "poolall", "group": "LTM", "label": "All pool stats", "path": "/mgmt/tm/ltm/pool/stats"},
         {"id": "poolmem", "group": "LTM", "label": "Pool member stats", "path": "/mgmt/tm/ltm/pool/{pool}/members/stats",
          "params": [P("pool", "Pool", "~Common~my_pool")]},
@@ -136,6 +149,14 @@ CATALOG = {
          "handler": "pan_nat_rules",
          "params": [P("filter", "Name, public IP or translated IP", "203.0.113.10", required=False),
                     P("vsys", "vsys", "vsys1", "vsys1")]},
+        {"id": "snat", "group": "Policy", "label": "Source NAT for an IP (what the IP is translated to as source; "
+         "optional destination for the rule the firewall uses)", "handler": "pan_snat",
+         "params": [P("ip", "Source IP", "10.1.1.10"), P("dst", "Destination IP (optional: the rule actually used)", "203.0.113.10", required=False),
+                    P("port", "Destination port (optional)", "443", required=False),
+                    P("proto", "Protocol: tcp, udp or icmp", "tcp", "tcp", required=False),
+                    P("from", "Source zone (optional)", "trust", required=False),
+                    P("to", "Destination zone (optional)", "untrust", required=False),
+                    P("vsys", "vsys", "vsys1", "vsys1")]},
         {"id": "urlcat", "group": "Policy", "label": "URL category lookup", "cmd": "<test><url>{url}</url></test>",
          "params": [P("url", "URL or domain", "www.example.com/path")]},
     ],
@@ -155,6 +176,13 @@ CATALOG = {
          "params": [P("filter", "Destination IP/subnet, gateway, interface or comment", "10.2.0.0/16", required=False)]},
         {"id": "vips", "group": "Policy", "label": "Virtual IPs (optional filter)", "path": "/api/v2/cmdb/firewall/vip",
          "params": [P("filter", "Name, external IP or mapped IP", "203.0.113.10", required=False)]},        {"id": "ipsec", "group": "VPN", "label": "IPsec tunnels", "path": "/api/v2/monitor/vpn/ipsec"},
+        {"id": "snat", "group": "Policy", "label": "Source NAT for an IP (what the IP is translated to as source: "
+         "policy NAT / IP pools, central SNAT, VIP nat-source-vip; optional destination for the policy used)",
+         "handler": "fg_snat",
+         "params": [P("ip", "Source IP", "10.1.1.10"), P("dst", "Destination IP (optional: the rule actually used)", "203.0.113.10", required=False),
+                    P("port", "Destination port (optional)", "443", required=False),
+                    P("proto", "Protocol: tcp, udp or icmp", "tcp", "tcp", required=False),
+                    P("vdom", "VDOM (optional)", "root", required=False)]},
         {"id": "polstats", "group": "Policy", "label": "Firewall policy hit counts", "path": "/api/v2/monitor/firewall/policy"},
         {"id": "sessions", "group": "Sessions", "label": "Session list (IPv4)", "path": "/api/v2/monitor/firewall/session?count={count}&ip_version=ipv4",
          "params": [P("count", "Max rows", "20", "20")]},
@@ -245,8 +273,9 @@ def pan_op(sess, cmd):
     return status, root.get("status") == "success", x2o(root)
 
 
-def rest_get(sess, path):
-    status, raw = http(sess, "GET", path, sess["hdr"])
+def rest_get(sess, path, timeout=None):
+    # Large reads (expanded sub-collections) on a big device can take well over 20 s.
+    status, raw = http(sess, "GET", path, sess["hdr"], timeout=timeout or (60 if "expandSubcollections" in path else 20))
     try:
         data = json.loads(raw)
     except ValueError:
@@ -362,6 +391,500 @@ def do_profile_delete(b):
     return {"ok": True}
 
 
+# ---- SSH: open this PC's OpenSSH client in a new terminal window (nothing runs through the console) ----------
+SSH_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._@\\-]{0,63}$")
+
+
+# Always added: hmac-sha1, which older TMOS / FortiOS / PAN-OS SSH servers still need and OpenSSH 10 no longer offers by
+# default. '+' appends to OpenSSH's list, so a device that supports SHA-2 MACs still negotiates those.
+SSH_ALWAYS = ["-o", "MACs=+hmac-sha1"]
+# Added to this one connection only when 'Allow older algorithms' is ticked (old FortiOS / PAN-OS / TMOS SSH servers).
+# MD5, DH group 1, 3DES and DSA are left out on purpose. (No MACs here: the first -o for an option wins.)
+SSH_LEGACY = ["-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1",
+              "-o", "HostKeyAlgorithms=+ssh-rsa", "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+              "-o", "Ciphers=+aes128-cbc,aes256-cbc"]
+
+
+def ssh_client():
+    """Path of the OpenSSH client: Windows' built-in one first, then whatever 'ssh' is on PATH."""
+    win = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "OpenSSH", "ssh.exe")
+    return win if os.name == "nt" and os.path.isfile(win) else shutil.which("ssh")
+
+
+def do_ssh(b):
+    try:
+        sess, argv, shown = ssh_request(b)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    host = argv[-1]
+    exe = ssh_client()
+    if not exe:
+        return {"ok": False, "error": "no OpenSSH client found on this PC. On Windows: Settings > System > Optional "
+                                      "features > OpenSSH Client. Or run it yourself: " + shown}
+    if os.name != "nt":
+        return {"ok": True, "launched": False, "command": shown,
+                "verdict": {"label": "Run this in a terminal: " + shown, "kind": "info"}, "summary": [
+                    "Opening a terminal window is only automatic on Windows; copy the command above."]}
+    # Run inside cmd /k so the window stays open when ssh ends: a refused or failed connection would otherwise close
+    # it at once and the error would never be seen. Only validated characters reach this line (no cmd metacharacters).
+    cmd = os.environ.get("ComSpec") or os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    line = ('"%s" /k title SSH %s & "%s" %s & echo. & echo ssh ended. Type exit or close this window.'
+            % (cmd, host, exe, " ".join(argv)))
+    try:
+        subprocess.Popen(line, creationflags=subprocess.CREATE_NEW_CONSOLE, close_fds=True)
+    except OSError as e:
+        return {"ok": False, "error": "could not start ssh: %s. Run it yourself: %s" % (e, shown)}
+    audit(sess, "SSH window opened: %s" % shown)
+    return {"ok": True, "launched": True, "command": shown,
+            "verdict": {"label": "SSH window opened: " + shown, "kind": "ok"},
+            "summary": ["Look for the new window titled 'SSH %s' (check the taskbar if it opened behind the browser)."
+                        % host,
+                        "Type the password in that window (the console never sees it). If the connection fails, the "
+                        "error stays in the window.",
+                        "The first connection asks you to confirm the device's host key: check the fingerprint.",
+                        "Everything typed in that window goes straight to the device, outside the console's "
+                        "read-only checks."] + (["Older algorithms (SHA-1 key exchange, ssh-rsa, AES-CBC) were "
+                                                 "allowed for this connection only."] if b.get("legacy") else
+                                                ["If it says 'Unable to negotiate ... no matching key exchange / host key "
+                                                 "type / cipher found', tick 'Allow older algorithms' and open it again."])}
+
+
+# ---- In-page SSH terminal: this PC's ssh on a Windows pseudo-console (ConPTY), relayed to the page ------------------
+# Keystrokes (the password too) pass through this process on their way to ssh; they are never stored, logged or shown
+# to the AI. Only "opened" / "closed" go to the audit log. Standard library only (ctypes), Windows 10 1809 or later.
+TERMS = {}
+TERM_LOCK = threading.Lock()
+TERM_MAX = 6            # open terminals at a time
+TERM_KEEP = 2_000_000   # characters of output kept for the page to fetch
+TERM_IDLE = 180         # seconds without the page polling (tab closed) before the session is ended
+
+
+class ConPty:
+    """One process attached to a Windows pseudo-console: write() keystrokes, read() its VT output."""
+
+    def __init__(self, cmdline, cols, rows):
+        import ctypes
+        from ctypes import wintypes as W
+        self.ct, k = ctypes, ctypes.WinDLL("kernel32", use_last_error=True)
+        self.k = k
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", W.SHORT), ("Y", W.SHORT)]
+
+        class SI(ctypes.Structure):
+            _fields_ = [("cb", W.DWORD), ("lpReserved", W.LPWSTR), ("lpDesktop", W.LPWSTR), ("lpTitle", W.LPWSTR),
+                        ("dwX", W.DWORD), ("dwY", W.DWORD), ("dwXSize", W.DWORD), ("dwYSize", W.DWORD),
+                        ("dwXCountChars", W.DWORD), ("dwYCountChars", W.DWORD), ("dwFillAttribute", W.DWORD),
+                        ("dwFlags", W.DWORD), ("wShowWindow", W.WORD), ("cbReserved2", W.WORD),
+                        ("lpReserved2", ctypes.c_void_p), ("hStdInput", W.HANDLE), ("hStdOutput", W.HANDLE),
+                        ("hStdError", W.HANDLE)]
+
+        class SIEX(ctypes.Structure):
+            _fields_ = [("StartupInfo", SI), ("lpAttributeList", ctypes.c_void_p)]
+
+        class PI(ctypes.Structure):
+            _fields_ = [("hProcess", W.HANDLE), ("hThread", W.HANDLE), ("dwProcessId", W.DWORD), ("dwThreadId", W.DWORD)]
+        self.COORD = COORD
+        H, P, vp = W.HANDLE, ctypes.POINTER, ctypes.c_void_p
+        k.CreatePipe.argtypes = [P(H), P(H), vp, W.DWORD]
+        k.CreatePseudoConsole.argtypes = [COORD, H, H, W.DWORD, P(vp)]
+        k.CreatePseudoConsole.restype = ctypes.c_long
+        k.ResizePseudoConsole.argtypes = [vp, COORD]
+        k.ResizePseudoConsole.restype = ctypes.c_long
+        k.ClosePseudoConsole.argtypes = [vp]
+        k.ClosePseudoConsole.restype = None
+        k.InitializeProcThreadAttributeList.argtypes = [vp, W.DWORD, W.DWORD, P(ctypes.c_size_t)]
+        k.UpdateProcThreadAttribute.argtypes = [vp, W.DWORD, ctypes.c_size_t, vp, ctypes.c_size_t, vp, vp]
+        k.DeleteProcThreadAttributeList.argtypes = [vp]
+        k.CreateProcessW.argtypes = [W.LPCWSTR, W.LPWSTR, vp, vp, W.BOOL, W.DWORD, vp, W.LPCWSTR, P(SIEX), P(PI)]
+        k.ReadFile.argtypes = [H, vp, W.DWORD, P(W.DWORD), vp]
+        k.WriteFile.argtypes = [H, vp, W.DWORD, P(W.DWORD), vp]
+        k.CloseHandle.argtypes = [H]
+        k.TerminateProcess.argtypes = [H, W.UINT]
+        k.WaitForSingleObject.argtypes = [H, W.DWORD]
+        k.WaitForSingleObject.restype = W.DWORD
+        k.GetExitCodeProcess.argtypes = [H, P(W.DWORD)]
+        self.W = W
+        in_r, in_w, out_r, out_w = H(), H(), H(), H()
+        if not k.CreatePipe(ctypes.byref(in_r), ctypes.byref(in_w), None, 0) or \
+                not k.CreatePipe(ctypes.byref(out_r), ctypes.byref(out_w), None, 0):
+            raise OSError("CreatePipe failed (%d)" % ctypes.get_last_error())
+        self.hpc = vp()
+        hr = k.CreatePseudoConsole(COORD(cols, rows), in_r, out_w, 0, ctypes.byref(self.hpc))
+        if hr != 0:
+            for h in (in_r, in_w, out_r, out_w):
+                k.CloseHandle(h)
+            raise OSError("this Windows has no pseudo-console (needs Windows 10 1809 or later): HRESULT 0x%08X"
+                          % (hr & 0xFFFFFFFF))
+        size = ctypes.c_size_t()
+        k.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+        self._attr = ctypes.create_string_buffer(size.value)
+        si = SIEX()
+        si.StartupInfo.cb = ctypes.sizeof(SIEX)
+        si.StartupInfo.dwFlags = 0x100   # STARTF_USESTDHANDLES with none: the child must use the pseudo-console only
+        si.lpAttributeList = ctypes.cast(self._attr, vp)
+        if not k.InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, ctypes.byref(size)) or \
+                not k.UpdateProcThreadAttribute(si.lpAttributeList, 0, 0x00020016, self.hpc, ctypes.sizeof(vp), None, None):
+            raise OSError("pseudo-console attribute failed (%d)" % ctypes.get_last_error())
+        pi = PI()
+        buf = ctypes.create_unicode_buffer(cmdline)
+        ok = k.CreateProcessW(None, buf, None, None, False, 0x00080000 | 0x00000400, None, None,  # EXTENDED_STARTUPINFO, UNICODE_ENV
+                              ctypes.byref(si), ctypes.byref(pi))
+        err = ctypes.get_last_error()
+        k.DeleteProcThreadAttributeList(si.lpAttributeList)
+        k.CloseHandle(in_r)    # the pseudo-console holds its own copies
+        k.CloseHandle(out_w)
+        if not ok:
+            k.ClosePseudoConsole(self.hpc)
+            k.CloseHandle(in_w)
+            k.CloseHandle(out_r)
+            raise OSError("could not start ssh (%d)" % err)
+        k.CloseHandle(pi.hThread)
+        self.proc, self.pid, self.inw, self.outr = pi.hProcess, pi.dwProcessId, in_w, out_r
+        self.closed = False
+
+    def read(self):
+        """Blocking read of the next chunk of output; b'' when the pseudo-console has closed."""
+        buf = self.ct.create_string_buffer(8192)
+        n = self.W.DWORD()
+        if not self.k.ReadFile(self.outr, buf, 8192, self.ct.byref(n), None) or n.value == 0:
+            return b""
+        return buf.raw[:n.value]
+
+    def write(self, data):
+        n = self.W.DWORD()
+        while data and not self.closed:
+            if not self.k.WriteFile(self.inw, data, len(data), self.ct.byref(n), None):
+                return
+            data = data[n.value:]
+
+    def resize(self, cols, rows):
+        if not self.closed:
+            self.k.ResizePseudoConsole(self.hpc, self.COORD(cols, rows))
+
+    def wait(self):
+        """Block until the process ends; -> exit code."""
+        self.k.WaitForSingleObject(self.proc, 0xFFFFFFFF)
+        code = self.W.DWORD()
+        self.k.GetExitCodeProcess(self.proc, self.ct.byref(code))
+        return code.value
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.k.TerminateProcess(self.proc, 1)
+        self.k.ClosePseudoConsole(self.hpc)   # ends the output pipe, so the reader thread stops
+        self.k.CloseHandle(self.inw)          # the process handle is closed by term_waiter once the wait returns
+
+
+def term_reader(t):
+    dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        try:
+            chunk = t["pty"].read()
+        except OSError:
+            chunk = b""
+        text = dec.decode(chunk, final=not chunk)
+        with t["cond"]:
+            if text:
+                t["buf"] += text
+                if len(t["buf"]) > TERM_KEEP:
+                    cut = len(t["buf"]) - TERM_KEEP
+                    t["buf"], t["base"] = t["buf"][cut:], t["base"] + cut
+            if not chunk:
+                t["alive"] = False
+            t["cond"].notify_all()
+        if not chunk:
+            break
+    t["pty"].k.CloseHandle(t["pty"].outr)
+
+
+def term_waiter(t):
+    code = t["pty"].wait()
+    with t["cond"]:
+        t["exit"] = code
+    t["pty"].close()   # the reader sees the end of output and marks the session ended
+    t["pty"].k.CloseHandle(t["pty"].proc)
+    audit(t["sess"], "SSH terminal closed (%s, exit code %s)" % (t["shown"], code))
+
+
+def term_reap():
+    """End sessions the page stopped polling (tab or console page closed)."""
+    now = time.time()
+    with TERM_LOCK:
+        idle = [tid for tid, t in TERMS.items() if now - t["seen"] > TERM_IDLE or (not t["alive"] and now - t["seen"] > 60)]
+        gone = [TERMS.pop(tid) for tid in idle]
+    for t in gone:
+        t["pty"].close()
+
+
+def ssh_request(b):
+    """Validated (session, ssh arguments, shown command) from an SSH request, or raises ValueError."""
+    sess = SESSIONS.get(b.get("id"))
+    if not sess or sess["vendor"] not in ("f5", "fortigate", "paloalto"):
+        raise ValueError("select a connected F5, FortiGate or Palo Alto")
+    user = str(b.get("user") or "").strip()
+    if not SSH_USER_RE.match(user):
+        raise ValueError("enter the SSH user name (letters, digits, . _ - @ \\; up to 64)")
+    port = num(b.get("port") or "22", 1, 65535, 22, "SSH port")
+    host = sess["host"].strip("[]")
+    if host.startswith("-") or not HOST_RE.match(host):
+        raise ValueError("invalid device address")
+    argv = (["-p", str(port), "-l", user, "-o", "ServerAliveInterval=30"] + SSH_ALWAYS
+            + (SSH_LEGACY if b.get("legacy") else []) + [host])
+    if re.search(r'[%^|<>&"]', " ".join(argv)):
+        raise ValueError("invalid characters for the SSH command")
+    return sess, argv, "ssh " + " ".join(argv)
+
+
+def do_term_open(b):
+    term_reap()
+    if os.name != "nt":
+        return {"ok": False, "error": "the in-page terminal needs Windows; use 'Open in a separate window'"}
+    try:
+        sess, argv, shown = ssh_request(b)
+        cols = num(b.get("cols") or "120", 20, 400, 120, "columns")
+        rows = num(b.get("rows") or "30", 5, 200, 30, "rows")
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    exe = ssh_client()
+    if not exe:
+        return {"ok": False, "error": "no OpenSSH client found on this PC (Settings > System > Optional features > "
+                                      "OpenSSH Client)"}
+    with TERM_LOCK:
+        if sum(1 for t in TERMS.values() if t["alive"]) >= TERM_MAX:
+            return {"ok": False, "error": "%d terminals are already open: close one first" % TERM_MAX}
+    try:
+        pty = ConPty(subprocess.list2cmdline([exe] + argv), cols, rows)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    tid = secrets.token_hex(8)
+    t = {"pty": pty, "sess": sess, "shown": shown, "buf": "", "base": 0, "alive": True, "exit": None,
+         "cond": threading.Condition(), "seen": time.time(), "title": "%s (%s)" % (sess["name"], sess["host"])}
+    with TERM_LOCK:
+        TERMS[tid] = t
+    threading.Thread(target=term_reader, args=(t,), daemon=True).start()
+    threading.Thread(target=term_waiter, args=(t,), daemon=True).start()
+    audit(sess, "SSH terminal opened in the page: %s" % shown)
+    return {"ok": True, "tid": tid, "title": t["title"], "command": shown}
+
+
+def term_get(b):
+    with TERM_LOCK:
+        t = TERMS.get(str(b.get("tid") or ""))
+    if not t:
+        raise ValueError("this terminal session has ended")
+    t["seen"] = time.time()
+    return t
+
+
+def do_term_read(b):
+    """Output after position 'pos'; waits up to ~1.5 s for new output (long poll)."""
+    try:
+        t = term_get(b)
+        pos = int(b.get("pos") or 0)
+    except (ValueError, TypeError) as e:
+        return {"ok": False, "error": str(e)}
+    with t["cond"]:
+        if pos >= t["base"] + len(t["buf"]) and t["alive"]:
+            t["cond"].wait(1.5)
+        start = max(pos, t["base"])
+        data = t["buf"][start - t["base"]:]
+        return {"ok": True, "data": data, "pos": t["base"] + len(t["buf"]), "lost": start > pos,
+                "alive": t["alive"], "exit": t["exit"]}
+
+
+def do_term_write(b):
+    try:
+        t = term_get(b)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    data = str(b.get("data") or "")[:65536]
+    if data and t["alive"]:
+        t["pty"].write(data.encode("utf-8"))
+    return {"ok": True}
+
+
+def do_term_resize(b):
+    try:
+        t = term_get(b)
+        t["pty"].resize(num(b.get("cols"), 20, 400, 120, "columns"), num(b.get("rows"), 5, 200, 30, "rows"))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+
+def do_term_close(b):
+    with TERM_LOCK:
+        t = TERMS.pop(str(b.get("tid") or ""), None)
+    if t:
+        t["pty"].close()
+    return {"ok": True}
+
+
+def term_close_all():
+    with TERM_LOCK:
+        ts = list(TERMS.values())
+        TERMS.clear()
+    for t in ts:
+        t["pty"].close()
+
+
+atexit.register(term_close_all)
+
+
+# ---- Saved logins: credentials encrypted with Windows DPAPI (current user) + a passphrase-derived entropy ---------
+# Without the passphrase, or under another Windows account / on another PC, the file cannot be decrypted.
+VAULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_logins.dat")
+VAULT = {"key": None, "logins": None}   # in memory only while unlocked
+VAULT_FIELDS = ("vendor", "name", "host", "port", "insecure", "account", "username", "password", "apikey")
+VAULT_LOCK = threading.Lock()
+
+
+def dpapi(data, entropy, protect):
+    if os.name != "nt":
+        raise ValueError("saved logins need Windows (DPAPI)")
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    bufs = [ctypes.create_string_buffer(x, len(x)) for x in (data, entropy)]
+    bi, be, bo = (BLOB(len(data), ctypes.cast(bufs[0], ctypes.POINTER(ctypes.c_char))),
+                  BLOB(len(entropy), ctypes.cast(bufs[1], ctypes.POINTER(ctypes.c_char))), BLOB())
+    c32 = ctypes.windll.crypt32
+    if protect:
+        ok = c32.CryptProtectData(ctypes.byref(bi), ctypes.c_wchar_p("netsecops"), ctypes.byref(be), None, None,
+                                  0x1, ctypes.byref(bo))
+    else:
+        ok = c32.CryptUnprotectData(ctypes.byref(bi), None, ctypes.byref(be), None, None, 0x1, ctypes.byref(bo))
+    if not ok:
+        raise ValueError("wrong passphrase" if not protect else "encryption failed")
+    try:
+        return ctypes.string_at(bo.pbData, bo.cbData)
+    finally:
+        k32 = ctypes.windll.kernel32
+        k32.LocalFree.argtypes = [ctypes.c_void_p]
+        k32.LocalFree(ctypes.cast(bo.pbData, ctypes.c_void_p))
+
+
+def vault_key(passphrase, salt):
+    return hashlib.pbkdf2_hmac("sha256", str(passphrase).encode("utf-8"), salt, 300000)
+
+
+def vault_read():
+    with open(VAULT_FILE, encoding="utf-8") as f:
+        d = json.load(f)
+    return bytes.fromhex(d["salt"]), base64.b64decode(d["data"])
+
+
+def vault_write(key, salt, logins):
+    blob = dpapi(json.dumps(logins).encode("utf-8"), key, True)
+    tmp = VAULT_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"v": 1, "note": "netsecops saved logins: DPAPI (this Windows user) + passphrase. Not in git.",
+                   "salt": salt.hex(), "data": base64.b64encode(blob).decode()}, f)
+    os.replace(tmp, VAULT_FILE)
+
+
+def vault_unlock(passphrase):
+    salt, blob = vault_read()
+    key = vault_key(passphrase, salt)
+    try:
+        logins = json.loads(dpapi(blob, key, False).decode("utf-8"))
+    except ValueError:
+        time.sleep(1)   # slows down guessing
+        raise ValueError("wrong passphrase (or the file was saved under another Windows account)")
+    VAULT.update(key=(key, salt), logins=logins)
+    return logins
+
+
+def vault_id(x):
+    return "%s|%s|%s" % (x.get("vendor"), str(x.get("host") or "").lower(), x.get("port") or 443)
+
+
+def vault_public():
+    return [{"id": vault_id(x), "name": x.get("name") or x.get("host"), "vendor": x.get("vendor"), "host": x.get("host")}
+            for x in VAULT["logins"] or []]
+
+
+def vault_remember(b):
+    """Add or replace one login (a successful connect body). Unlocks or creates the store with the passphrase."""
+    pp = str(b.get("vault_pass") or "")
+    with VAULT_LOCK:
+        if VAULT["key"] is None:
+            if os.path.exists(VAULT_FILE):
+                if not pp:
+                    raise ValueError("enter the saved-logins passphrase")
+                vault_unlock(pp)
+            else:
+                if len(pp) < 8:
+                    raise ValueError("choose a passphrase of at least 8 characters for the saved logins")
+                salt = secrets.token_bytes(16)
+                VAULT.update(key=(vault_key(pp, salt), salt), logins=[])
+        x = {k: b.get(k) for k in VAULT_FIELDS if b.get(k) not in (None, "")}
+        x["vendor"] = b.get("vendor")
+        if x["vendor"] == "cloudflare":
+            x["host"] = CF_HOST
+        VAULT["logins"] = [y for y in VAULT["logins"] if vault_id(y) != vault_id(x)] + [x]
+        vault_write(VAULT["key"][0], VAULT["key"][1], VAULT["logins"])
+
+
+def vault_connect_all():
+    """Connect every saved login that is not connected yet, in parallel -> [connect results]."""
+    with LOCK:
+        live = {vault_id(s_) for s_ in SESSIONS.values()}
+    todo = [x for x in VAULT["logins"] or [] if vault_id(x) not in live]
+
+    def one(x):
+        try:
+            r = do_connect(dict(x))
+        except Exception as e:   # one bad device must not stop the others
+            r = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        if not r.get("ok"):
+            r = {"ok": False, "error": r.get("error"), "name": x.get("name") or x.get("host")}
+        return r
+    if not todo:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(todo))) as ex:
+        return list(ex.map(one, todo))
+
+
+def do_vault(b):
+    a = str(b.get("action") or "status")
+    try:
+        if a == "status":
+            pass
+        elif a == "unlock":
+            with VAULT_LOCK:
+                vault_unlock(str(b.get("passphrase") or ""))
+            return dict(do_vault({}), results=vault_connect_all())
+        elif a == "connect":
+            if VAULT["key"] is None:
+                raise ValueError("unlock the saved logins first")
+            return dict(do_vault({}), results=vault_connect_all())
+        elif a == "forget":
+            with VAULT_LOCK:
+                if VAULT["key"] is None:
+                    raise ValueError("unlock the saved logins first")
+                VAULT["logins"] = [x for x in VAULT["logins"] if vault_id(x) != b.get("id")]
+                vault_write(VAULT["key"][0], VAULT["key"][1], VAULT["logins"])
+        elif a == "lock":
+            VAULT.update(key=None, logins=None)
+        elif a == "reset":   # forgotten passphrase: delete the file
+            with VAULT_LOCK:
+                VAULT.update(key=None, logins=None)
+                if os.path.exists(VAULT_FILE):
+                    os.remove(VAULT_FILE)
+        else:
+            raise ValueError("unknown action")
+    except (OSError, ValueError, KeyError) as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "windows": os.name == "nt", "exists": os.path.exists(VAULT_FILE),
+            "unlocked": VAULT["key"] is not None, "logins": vault_public() if VAULT["key"] is not None else []}
+
+
 def do_connect(b):
     vendor = b.get("vendor")
     if vendor not in CATALOG:
@@ -432,11 +955,19 @@ def do_connect(b):
         return {"ok": False, "error": "connection failed: %s" % getattr(e, "reason", e)}
     if not ok:
         return {"ok": False, "error": "device rejected the request (HTTP %s)" % status}
+    if vendor in ("f5", "paloalto") and SSH_USER_RE.match(str(user or "")):
+        sess["user"] = user   # the login name only, as the default for SSH
     sid = secrets.token_hex(6)
     with LOCK:
         SESSIONS[sid] = sess
     audit(sess, "connected")
-    out = {"ok": True, "id": sid, "name": sess["name"], "vendor": vendor, "host": host}
+    out = {"ok": True, "id": sid, "name": sess["name"], "vendor": vendor, "host": host, "user": sess.get("user", "")}
+    if b.get("remember"):
+        try:
+            vault_remember(b)
+            out["remembered"] = True
+        except (OSError, ValueError, KeyError) as e:
+            out["remember_error"] = str(e)
     if vendor == "cloudflare":
         out.update(zones=[z["name"] for z in sess["zones"]], note=note,
                    accounts=len(sess.get("accounts") or {}))
@@ -499,7 +1030,7 @@ def do_run(b):
             if rows:
                 result["data"] = {"virtual_servers": rows}
         if sess["vendor"] == "f5" and spec["id"] == "certs" and result.get("ok") and isinstance(result.get("data"), dict):
-            result["data"] = {"certificates": f5_cert_rows(result["data"].get("items") or [])}
+            result["data"] = {"certificates": f5_cert_rows(result["data"].get("items") or [], sess)}
         if sess["vendor"] == "f5" and spec["id"] == "polsearch" and result.get("ok"):
             rows = f5_policy_search(sess, str((b.get("params") or {}).get("policy") or "").strip())
             result["data"] = {"policies": rows} if rows else {"policies": [], "note": "no local traffic policy matches that name"}
@@ -1042,7 +1573,23 @@ def f5_host_cond(c, host):
     return True, (not hit if neg else hit), text
 
 
+F5_HOST_CACHE = {}   # (session id, hostname) -> (time, result): the flow trace asks each F5 more than once
+
+
 def do_f5_host(b):
+    k = (b.get("id"), str(b.get("hostname") or "").strip().lower())
+    hit = F5_HOST_CACHE.get(k)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    r = f5_host_lookup(b)
+    if r.get("ok"):
+        F5_HOST_CACHE[k] = (time.time(), r)
+        for x in [x for x, v in F5_HOST_CACHE.items() if time.time() - v[0] > 60]:
+            F5_HOST_CACHE.pop(x, None)
+    return r
+
+
+def f5_host_lookup(b):
     sess = SESSIONS.get(b.get("id"))
     if not sess or sess["vendor"] != "f5":
         return {"ok": False, "error": "connect an F5 device first"}
@@ -1146,30 +1693,11 @@ def pan_lookup(sess, ip, vsys, flow, refs=True):
     def section(xp, tag):
         return pan_section(sess, xp, tag)
 
-    scopes = [("vsys:" + vsys, base), ("shared", "/config/shared")]
-    matched, groups, skipped = {}, [], 0
-    for label, xp in (scopes if refs else []):
-        node = section(xp, "address")
-        for e in (node.findall("entry") if node is not None else []):
-            for tag in ("ip-netmask", "ip-range"):
-                v = e.findtext(tag)
-                if v and ip_in_spec(ip, v):
-                    matched[e.get("name")] = "%s %s (%s)%s" % (tag, v.strip(), label, spec_relation(ip, v))
-            if e.find("fqdn") is not None or e.find("ip-wildcard") is not None:
-                skipped += 1
-        node = section(xp, "address-group")
-        for e in (node.findall("entry") if node is not None else []):
-            if e.find("dynamic") is not None:
-                skipped += 1
-            groups.append((label, e.get("name"), pan_members(e.find("static"))))
-    changed = True
-    while changed:
-        changed = False
-        for label, n, members in groups:
-            via = [m for m in members if m in matched]
-            if n not in matched and via:
-                matched[n] = "group containing %s (%s)" % (", ".join(via), label)
-                changed = True
+    if refs:
+        addrs, groups, skipped = pan_addr_db(sess, vsys)
+        matched = pan_addr_match(ip, addrs, groups)
+    else:
+        matched, skipped = {}, 0
     rules = []
     for label, e in (pan_rules(sess, vsys) if refs else []):
         hits = []
@@ -1266,26 +1794,7 @@ def fg_lookup(sess, ip, vdom, flow, refs=True):
     addrs, grps, pols = (fg_cmdb(sess, n, vdom) if refs else [] for n in ("address", "addrgrp", "policy"))
     if pols is None:
         notes.append("could not read firewall policy list (check token profile / VDOM)")
-    matched, skipped = {}, 0
-    for a in addrs or []:
-        n, t = a.get("name"), a.get("type", "ipmask")
-        if n == "all" or a.get("subnet") == "0.0.0.0 0.0.0.0":
-            continue
-        if t == "ipmask" and ip_in_spec(ip, a.get("subnet")):
-            matched[n] = "subnet " + a["subnet"] + spec_relation(ip, a["subnet"])
-        elif t == "iprange" and ip_in_spec(ip, "%s-%s" % (a.get("start-ip"), a.get("end-ip"))):
-            rng = "%s-%s" % (a.get("start-ip"), a.get("end-ip"))
-            matched[n] = "range " + rng + spec_relation(ip, rng)
-        elif t not in ("ipmask", "iprange"):
-            skipped += 1
-    changed = True
-    while changed:
-        changed = False
-        for g in grps or []:
-            via = [m.get("name") for m in as_list(g.get("member")) if m.get("name") in matched]
-            if g.get("name") not in matched and via:
-                matched[g["name"]] = "group containing " + ", ".join(via)
-                changed = True
+    matched, skipped = fg_addr_match(ip, addrs, grps)
     names = lambda x: [i.get("name") for i in as_list(x)]
     rules = []
     for p in pols or []:
@@ -1762,6 +2271,356 @@ def pan_nat_rules(sess, v):
                       {"virtual_ip_equivalents": rows, "count": len(rows), "nat_rules_scanned": total,
                        "note": "Address objects in 'public destination' are shown by name; use 'Where does this IP appear' to resolve them. "
                                "Panorama-pushed rules appear only if present in this device's running config."}, t0)
+
+
+# ---- Source NAT lookup: what an IP is translated to when it is the source (PAN-OS, FortiGate, F5) ----------------
+def pan_addr_db(sess, vsys):
+    """Address objects (ip-netmask / ip-range) and static groups of the vsys and shared -> (addrs, groups, skipped)."""
+    addrs, groups, skipped = [], [], 0
+    for label, xp in [("vsys:" + vsys, pan_base(vsys)), ("shared", "/config/shared")]:
+        node = pan_section(sess, xp, "address")
+        for e in (node.findall("entry") if node is not None else []):
+            for tag in ("ip-netmask", "ip-range"):
+                v = e.findtext(tag)
+                if v:
+                    addrs.append((label, e.get("name"), tag, v.strip()))
+            if e.find("fqdn") is not None or e.find("ip-wildcard") is not None:
+                skipped += 1
+        node = pan_section(sess, xp, "address-group")
+        for e in (node.findall("entry") if node is not None else []):
+            if e.find("dynamic") is not None:
+                skipped += 1
+            groups.append((label, e.get("name"), pan_members(e.find("static"))))
+    return addrs, groups, skipped
+
+
+def pan_addr_match(ip, addrs, groups):
+    """{object or group name: why it contains ip}."""
+    matched = {}
+    for label, n, tag, v in addrs:
+        if ip_in_spec(ip, v):
+            matched[n] = "%s %s (%s)%s" % (tag, v, label, spec_relation(ip, v))
+    changed = True
+    while changed:
+        changed = False
+        for label, n, members in groups:
+            via = [m for m in members if m in matched]
+            if n not in matched and via:
+                matched[n] = "group containing %s (%s)" % (", ".join(via), label)
+                changed = True
+    return matched
+
+
+def fg_addr_match(ip, addrs, grps):
+    """FortiGate address objects / groups containing ip -> ({name: why}, objects not evaluated)."""
+    matched, skipped = {}, 0
+    for a in addrs or []:
+        n, t = a.get("name"), a.get("type", "ipmask")
+        if n == "all" or a.get("subnet") == "0.0.0.0 0.0.0.0":
+            continue
+        if t == "ipmask" and ip_in_spec(ip, a.get("subnet")):
+            matched[n] = "subnet " + a["subnet"] + spec_relation(ip, a["subnet"])
+        elif t == "iprange" and ip_in_spec(ip, "%s-%s" % (a.get("start-ip"), a.get("end-ip"))):
+            rng = "%s-%s" % (a.get("start-ip"), a.get("end-ip"))
+            matched[n] = "range " + rng + spec_relation(ip, rng)
+        elif t not in ("ipmask", "iprange"):
+            skipped += 1
+    changed = True
+    while changed:
+        changed = False
+        for g in grps or []:
+            via = [m.get("name") for m in as_list(g.get("member")) if m.get("name") in matched]
+            if g.get("name") not in matched and via:
+                matched[g["name"]] = "group containing " + ", ".join(via)
+                changed = True
+    return matched, skipped
+
+
+def snat_hit(members, ip, matched, anyname):
+    """How a rule's address list covers ip: 'any', an object (with why) or a literal; '' if it does not."""
+    for m in members:
+        if m == anyname:
+            return m
+        if m in matched:
+            return "%s: %s" % (m, matched[m])
+        if ip_in_spec(ip, m):
+            return m + " (literal)"
+    return ""
+
+
+def snat_flow_args(v, pan):
+    ip = parse_ip(v.get("ip"), "Source IP")
+    dst = parse_ip(v["dst"], "Destination IP") if v.get("dst") else None
+    port = num(v["port"], 1, 65535, None, "port") if v.get("port") else None
+    proto = (v.get("proto") or "tcp").lower()
+    if pan:
+        proto = {"tcp": "6", "udp": "17", "icmp": "1"}.get(proto, proto)
+        num(proto, 0, 255, None, "protocol")
+    elif proto not in ("tcp", "udp", "icmp") and not proto.isdigit():
+        raise ValueError("protocol must be tcp, udp, icmp or a number")
+    return ip, dst, port, proto
+
+
+def pan_snat(sess, v):
+    t0, vsys = time.time(), v.get("vsys") or "vsys1"
+    ip, dst, port, proto = snat_flow_args(v, True)
+    addrs, groups, skipped = pan_addr_db(sess, vsys)
+    m_src = pan_addr_match(ip, addrs, groups)
+    m_dst = pan_addr_match(dst, addrs, groups) if dst else {}
+    vals = {n: val for _, n, _, val in addrs}
+    show = lambda names: ", ".join("%s (%s)" % (n, vals[n]) if n in vals else n for n in names)
+    rows, pos, total = [], 0, 0
+    for label, xp in [("shared-pre", "/config/shared/pre-rulebase/nat"), ("local", pan_base(vsys) + "/rulebase/nat"),
+                      ("shared-post", "/config/shared/post-rulebase/nat")]:   # the order PAN-OS evaluates them
+        node = pan_section(sess, xp, "rules")
+        for e in (node.findall("entry") if node is not None else []):
+            pos += 1
+            total += 1
+            src_m, dst_m = pan_members(e.find("source")), pan_members(e.find("destination"))
+            sv = snat_hit(src_m, ip, m_src, "any")
+            dv = snat_hit(dst_m, dst, m_dst, "any") if dst else ""
+            if not sv or (dst and not dv):
+                continue
+            st = e.find("source-translation")
+            dipp = st.find("dynamic-ip-and-port") if st is not None else None
+            dip = st.find("dynamic-ip") if st is not None else None
+            sip = st.find("static-ip") if st is not None else None
+            if dipp is not None and dipp.find("interface-address") is not None:
+                ia = dipp.find("interface-address")
+                kind = "dynamic IP and port (interface address)"
+                to = "interface %s, address %s" % (ia.findtext("interface") or "?",
+                                                   show([ia.findtext("ip")]) if ia.findtext("ip") else "(its primary IP)")
+            elif dipp is not None:
+                kind, to = "dynamic IP and port", show(pan_members(dipp.find("translated-address")))
+            elif dip is not None:
+                kind, to = "dynamic IP", show(pan_members(dip.find("translated-address")))
+                fb = dip.find("fallback")
+                if fb is not None:
+                    to += " (fallback configured)"
+            elif sip is not None:
+                kind = "static IP" + (" (bi-directional)" if (sip.findtext("bi-directional") or "") == "yes" else "")
+                to = show([sip.findtext("translated-address") or "?"])
+            else:
+                kind, to = "none: no source translation (this rule keeps the source)", "unchanged"
+            rows.append({"order": pos, "rule": e.get("name"), "scope": label, "source_nat": kind, "translated_to": to,
+                         "disabled": e.findtext("disabled") or "no",
+                         "from_zone": ", ".join(pan_members(e.find("from"))), "to_zone": ", ".join(pan_members(e.find("to"))),
+                         "to_interface": e.findtext("to-interface") or "any", "source": ", ".join(src_m),
+                         "source_match": sv, "destination": ", ".join(dst_m), "service": e.findtext("service") or "any",
+                         "destination_nat": "yes" if e.find("destination-translation") is not None else "no"})
+    live = [r for r in rows if r["disabled"] != "yes"]
+    summary, notes, verdict, test = [], [], None, None
+    if dst:
+        cmd = "<test><nat-policy-match>"
+        for k in ("from", "to"):
+            if v.get(k):
+                cmd += "<%s>%s</%s>" % (k, xml_escape(v[k]), k)
+        cmd += "<source>%s</source><destination>%s</destination>" % (ip, dst)
+        if port:
+            cmd += "<destination-port>%d</destination-port>" % port
+        cmd += "<protocol>%s</protocol></nat-policy-match></test>" % proto
+        st_, raw = http(sess, "POST", "/api/", {"X-PAN-KEY": sess["key"], "Content-Type": "application/x-www-form-urlencoded"},
+                        urllib.parse.urlencode({"type": "op", "cmd": cmd}).encode(), 30)
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            root = None
+        if root is not None and root.get("status") == "success":
+            e = root.find(".//rules/entry")
+            e = root.find(".//entry") if e is None else e
+            name = "" if e is None else (e.get("name") or (e.text or "").split(";")[0].strip())
+            test = {"matched_rule": name or None}
+            r = next((x for x in rows if x["rule"] == name), None)
+            if not name:
+                verdict = {"label": "NO NAT RULE MATCHES: %s leaves with its own address" % ip, "kind": "ok"}
+            elif r and r["translated_to"] != "unchanged":
+                verdict = {"label": "SOURCE NAT by rule '%s': %s -> %s" % (name, ip, r["translated_to"]), "kind": "info"}
+            elif r:
+                verdict = {"label": "NAT rule '%s' matches: source not translated" % name, "kind": "ok"}
+            else:
+                verdict = {"label": "NAT rule '%s' matches (not in the running config read here)" % name, "kind": "warn"}
+            summary.append("Firewall test (nat-policy-match %s -> %s%s, protocol %s%s): %s" % (
+                ip, dst, ":%d" % port if port else "", proto,
+                "".join(", %s zone %s" % (k, v[k]) for k in ("from", "to") if v.get(k)), name or "no NAT rule"))
+        else:
+            err = (" ".join(t.strip() for t in root.itertext() if t.strip())[:300] if root is not None else "HTTP %s" % st_)
+            notes.append("nat-policy-match was rejected: %s. Enter the source and destination zones (from / to) if the "
+                         "firewall needs them; the table below is from the configuration." % err)
+    if verdict is None and dst:
+        f = live[0] if live else None
+        verdict = ({"label": "NO NAT RULE COVERS %s -> %s: the source is not translated" % (ip, dst), "kind": "ok"} if not f
+                   else {"label": "FIRST MATCHING NAT RULE (config, zones / service not checked): '%s': %s" % (
+                       f["rule"], "source not translated" if f["translated_to"] == "unchanged" else
+                       "%s -> %s" % (ip, f["translated_to"])), "kind": "info" if f["translated_to"] != "unchanged" else "ok"})
+    if verdict is None:
+        tr = [r for r in live if r["translated_to"] != "unchanged"]
+        verdict = ({"label": "NO NAT RULE TRANSLATES %s as source" % ip, "kind": "ok"} if not tr else
+                   {"label": "%d NAT RULE(S) TRANSLATE THIS SOURCE · first: '%s' -> %s" % (len(tr), tr[0]["rule"],
+                                                                                            tr[0]["translated_to"]),
+                    "kind": "info"})
+        if tr and tr[0] is not live[0]:
+            summary.append("Rule '%s' comes earlier and keeps the source unchanged for the traffic it matches (destination "
+                           "%s)." % (live[0]["rule"], live[0]["destination"] or "any"))
+        if live:
+            summary.append("Without a destination the zones and destination of each rule are not checked: the first "
+                           "rule in the list is the first candidate, not necessarily the one used. Enter the "
+                           "destination for the firewall's own answer.")
+    if skipped:
+        notes.append("%d FQDN / wildcard / dynamic object(s) were not evaluated." % skipped)
+    notes.append("Rules in evaluation order (shared pre-rules, local, shared post-rules); the first match applies. "
+                 "Panorama-pushed rules appear only if present in this device's running config.")
+    data = {"source_nat_rules": rows, "count": len(rows), "nat_rules_scanned": total, "objects_containing_ip": m_src,
+            "notes": notes}
+    if test:
+        data["firewall_test"] = test
+    return dict(pan_result("source NAT for %s%s (vsys %s)" % (ip, " -> %s" % dst if dst else "", vsys), data, t0),
+                verdict=verdict, summary=summary)
+
+
+def fg_snat(sess, v):
+    t0, vdom = time.time(), v.get("vdom") or ""
+    ip, dst, port, proto = snat_flow_args(v, False)
+    vq = ("?vdom=" + urllib.parse.quote(vdom)) if vdom else ""
+    st, ok, sd = rest_get(sess, "/api/v2/cmdb/system/settings" + vq)
+    res0 = sd.get("results") if isinstance(sd, dict) else None
+    central = isinstance(res0, dict) and res0.get("central-nat") == "enable"
+    addrs, grps = fg_cmdb(sess, "address", vdom), fg_cmdb(sess, "addrgrp", vdom)
+    m_src, skipped = fg_addr_match(ip, addrs, grps)
+    m_dst = fg_addr_match(dst, addrs, grps)[0] if dst else {}
+    pools = {p.get("name"): p for p in fg_cmdb(sess, "ippool", vdom) or []}
+    names = lambda x: [i.get("name") for i in as_list(x) if isinstance(i, dict)]
+    ifip = {}
+
+    def egress(intfs):
+        out = []
+        for n in intfs:
+            if n not in ifip:
+                s2, ok2, d2 = rest_get(sess, "/api/v2/cmdb/system/interface/" + urllib.parse.quote(n, safe="") + vq)
+                r2 = d2.get("results") if ok2 and isinstance(d2, dict) else None
+                r2 = r2[0] if isinstance(r2, list) and r2 else r2
+                a = str((r2 or {}).get("ip") or "").split() if isinstance(r2, dict) else []
+                ifip[n] = a[0] if a and a[0] != "0.0.0.0" else ""
+            out.append("%s address%s" % (n, " " + ifip[n] if ifip[n] else ""))
+        return "egress interface: " + (", ".join(out) or "?")
+
+    def pool_txt(pn):
+        out = []
+        for n in pn:
+            p = pools.get(n) or {}
+            out.append("%s (%s%s, %s)" % (n, p.get("startip", "?"), "-" + p["endip"] if p.get("endip") and
+                                          p.get("endip") != p.get("startip") else "", p.get("type", "?")) if p else n)
+        return "IP pool " + ", ".join(out)
+    rows = []
+    if central:
+        for r in fg_cmdb(sess, "central-snat-map", vdom) or []:
+            sv = snat_hit(names(r.get("orig-addr")), ip, m_src, "all")
+            dv = snat_hit(names(r.get("dst-addr")), dst, m_dst, "all") if dst else ""
+            if not sv or (dst and not dv):
+                continue
+            nat = r.get("nat", "enable") == "enable"
+            pn = names(r.get("nat-ippool"))
+            rows.append({"rule": "central SNAT %s" % r.get("policyid"), "status": r.get("status", "enable"),
+                         "srcintf": ", ".join(names(r.get("srcintf"))), "dstintf": ", ".join(names(r.get("dstintf"))),
+                         "source": ", ".join(names(r.get("orig-addr"))), "source_match": sv,
+                         "destination": ", ".join(names(r.get("dst-addr"))),
+                         "translated_to": (pool_txt(pn) if pn else egress(names(r.get("dstintf")))) if nat else "unchanged (nat disable)",
+                         "_id": r.get("policyid")})
+    pol_rows = []
+    for p in fg_cmdb(sess, "policy", vdom) or []:
+        if p.get("action") != "accept" or p.get("srcaddr-negate") == "enable":
+            continue
+        sv = snat_hit(names(p.get("srcaddr")), ip, m_src, "all")
+        dv = snat_hit(names(p.get("dstaddr")), dst, m_dst, "all") if dst else ""
+        if not sv or (dst and p.get("dstaddr-negate") != "enable" and not dv):
+            continue
+        nat = p.get("nat") == "enable"
+        pn = names(p.get("poolname")) if p.get("ippool") == "enable" else []
+        pol_rows.append({"rule": "policy %s%s" % (p.get("policyid"), " '%s'" % p["name"] if p.get("name") else ""),
+                         "status": p.get("status", "enable"), "srcintf": ", ".join(names(p.get("srcintf"))),
+                         "dstintf": ", ".join(names(p.get("dstintf"))), "source": ", ".join(names(p.get("srcaddr"))),
+                         "source_match": sv, "destination": ", ".join(names(p.get("dstaddr"))),
+                         "translated_to": ("(central NAT: see the central SNAT rows)" if central else
+                                           (pool_txt(pn) if pn else egress(names(p.get("dstintf")))) if nat
+                                           else "unchanged (nat disable)"),
+                         "_id": p.get("policyid")})
+    if not central:
+        rows = pol_rows
+    for x in fg_cmdb(sess, "vip", vdom) or []:
+        if x.get("nat-source-vip") == "enable" and any(ip_in_spec(ip, strip_rd(str(m.get("range", ""))))
+                                                       for m in as_list(x.get("mappedip"))):
+            rows.append({"rule": "VIP %s (nat-source-vip)" % x.get("name"), "status": "enable",
+                         "srcintf": "", "dstintf": x.get("extintf", ""), "source": ", ".join(
+                             str(m.get("range")) for m in as_list(x.get("mappedip"))), "source_match": "mapped IP",
+                         "destination": "any", "translated_to": str(x.get("extip") or ""), "_id": None})
+    summary, notes, verdict, test = [], [], None, None
+    if dst:
+        res, _, vd = fg_lookup(sess, ip, vdom, {"src": str(ip), "dst": str(dst), "port": port, "proto": proto,
+                                                "srcintf": v.get("srcintf") or ""}, refs=False)
+        pol = (res.get("flow_test") or {}).get("matched_policy") or {}
+        notes += res.get("notes") or []
+        test = {"policy_lookup": vd.get("label"), "matched_policy": pol.get("policyid")}
+        if pol.get("policyid") is not None and not central:
+            r = next((x for x in rows if x["_id"] == pol.get("policyid")), None)
+            if r and r["translated_to"].startswith("unchanged"):
+                verdict = {"label": "Policy %s matches: no source NAT, %s keeps its address" % (pol["policyid"], ip), "kind": "ok"}
+            elif r:
+                verdict = {"label": "SOURCE NAT by %s: %s -> %s" % (r["rule"], ip, r["translated_to"]), "kind": "info"}
+        elif pol.get("policyid") is not None and central:
+            f = next((x for x in rows if x["status"] != "disable" and x["_id"] is not None), None)
+            verdict = ({"label": "Policy %s matches; first central SNAT rule for this flow: %s -> %s" % (
+                pol["policyid"], f["rule"], f["translated_to"]), "kind": "info"} if f else
+                {"label": "Policy %s matches; no central SNAT rule covers it: the source is not translated" % pol["policyid"],
+                 "kind": "ok"})
+            if f:
+                notes.append("Central NAT: the first enabled central SNAT rule whose interfaces and addresses match is "
+                             "used; the interfaces are not compared here.")
+        else:
+            verdict = {"label": "POLICY LOOKUP: %s" % vd.get("label"), "kind": vd.get("kind", "warn")}
+    if verdict is None:
+        live = [r for r in rows if r["status"] != "disable"]
+        nat = [r for r in live if not r["translated_to"].startswith("unchanged")]
+        verdict = ({"label": "NO SOURCE NAT COVERS %s: the source is not translated" % ip, "kind": "ok"} if not nat else
+                   {"label": "%d RULE(S) TRANSLATE THIS SOURCE · first: %s -> %s" % (len(nat), nat[0]["rule"],
+                                                                                     nat[0]["translated_to"]), "kind": "info"})
+        if live and not dst:
+            summary.append("Without a destination every policy / rule that covers the source is listed in order; enter "
+                           "the destination for the one that is used.")
+    if skipped:
+        notes.append("%d FQDN / geography / wildcard object(s) were not evaluated." % skipped)
+    notes.append("NAT mode: %s." % ("central NAT (central SNAT map)" if central else "policy NAT (nat enable on the policy)"))
+    for r in rows:
+        r.pop("_id", None)
+    data = {"source_nat": rows, "count": len(rows), "objects_containing_ip": m_src, "notes": notes}
+    if test:
+        data["firewall_test"] = test
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "verdict": verdict, "summary": summary,
+            "request": "source NAT for %s%s%s" % (ip, " -> %s" % dst if dst else "", " (vdom %s)" % vdom if vdom else ""),
+            "data": data}
+
+
+def f5_snat_lookup(sess, v):
+    t0 = time.time()
+    ip = parse_ip(v.get("ip"), "Source IP")
+    ok, d = f5_get(sess, "/mgmt/tm/ltm/snat")
+    if not ok:
+        return {"ok": False, "error": "could not read /mgmt/tm/ltm/snat"}
+    rows = []
+    for s in (d.get("items") if isinstance(d, dict) else None) or []:
+        origins = [strip_rd(str(o.get("name") or "")) for o in as_list(s.get("origins")) if isinstance(o, dict)]
+        hit = next((o for o in origins if o in ("0.0.0.0/0", "0.0.0.0/0.0.0.0", "any", "any6") or ip_in_spec(ip, o)), "")
+        if not hit:
+            continue
+        to = ("automap" if s.get("automap") is not None else "SNAT pool " + str(s["snatpool"]) if s.get("snatpool")
+              else strip_rd(str(s.get("translation") or "?").rsplit("/", 1)[-1]))
+        rows.append({"snat": s.get("fullPath") or s.get("name"), "origin_match": hit, "translated_to": to,
+                     "vlans": ", ".join(as_list(s.get("vlans"))) or "all",
+                     "vlans_mode": "enabled on" if s.get("vlansEnabled") is not None else "disabled on" if s.get("vlansDisabled") is not None else "all"})
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "GET /mgmt/tm/ltm/snat",
+            "verdict": ({"label": "SNAT %s: %s -> %s" % (rows[0]["snat"], ip, rows[0]["translated_to"]), "kind": "info"} if rows
+                        else {"label": "NO STANDALONE SNAT COVERS %s" % ip, "kind": "ok"}),
+            "summary": ["Virtual-server SNAT (automap / SNAT pool on the virtual server) applies to every client of "
+                        "that virtual server and is not listed here: see the flow trace or the virtual server."],
+            "data": {"snats": rows, "count": len(rows)}}
 
 
 def pan_static_routes(sess, v):
@@ -2915,7 +3774,8 @@ def pan_app_traffic(sess, v):
 
 PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_routes, "pan_sessions": pan_sessions,
                 "pan_resources": pan_resources, "fg_resources": fg_resources,
-                "f5_perf": f5_perf, "f5_vs_top": f5_vs_top, "pan_app_traffic": pan_app_traffic}
+                "f5_perf": f5_perf, "f5_vs_top": f5_vs_top, "pan_app_traffic": pan_app_traffic,
+                "pan_snat": pan_snat, "fg_snat": fg_snat, "f5_snat": f5_snat_lookup}
 
 
 def do_ipcheck(b):
@@ -2975,12 +3835,320 @@ def do_ipcheck(b):
             "request": "IP lookup %s" % ip, "data": res, "summary": summary, "verdict": verdict}
 
 
-# ---- Flow trace: one flow followed along the path Cloudflare -> FortiGate DMZ -> F5 DMZ -> Palo Alto ---------------
-# Each device is tested with the addresses it really sees: after Cloudflare proxying (source = a Cloudflare edge
-# address, destination = the origin IP), after the FortiGate VIP (destination = the mapped F5 virtual address) and
-# after the F5 (source = its SNAT address, destination = the pool members).
-FLOW_STAGE = {"cloudflare": (1, "1 Edge · Cloudflare"), "fortigate": (2, "2 DMZ firewall · FortiGate"),
-              "f5": (3, "3 DMZ load balancer · F5"), "paloalto": (4, "4 Internal firewall · Palo Alto")}
+# ---- Flow trace: one flow through the connected devices it crosses, found from their own configuration ------------
+# Not tied to device names, vendors or order: edge (Cloudflare) -> optional upstream 1:1 NAT -> the firewall that
+# translates the destination (FortiGate VIP / Palo Alto NAT) -> the F5 with the virtual server -> firewalls before the
+# servers. Each device is tested with the addresses it really sees (after proxying, NAT and the F5's SNAT).
+FLOW_STAGE = {"cloudflare": (1, "1 Edge · Cloudflare"), "nat": (1.5, "Upstream NAT · 1:1 NAT"),
+              "fortigate": (2, "2 Firewall · FortiGate"), "f5": (3, "3 Load balancer · F5"),
+              "paloalto": (4, "4 Firewall · Palo Alto")}
+# Optional step for environments where a public IP is 1:1 NAT'ed to a private IP before the first firewall (a cloud
+# provider's public IPs, an edge router). It only appears when it applies: the public IP is in nat_map.txt, or it can
+# be inferred without doubt from the F5 virtual server and the FortiGate VIP that maps to it. Elsewhere it never shows.
+NAT_SESS = {"vendor": "nat", "name": "Upstream NAT", "host": "nat"}   # not a connected device
+NAT_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nat_map.txt")
+
+
+def nat_map_parse(text):
+    """'public private  # comment' lines -> ([(public, private, comment)], [errors])."""
+    rows, errs = [], []
+    for n, line in enumerate(str(text or "").splitlines(), 1):
+        body, _, com = line.partition("#")
+        parts = body.split()
+        if not parts:
+            continue
+        try:
+            if len(parts) != 2:
+                raise ValueError
+            pub, priv = ipaddress.ip_address(parts[0]), ipaddress.ip_address(parts[1])
+        except ValueError:
+            errs.append("line %d: expected 'public-IP private-IP', got %r" % (n, body.strip()[:60]))
+            continue
+        rows.append((str(pub), str(priv), com.strip()[:100]))
+    return rows, errs
+
+
+def nat_map_rows():
+    try:
+        with open(NAT_MAP_FILE, encoding="utf-8") as f:
+            return nat_map_parse(f.read())[0]
+    except OSError:
+        return []
+
+
+def nat_map_text(rows):
+    return "".join("%s %s%s\n" % (a, c, ("  # " + m) if m else "") for a, c, m in rows)
+
+
+def do_nat_map(b):
+    """Read, or replace, the optional upstream NAT list (public IP -> private IP) used by the flow trace."""
+    if b.get("set"):
+        rows, errs = nat_map_parse(str(b.get("text") or "")[:100000])
+        if errs:
+            return {"ok": False, "error": "; ".join(errs[:5])}
+        tmp = NAT_MAP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("# Upstream NAT: public IP -> private IP (1:1), one pair per line. Used by the flow trace. "
+                    "Not in git.\n" + nat_map_text(rows))
+        os.replace(tmp, NAT_MAP_FILE)
+    rows = nat_map_rows()
+    return {"ok": True, "count": len(rows), "text": nat_map_text(rows)}
+
+
+NAT_PRIVATE = [ipaddress.ip_network(x) for x in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7")]
+
+
+def nat_private(ip):
+    """Inside address (RFC 1918, carrier-grade NAT, IPv6 ULA): the side a 1:1 NAT translates public addresses to."""
+    return any(ip.version == net.version and ip in net for net in NAT_PRIVATE)
+
+
+# Optional VIP list: one row per published service, "name  FortiGate-VIP  F5-VIP[:port]", pasted from a spreadsheet.
+# The name may be a hostname or a label such as "Shop portal VIP": its words are matched against the hostname traced.
+# It tells the trace which FortiGate VIP belongs to a hostname, which the devices themselves do not record.
+VIP_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vip_map.txt")
+VIP_NAME_STOP = {"vip", "vips", "vs", "virtual", "server", "fg", "fgt", "fortigate", "f5", "fw", "nat", "public", "pub",
+                 "external", "ext", "prod", "production", "the", "and", "new", "old"}
+
+
+def vip_map_ip(tok):
+    """'10.1.1.1' or '10.1.1.1:443' -> (ip, port) or None."""
+    tok = tok.strip().strip("[]")
+    try:
+        return str(ipaddress.ip_address(tok)), ""
+    except ValueError:
+        pass
+    a, _, b = tok.rpartition(":")
+    try:
+        if b.isdigit() and 0 < int(b) < 65536:
+            return str(ipaddress.ip_address(a.strip("[]"))), b
+    except ValueError:
+        pass
+    return None
+
+
+def vip_map_parse(text):
+    """Lines 'name<tab>fortigate-vip<tab>f5-vip[:port][<tab>anything]' (tabs, commas or spaces; a header row and extra
+    columns are ignored) -> ([(name, fg_ip, f5_ip, f5_port)], [errors])."""
+    rows, errs = [], []
+    for n, line in enumerate(str(text or "").splitlines(), 1):
+        body = line.split("#", 1)[0]
+        toks = [t for t in re.split(r"[\t,;\s]+", body) if t]
+        if not toks:
+            continue
+        i = next((j for j, t in enumerate(toks) if vip_map_ip(t)), None)
+        if i is None:
+            continue   # a header row or a note: no address on it
+        ips = [vip_map_ip(t) for t in toks[i:i + 2]]
+        if len(ips) < 2 or not ips[1] or ips[0][1]:
+            errs.append("line %d: expected 'name  FortiGate-VIP  F5-VIP', got %r" % (n, body.strip()[:80]))
+            continue
+        rows.append((" ".join(toks[:i])[:100], ips[0][0], ips[1][0], ips[1][1]))
+    return rows, errs
+
+
+def vip_map_rows():
+    try:
+        with open(VIP_MAP_FILE, encoding="utf-8") as f:
+            return vip_map_parse(f.read())[0]
+    except OSError:
+        return []
+
+
+def vip_map_text(rows):
+    return "".join("%s\t%s\t%s%s\n" % (nm or "-", fg, f5, ":" + fp if fp else "") for nm, fg, f5, fp in rows)
+
+
+def do_vip_map(b):
+    """Read, or replace, the optional VIP list (name / hostname -> FortiGate VIP -> F5 VIP) used by the flow trace."""
+    if b.get("set"):
+        rows, errs = vip_map_parse(str(b.get("text") or "")[:300000])
+        if errs:
+            return {"ok": False, "error": "; ".join(errs[:5])}
+        tmp = VIP_MAP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("# VIP list: name or hostname <tab> FortiGate VIP <tab> F5 VIP[:port]. Used by the flow trace. "
+                    "Not in git.\n" + vip_map_text(rows))
+        os.replace(tmp, VIP_MAP_FILE)
+    rows = vip_map_rows()
+    return {"ok": True, "count": len(rows), "text": vip_map_text(rows)}
+
+
+def vip_name_hit(name, host):
+    """How well a VIP list name fits a hostname: 0 = no match, higher = more specific."""
+    n = str(name or "").strip().lower().rstrip(".")
+    if not n or n == "-" or not host:
+        return 0
+    if n == host:
+        return 1000
+    ht = {t for t in re.split(r"[^a-z0-9]+", host) if t}
+    words = [w for w in re.split(r"[^a-z0-9]+", n) if w and w not in VIP_NAME_STOP]
+    if words and (all(w in ht for w in words) or "".join(words) in ht):
+        return len(words)
+    return 0
+
+
+def vip_list_named(rows, host):
+    """Rows of the VIP list whose name fits the hostname best."""
+    sc = [(vip_name_hit(r[0], host), r) for r in rows]
+    best = max([x for x, _ in sc] or [0])
+    return [r for x, r in sc if best and x == best]
+
+
+def flow_nat_list(rows, d, leg, host, fg, vips, vs_ips):
+    """Upstream NAT from the VIP list -> (hop, next leg, {private: (f5 ip, f5 port)}) or None when no row applies."""
+    named = vip_list_named(rows, host)
+    live = {a for a, _ in vs_ips()}
+    onf5 = [r for r in rows if r[2] in live]
+    both = [r for r in named if r in onf5]
+    cand = [r for r in (both or named or onf5) if nat_private(ipaddress.ip_address(r[1]))]
+    if not cand:
+        return None
+    nm = lambda rs: ", ".join(dict.fromkeys(r[0] or r[1] for r in rs))
+    how = ("its name matches %s and its F5 VIP is the F5 virtual server of %s" % (host, host) if both else
+           "its name matches %s" % host if named and cand[0] in named else "its F5 VIP is the F5 virtual server of %s" % host)
+    privs = list(dict.fromkeys(r[1] for r in cand))
+    if len(privs) > 1:
+        return (flow_hop(NAT_SESS, "Public IP %s" % d, {"ok": True, "verdict": {
+            "label": "AMBIGUOUS: public %s may be NAT'ed to %s (VIP list: %s)" % (d, " or ".join(privs[:4]), nm(cand)[:120]),
+            "kind": "warn"}}, ["Several rows of the VIP list fit %s (%s). Make the names more specific, or add the right "
+                               "'public private' pair to the upstream NAT list." % (host, how)]), leg, {})
+    p = privs[0]
+    rs = [r for r in cand if r[1] == p]
+    det, kind = ["VIP list row %s: FortiGate VIP %s -> F5 VIP %s (%s)" % (
+        nm(rs), p, ", ".join(r[2] + (":" + r[3] if r[3] else "") for r in rs), how)], "ok"
+    if fg:
+        pip = ipaddress.ip_address(p)
+        lv = [v for v in vips() if ip_in_spec(pip, str(v.get("extip") or ""))]
+        mapped = {strip_rd(str(m.get("range", ""))).split("-")[0].strip() for v in lv for m in as_list(v.get("mappedip"))}
+        if not lv:
+            kind = "warn"
+            det.append("no FortiGate VIP has the external IP %s: the list may be out of date" % p)
+        elif not any(r[2] in mapped for r in rs):
+            kind = "warn"
+            det.append("on the FortiGate, VIP %s maps %s to %s, not to the listed F5 VIP" % (
+                ", ".join(str(v.get("name")) for v in lv), p, ", ".join(sorted(mapped)) or "?"))
+        else:
+            det.append("confirmed on the FortiGate: VIP %s maps %s to %s" % (
+                ", ".join(str(v.get("name")) for v in lv), p, ", ".join(sorted(mapped))))
+    else:
+        det.append("FortiGate not connected: the row is not checked against the device")
+    if live and not any(r[2] in live for r in rs):
+        kind = "warn"
+        det.append("the F5 virtual server of %s is on %s, not on the listed F5 VIP" % (host, ", ".join(sorted(live))))
+    lab = "public %s -> private %s (VIP list: %s)" % (d, p, nm(rs)[:120])
+    return (flow_hop(NAT_SESS, "Public IP %s" % d, {"ok": True, "verdict": {
+        "label": lab if kind == "ok" else "CHECK: " + lab, "kind": kind}}, det),
+        flow_leg(leg["src"], p, leg["port"], "upstream NAT %s -> %s (VIP list: %s)" % (d, p, nm(rs)[:80])),
+        {p: (rs[0][2], rs[0][3], nm(rs))})
+
+
+def flow_list_resolve(src, host, port):
+    """Hostname -> legs to the FortiGate VIP of the best-matching VIP list rows (when nothing else resolved it)."""
+    rs = vip_list_named(vip_map_rows(), host)
+    return [flow_leg(src, fg, port, "VIP list: %s is %s" % (host, nm or fg)) for nm, fg in
+            dict.fromkeys((r[0], r[1]) for r in rs)][:FLOW_MAX_LEGS]
+
+
+def flow_trace_nat(by, legs, host, port):
+    """Public destination -> the private IP the first firewall really sees, when a 1:1 NAT sits in front of it.
+    -> (hops, legs, {private IP: (F5 VIP, port, name)} from the VIP list). No hop and no change when nothing
+    indicates such a NAT. Evidence, strongest first: upstream NAT list, VIP list, inference from the devices."""
+    nat = {a: c for a, c, _ in nat_map_rows()}
+    rev = {c: a for a, c in nat.items()}
+    vrows = vip_map_rows()
+    hops, out, f5map, cache = [], [], {}, {}
+
+    def vips():
+        if "vips" not in cache:
+            cache["vips"] = []
+            for k, s_ in by("fortigate"):
+                try:
+                    cache["vips"] += fg_cmdb(s_, "vip", "") or []
+                except (urllib.error.URLError, OSError, ValueError):
+                    pass   # an unreachable FortiGate: its VIPs are not used here, and its own step reports the error
+        return cache["vips"]
+
+    def vs_ips():
+        if "vs" not in cache:
+            def one(x):
+                try:
+                    r = do_f5_host({"id": x[0], "hostname": host})
+                except (urllib.error.URLError, OSError, ValueError):
+                    return []
+                return [(f5_dest_ip(e["destination"]), str(e["destination"]).rsplit(":", 1)[-1])
+                        for e in (r.get("data") or {}).get("entries") or [] if e.get("destination")]
+            items = by("f5") if host else []
+            cache["vs"] = []
+            if items:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(items))) as ex:
+                    for lst in ex.map(one, items):
+                        cache["vs"] += lst
+        return cache["vs"]
+    for leg in legs[:FLOW_MAX_LEGS]:
+        d = leg["dst"]
+        try:
+            ip = ipaddress.ip_address(d)
+        except ValueError:
+            out.append(leg)
+            continue
+        if d in nat:
+            hops.append(flow_hop(NAT_SESS, "Public IP %s" % d, {"ok": True, "verdict": {
+                "label": "public %s -> private %s" % (d, nat[d]), "kind": "ok"}}, ["from the upstream NAT list"]))
+            out.append(flow_leg(leg["src"], nat[d], leg["port"], "upstream NAT %s -> %s" % (d, nat[d])))
+            continue
+        if d in rev:
+            hops.append(flow_hop(NAT_SESS, "Private IP %s" % d, {"ok": True, "verdict": {
+                "label": "private %s is public %s" % (d, rev[d]), "kind": "ok"}}, ["from the upstream NAT list"]))
+            out.append(leg)
+            continue
+        fg = bool(by("fortigate"))
+        if nat_private(ip) or (fg and flow_fg_vip(vips(), leg)[0]):
+            out.append(leg)   # already private, or the FortiGate has a VIP on the public address itself: no NAT
+            continue
+        if vrows and host:
+            r = flow_nat_list(vrows, d, leg, host, fg, vips, vs_ips)
+            if r:
+                hops.append(r[0])
+                out.append(r[1])
+                f5map.update(r[2])
+                continue
+        if not fg:
+            out.append(leg)
+            continue
+        cands = []
+        for v in vips():
+            ext = str(v.get("extip") or "")
+            if not ext or "-" in ext:
+                continue
+            try:
+                if not nat_private(ipaddress.ip_address(ext)):
+                    continue
+            except ValueError:
+                continue
+            for m in as_list(v.get("mappedip")):
+                mip = strip_rd(str(m.get("range", ""))).split("-")[0].strip()
+                if any(mip == a and (not port or v.get("portforward") != "enable" or
+                                     str(v.get("mappedport") or "").split("-")[0] in ("", vport)) for a, vport in vs_ips()):
+                    cands.append((ext, v.get("name")))
+        cands = list(dict.fromkeys(cands))
+        privs = list(dict.fromkeys(c[0] for c in cands))
+        if len(privs) == 1:
+            hops.append(flow_hop(NAT_SESS, "Public IP %s" % d, {"ok": True, "verdict": {
+                "label": "INFERRED: public %s -> private %s" % (d, privs[0]), "kind": "warn"}},
+                ["%s is the external IP of FortiGate VIP %s, which maps to the F5 virtual server of %s. Add '%s %s' to "
+                 "the upstream NAT list in the flow trace card to confirm it." % (
+                     privs[0], ", ".join(str(c[1]) for c in cands), host, d, privs[0])]))
+            out.append(flow_leg(leg["src"], privs[0], leg["port"], "upstream NAT %s -> %s (inferred)" % (d, privs[0])))
+        elif privs:
+            hops.append(flow_hop(NAT_SESS, "Public IP %s" % d, {"ok": True, "verdict": {
+                "label": "AMBIGUOUS: public %s may be NAT'ed to %s" % (d, " or ".join(privs[:4])), "kind": "warn"}},
+                ["Several FortiGate VIPs map to the F5 virtual server of %s. Add the right 'public private' pair to the "
+                 "upstream NAT list in the flow trace card." % host]))
+            out.append(leg)
+        else:
+            out.append(leg)   # nothing points to a NAT: the address is passed on unchanged, as before
+    return hops, out + legs[FLOW_MAX_LEGS:], f5map
 FLOW_PAN_PERIOD = {"last 15 minutes": "last-15-minutes", "last hour": "last-hour", "last 6 hours": "last-6-hrs",
                    "last 12 hours": "last-12-hrs", "last 24 hours": "last-24-hrs"}
 FLOW_MAX_LEGS = 3   # address pairs carried to the next device (several origin IPs, VIPs or pool members)
@@ -3107,9 +4275,10 @@ def flow_fg_vip(vips, leg):
     return None, None
 
 
-def flow_trace_fg(sess, sid, legs, proto, within, logs, proxied):
+def flow_trace_fg(sess, sid, legs, proto, within, logs, proxied, vips=False):
     hops, out = [], []
-    vips = fg_cmdb(sess, "vip", "")
+    if vips is False:
+        vips = fg_cmdb(sess, "vip", "")
     for leg in legs[:FLOW_MAX_LEGS]:
         h, pol = flow_fw_verdict(sess, sid, leg, proto, within, logs, log_src=not proxied)
         if pol.get("nat") == "enable":
@@ -3137,19 +4306,32 @@ def flow_f5_snat(sess, v, member_ip, fallback):
     t = str(sat.get("type") or "none")
     if t == "automap":
         ok, d = f5_get(sess, "/mgmt/tm/net/self")
-        best = None
-        for s in (d.get("items") or []) if ok else []:
-            a = str(s.get("address") or "")
-            ipm = strip_rd(a.split("/")[0]) + ("/" + a.split("/")[1] if "/" in a else "")
-            try:
-                net = ipaddress.ip_interface(ipm)
-                if ipaddress.ip_address(member_ip) in net.network:
-                    cand = (s.get("floating") == "enabled", str(net.ip))
-                    best = max(best, cand) if best else cand
-            except ValueError:
-                continue
+
+        def self_for(ip):
+            best = None
+            for s in (d.get("items") or []) if ok else []:
+                a = str(s.get("address") or "")
+                ipm = strip_rd(a.split("/")[0]) + ("/" + a.split("/")[1] if "/" in a else "")
+                try:
+                    net = ipaddress.ip_interface(ipm)
+                    if ipaddress.ip_address(ip) in net.network:
+                        cand = (s.get("floating") == "enabled", str(net.ip))
+                        best = max(best, cand) if best else cand
+                except ValueError:
+                    continue
+            return best
+        best = self_for(member_ip)
         if best:
             return best[1], "SNAT automap (%s self IP %s)" % ("floating" if best[0] else "non-floating", best[1])
+        # Routed pool member: automap uses the self IP on the VLAN towards the route's gateway.
+        try:
+            r = f5_route(sess, member_ip)
+        except (urllib.error.URLError, OSError, ValueError):
+            r = None
+        best = self_for(r[2]) if r and r[2] else None
+        if best:
+            return best[1], "SNAT automap (%s self IP %s, towards gateway %s)" % (
+                "floating" if best[0] else "non-floating", best[1], r[2])
         return "", "SNAT automap, but no self IP is in the pool member's subnet (routed): the source address is not known"
     if t == "snat" and sat.get("pool"):
         ok, d = f5_get(sess, "/mgmt/tm/ltm/snatpool/" + str(sat["pool"]).replace("/", "~"))
@@ -3229,12 +4411,18 @@ def flow_resolve_host(by, src, host, port):
     """No Cloudflare answer: start from the F5 virtual server of the hostname, mapped back through the FortiGate VIP."""
     legs = []
     for k, s in by("f5"):
-        r = do_f5_host({"id": k, "hostname": host})
+        try:
+            r = do_f5_host({"id": k, "hostname": host})
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
         for e in (r.get("data") or {}).get("entries") or []:
             if e.get("destination"):
                 legs.append(flow_leg(src, f5_dest_ip(e["destination"]), port, "F5 virtual server %s" % e["virtual_server"]))
     for k, s in by("fortigate"):
-        vips = fg_cmdb(s, "vip", "") or []
+        try:
+            vips = fg_cmdb(s, "vip", "") or []
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
         for i, l in enumerate(legs):
             for v in vips:
                 ext = str(v.get("extip") or "")
@@ -3242,6 +4430,206 @@ def flow_resolve_host(by, src, host, port):
                                                   for m in as_list(v.get("mappedip"))):
                     legs[i] = flow_leg(src, ext, port, "external address of FortiGate VIP %s" % v.get("name"))
     return legs
+
+
+# ---- Which devices a flow crosses -----------------------------------------------------------------------------------
+# A firewall is on the path when its routes to the source and to the destination leave through different interfaces.
+# Read-only: FortiOS GET /api/v2/monitor/router/lookup, PAN-OS 'test routing fib-lookup' on each virtual router.
+FLOW_ROLE = {"cloudflare": "Edge", "nat": "Upstream NAT", "fortigate": "Firewall", "f5": "Load balancer",
+             "paloalto": "Firewall"}
+FLOW_VNAME = {"cloudflare": "Cloudflare", "nat": "1:1 NAT", "fortigate": "FortiGate", "f5": "F5", "paloalto": "Palo Alto"}
+PAN_VRS = {}
+
+
+def flow_is_ip(x):
+    try:
+        ipaddress.ip_address(x)
+        return True
+    except ValueError:
+        return False
+
+
+def fg_route(sess, ip):
+    """-> (egress interface, directly connected?, gateway) or None."""
+    st, ok, rd = rest_get(sess, "/api/v2/monitor/router/lookup?" + urllib.parse.urlencode({"destination": ip}))
+    rr = rd.get("results") if ok and isinstance(rd, dict) else None
+    rr = rr[0] if isinstance(rr, list) and rr else rr
+    if not isinstance(rr, dict) or not rr.get("interface"):
+        return None
+    gw = str(rr.get("gateway") or "")
+    gw = gw if flow_is_ip(gw) and gw not in ("0.0.0.0", "::", ip) else ""
+    return str(rr["interface"]), not gw, gw
+
+
+def pan_vrs(sess):
+    k = (sess["host"], sess.get("port"))
+    if k not in PAN_VRS:
+        root = pan_xml(sess, {"type": "config", "action": "get",
+                              "xpath": "/config/devices/entry/network/virtual-router"}, 20)
+        names = [e.get("name") for e in root.findall("./result/virtual-router/entry")] if root is not None else []
+        PAN_VRS[k] = [n_ for n_ in names if n_] or ["default"]
+    return PAN_VRS[k]
+
+
+def pan_route(sess, ip):
+    """-> ('vr/interface', directly connected?) or None, from the first virtual router that has a route."""
+    for vr in pan_vrs(sess)[:8]:
+        root = pan_xml(sess, {"type": "op", "cmd": "<test><routing><fib-lookup><virtual-router>%s</virtual-router><ip>%s"
+                                                   "</ip></fib-lookup></routing></test>" % (xml_escape(vr), xml_escape(ip))}, 20)
+        intf = (root.findtext(".//interface") or "").strip() if root is not None else ""
+        if intf:
+            nh, nxt = (root.findtext(".//nh") or "").strip(), (root.findtext(".//ip") or "").strip()
+            gw = next((x for x in (nxt, nh) if flow_is_ip(x) and x not in ("0.0.0.0", "::", ip)), "")
+            return "%s/%s" % (vr, intf), not gw, gw
+    return None
+
+
+def f5_route(sess, ip):
+    """F5: a self IP subnet holding the address (connected), else the longest matching static route."""
+    a = ipaddress.ip_address(ip)
+    ok, d = f5_get(sess, "/mgmt/tm/net/self")
+    for x in (d.get("items") or []) if ok else []:
+        try:
+            ad = str(x.get("address") or "").split("/")
+            if a in ipaddress.ip_network(strip_rd(ad[0]) + "/" + ad[1], strict=False):
+                return str(x.get("vlan") or x.get("name")), True, ""
+        except (ValueError, IndexError):
+            continue
+    ok, d = f5_get(sess, "/mgmt/tm/net/route")
+    best = None
+    for x in (d.get("items") or []) if ok else []:
+        n_ = str(x.get("network") or "")
+        n_ = {"default": "0.0.0.0/0", "default-inet6": "::/0"}.get(strip_rd(n_), strip_rd(n_.split("/")[0]) + (
+            "/" + n_.split("/")[1] if "/" in n_ else ""))
+        try:
+            net = ipaddress.ip_network(n_, strict=False)
+        except ValueError:
+            continue
+        gw = strip_rd(str(x.get("gw") or ""))
+        if net.version == a.version and a in net and flow_is_ip(gw) and (best is None or net.prefixlen > best[0].prefixlen):
+            best = (net, gw, str(x.get("name")))
+    return (best[2], False, best[1]) if best else None
+
+
+def flow_dev_ips(sess):
+    """Interface addresses of a device, to find which device owns a gateway address."""
+    out, v = [], sess["vendor"]
+    if v == "fortigate":
+        st, ok, d = rest_get(sess, "/api/v2/cmdb/system/interface")
+        for x in as_list(d.get("results")) if ok and isinstance(d, dict) else []:
+            out += [str(x.get("ip") or "").split(" ")[0]] + [str(y.get("ip") or "").split(" ")[0] for y in as_list(x.get("secondaryip"))]
+    elif v == "paloalto":
+        root = pan_xml(sess, {"type": "op", "cmd": "<show><interface>all</interface></show>"}, 20)
+        out += [(e.findtext("ip") or "").split("/")[0] for e in (root.findall(".//ifnet/entry") if root is not None else [])]
+    elif v == "f5":
+        ok, d = f5_get(sess, "/mgmt/tm/net/self")
+        out += [strip_rd(str(x.get("address") or "").split("/")[0]) for x in (d.get("items") or []) if ok]
+    return [x for x in out if flow_is_ip(x) and x not in ("0.0.0.0", "::")]
+
+
+def flow_route(sess, ip, cache):
+    k = (sess["host"], sess.get("port"), ip)
+    if k not in cache:
+        try:
+            cache[k] = {"fortigate": fg_route, "paloalto": pan_route, "f5": f5_route}[sess["vendor"]](sess, ip)
+        except (urllib.error.URLError, OSError, ValueError, ET.ParseError, KeyError):
+            cache[k] = None
+    return cache[k]
+
+
+def flow_on_path(sess, leg, cache):
+    """-> (True on the path / False not / None cannot tell, reason, order: 0 faces the source, 2 the destination)."""
+    a, b = flow_route(sess, leg["src"], cache), flow_route(sess, leg["dst"], cache)
+    if not a or not b:
+        return None, "route lookup for %s failed" % (leg["src"] if not a else leg["dst"]), 1
+    if a[0] == b[0]:
+        return False, "%s and %s are both reached via %s, so the flow does not cross it" % (leg["src"], leg["dst"], a[0]), 1
+    return True, "%s via %s, %s via %s" % (leg["src"], a[0], leg["dst"], b[0]), 0 if a[1] else 2 if b[1] else 1
+
+
+def flow_chain(start, dst, smap, owner, cache):
+    """Follow the next hops from device 'start' towards dst: the gateway of each route is an interface address of the
+    next connected device. -> ([device ids after start], complete: the destination was reached on a connected subnet)."""
+    out, cur = [], start
+    for _ in range(8):
+        r = flow_route(smap[cur], dst, cache)
+        if not r:
+            return out, False
+        if r[1]:
+            return out, True
+        nxt = owner.get(r[2])
+        if not nxt or nxt == cur or nxt in out or nxt == start:
+            return out, False   # the next hop is not one of the connected devices: the path leaves what we can see
+        out.append(nxt)
+        cur = nxt
+    return out, False
+
+
+def pan_dnat_rules(sess):
+    """Enabled destination NAT and bi-directional static NAT rules, in evaluation order -> (rules, addrs, groups)."""
+    vsys = sess.get("vsys") or "vsys1"
+    addrs, groups, _ = pan_addr_db(sess, vsys)
+    vals = {n: v for _, n, _, v in addrs}
+    val = lambda x: vals.get(x, x)
+    out = []
+    for label, xp in [("shared-pre", "/config/shared/pre-rulebase/nat"), ("local", pan_base(vsys) + "/rulebase/nat"),
+                      ("shared-post", "/config/shared/post-rulebase/nat")]:
+        node = pan_section(sess, xp, "rules")
+        for e in (node.findall("entry") if node is not None else []):
+            if (e.findtext("disabled") or "") == "yes":
+                continue
+            dt, sip = e.find("destination-translation"), e.find("source-translation/static-ip")
+            if dt is not None and dt.findtext("translated-address"):
+                out.append({"name": e.get("name"), "scope": label, "dst": pan_members(e.find("destination")),
+                            "to": val(dt.findtext("translated-address")), "port": dt.findtext("translated-port") or "",
+                            "service": e.findtext("service") or "any"})
+            elif sip is not None and (sip.findtext("bi-directional") or "") == "yes" and pan_members(e.find("source")):
+                # static bi-directional NAT: traffic to the translated (public) address goes to the source address
+                out.append({"name": e.get("name"), "scope": label, "dst": [sip.findtext("translated-address") or ""],
+                            "to": val(pan_members(e.find("source"))[0]), "port": "", "service": "any"})
+    return out, addrs, groups
+
+
+def pan_dnat_for(db, leg):
+    """The first destination NAT rule for leg's destination -> (rule, next leg) or (None, None)."""
+    rules, addrs, groups = db
+    try:
+        ip = ipaddress.ip_address(leg["dst"])
+    except ValueError:
+        return None, None
+    matched = pan_addr_match(ip, addrs, groups)
+    for r in rules:
+        if r["dst"] == ["any"] or not snat_hit(r["dst"], ip, matched, "any"):
+            continue
+        to = str(r["to"]).split("/")[0].split("-")[0].strip()
+        if not flow_is_ip(to):
+            continue
+        nxt = flow_leg(leg["src"], to, r["port"] or leg["port"])
+        nxt["via"] = "Palo Alto NAT rule %s: %s -> %s" % (r["name"], flow_to(leg), flow_to(nxt))
+        return r, nxt
+    return None, None
+
+
+def flow_trace_pa_edge(sess, sid, legs, db, proto, within, logs, proxied):
+    """Palo Alto that translates the destination: policy verdict, then the NAT rule (its FortiGate VIP equivalent)."""
+    hops, out = [], []
+    for leg in legs[:FLOW_MAX_LEGS]:
+        hops += flow_fw_verdict(sess, sid, leg, proto, within, logs, log_src=not proxied)[0]
+        r, nxt = pan_dnat_for(db, leg)
+        if r:
+            hops.append(flow_hop(sess, "Destination NAT for %s" % flow_to(leg), {"ok": True, "verdict": {
+                "label": "NAT rule %s maps %s -> %s" % (r["name"], flow_to(leg), flow_to(nxt)), "kind": "ok"}},
+                ["%s rulebase; service %s (not compared with the port)" % (r["scope"], r["service"])]))
+        out.append(nxt or leg)
+    return hops, out
+
+
+def flow_logs_seen(sess, sid, leg, within):
+    """With 'Also search logs': does the device's traffic log show this source -> destination?"""
+    q = {"id": sid, "ip": leg["src"], "dest_ip": leg["dst"], "count": "5"}
+    r = (do_pan_logs(dict(q, log_type="traffic", period=FLOW_PAN_PERIOD.get(within, "last-24-hrs")))
+         if sess["vendor"] == "paloalto" else do_fg_logs(dict(q, log_source="disk", within=within)))
+    return bool((r.get("data") or {}).get("entries"))
 
 
 def do_flow_trace(b):
@@ -3272,10 +4660,10 @@ def do_flow_trace(b):
         audit(s, "flow trace %s -> %s%s %s%s" % (src or "?", dst, ":" + port if port else "", proto, " +logs" if logs else ""))
     by = lambda v: [(k, s) for k, s in sess if s["vendor"] == v]
 
-    def each(vendor, fn):
-        """fn(sid, sess) on each device of a vendor in parallel -> [(hops, extra)]; a failing device gives a 'not checked' row."""
-        items = by(vendor)
+    smap = dict(sess)
 
+    def pmap(items, fn):
+        """fn(sid, sess) on each (sid, sess) in parallel -> [(hops, extra)]; a failing device gives a 'not checked' row."""
         def one(x):
             try:
                 return fn(x[0], x[1])
@@ -3288,16 +4676,48 @@ def do_flow_trace(b):
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(items))) as ex:
             return list(ex.map(one, items))
 
+    each = lambda vendor, fn: pmap(by(vendor), fn)
+    # The path is built as an ordered list of nodes, one per device the flow crosses; the others are only listed.
+    nodes, hidden, rcache = [], {}, {}
+
+    def placed(sid):
+        return any(nd["sid"] == sid for nd in nodes)
+
+    def place(sid, s_, vendor, sees, hs):
+        nodes.append({"sid": sid, "sess": s_, "vendor": vendor, "sees": list(sees or []), "hops": list(hs)})
+        hidden.pop(sid, None)
+
+    def hide(sid, reason):
+        if not placed(sid):
+            hidden[sid] = reason
+
     hops, notes = [], []
     legs = [flow_leg(src, dst_ip, port, "destination entered")] if dst_ip else []
-    # 1. Cloudflare: the origin IP from DNS; when proxied, the next devices see a Cloudflare edge address as source.
+    # 1. Cloudflare, only for a hostname or a Cloudflare address: the origin IP from DNS; when proxied, the next
+    #    devices see a Cloudflare edge address as source.
     proxied, edge, origin = False, "", []
-    for h, extra in each("cloudflare", lambda k, s: (lambda r: (r[0], r[1:]))(flow_trace_cf(s, k, src, host, within))):
-        hops += h
-        if extra:
-            origin += extra[0]
-            if extra[1]:
-                proxied, edge = True, extra[1]
+    cf_rel = bool(host)
+    if not cf_rel and dst_ip and by("cloudflare"):
+        try:
+            dip = ipaddress.ip_address(dst_ip)
+            cf_rel = any(n_.version == dip.version and dip in n_ for n_ in cf_edge_nets(by("cloudflare")[0][1]))
+        except (urllib.error.URLError, OSError, ValueError, KeyError):
+            cf_rel = True   # cannot tell: keep it
+    if cf_rel:
+        for (k, s_), (h, extra) in zip(by("cloudflare"), each("cloudflare", lambda k, s: (lambda r: (r[0], r[1:]))(
+                flow_trace_cf(s, k, src, host, within)))):
+            if extra:
+                origin += extra[0]
+                if extra[1]:
+                    proxied, edge = True, extra[1]
+            if ((extra and extra[0]) or any(x["state"] in ("bad", "warn") for x in h) or
+                    any(x["check"].startswith("WAF") and not x["result"].startswith("no security events") for x in h)):
+                place(k, s_, "cloudflare", [flow_leg(src, host or dst_ip, port)], h)
+            else:
+                hide(k, "%s is not in its zones and it has no security events for the client" % (host or dst_ip))
+    else:
+        for k, _ in by("cloudflare"):
+            hide(k, "%s is not a Cloudflare hostname or address" % dst_ip)
     if proxied:
         notes.append("%s is proxied by Cloudflare: past the edge the source is a Cloudflare address (tested as %s, from "
                      "Cloudflare's published ranges); the client IP only travels in headers." % (host, edge or "unknown"))
@@ -3309,37 +4729,193 @@ def do_flow_trace(b):
         if legs:
             notes.append("%s was resolved through the F5 virtual server%s, not Cloudflare." % (
                 host, " and the FortiGate VIP" if any("VIP" in l["via"] for l in legs) else ""))
+    if host and not legs:
+        legs = flow_list_resolve(src, host, port)
+        if legs:
+            notes.append("%s was resolved from the VIP list (name match), not from a device." % host)
     legs = flow_dedupe(legs)
     if not legs:
         notes.append("Could not resolve %s on any connected device: enter the destination IP instead." % host)
     if len(legs) > FLOW_MAX_LEGS:
         notes.append("Only the first %d addresses were followed." % FLOW_MAX_LEGS)
-    # 2. FortiGate DMZ: policy verdict, then the VIP that maps the public address to the F5 virtual server.
-    if legs and by("fortigate"):
+    # 1b. Optional upstream 1:1 NAT (public -> private) in front of the FortiGate: from the lists or inferred.
+    f5map = {}
+    if legs:
+        before = list(legs)
+        nh, legs, f5map = flow_trace_nat(by, legs, host, port)
+        if nh:
+            place("nat", NAT_SESS, "nat", before, nh)
+        legs = flow_dedupe(legs)
+
+    fws = by("fortigate") + by("paloalto")
+    dmap = dict(fws + by("f5"))
+    nm = lambda k: str(dmap[k].get("name") or dmap[k]["host"]) if k in dmap else str(k)
+    owner_box = {}
+
+    def owners_of_ips():
+        """{interface address: device id} of every connected firewall and F5, read once per trace."""
+        if "m" not in owner_box:
+            def ips(x):
+                try:
+                    return flow_dev_ips(x[1])
+                except Exception:
+                    return []
+            items = list(dmap.items())
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(items)))) as ex:
+                res = list(ex.map(ips, items))
+            owner_box["m"] = {}
+            for (k, _), lst in zip(items, res):
+                for ip in lst:
+                    owner_box["m"].setdefault(ip, k)
+        return owner_box["m"]
+
+    def warm(devs, ips):
+        pairs = [(s_, ip) for _, s_ in devs for ip in ips if ip]
+        if pairs:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(pairs))) as ex:
+                list(ex.map(lambda x: flow_route(x[0], x[1], rcache), pairs))
+
+    def fw_find(cands, seg, anchor=None, after=False, fallback=True):
+        """The firewalls among cands that this part of the flow crosses: tested and placed in path order.
+        Evidence, strongest first (no device names or vendor roles are assumed):
+        - the next-hop chain from the anchor (the edge firewall or the F5) when it reaches the destination
+        - the flow crosses the firewall (its routes to the source and the destination use different interfaces)
+          AND the firewall is directly connected to the destination's subnet, or, when there is no anchor, the source's
+        - with 'Also search logs': its traffic log shows the flow
+        - only when nothing else is found and fallback is allowed: any firewall the flow crosses."""
+        seg = [l for l in seg[:FLOW_MAX_LEGS] if l["src"]]
+        cands = [x for x in cands if x[0] != anchor]
+        cset = dict(cands)
+        if not cands or not seg:
+            return
+        warm(cands + ([(anchor, dmap[anchor])] if anchor in dmap else []), [ip for l in seg for ip in (l["src"], l["dst"])])
+        pick = {}
+        for l in seg:
+            got = {}
+            chain, done = flow_chain(anchor, l["dst"], dmap, owners_of_ips(), rcache) if anchor in dmap else ([], False)
+            for i, k in enumerate(chain):
+                if k in cset:
+                    got[k] = ("next hop on the route from %s to %s" % (nm(anchor), l["dst"]), 1 + i)
+            if not done:
+                for k, s_ in cands:
+                    ra, rb = flow_route(s_, l["src"], rcache), flow_route(s_, l["dst"], rcache)
+                    if k in got or not ra or not rb or ra[0] == rb[0]:
+                        continue
+                    if rb[1]:
+                        got[k] = ("%s is directly connected to it (%s); %s is reached via %s" % (l["dst"], rb[0], l["src"], ra[0]), 90)
+                    elif ra[1] and not after:
+                        got[k] = ("%s is directly connected to it (%s); %s is reached via %s" % (l["src"], ra[0], l["dst"], rb[0]), 0)
+                if not after:   # middle hops: follow the routes from the firewall the source is connected to
+                    for k0 in [k for k, (_, key) in got.items() if key == 0]:
+                        for i, k in enumerate(flow_chain(k0, l["dst"], dmap, owners_of_ips(), rcache)[0]):
+                            if k in cset:
+                                got.setdefault(k, ("next hop on the route from %s to %s" % (nm(k0), l["dst"]), 1 + i))
+            if logs:
+                for k, s_ in cands:
+                    if k not in got:
+                        try:
+                            if flow_logs_seen(s_, k, l, within):
+                                got[k] = ("its traffic log shows %s" % flow_txt(l), 50)
+                        except Exception:
+                            pass
+            if not got and not done and fallback:
+                for k, s_ in cands:
+                    on, why, key = flow_on_path(s_, l, rcache)
+                    if on:
+                        got[k] = (why + "; no firewall is directly connected to either end, so this is from the routes "
+                                        "alone", 50 + key)
+            for k, (why, key) in got.items():
+                pick.setdefault(k, []).append((l, why, key))
+        grp = sorted(((min(x[2] for x in v), nm(k), k, cset[k], v) for k, v in pick.items()), key=lambda g: g[:2])
+
+        def test(k, s_):
+            hs = []
+            for l, why, _ in next(g[4] for g in grp if g[2] == k):
+                h = flow_fw_verdict(s_, k, l, proto, within, logs, log_src=not (proxied and l["src"] == edge))[0]
+                h[0]["details"] = ("On the path: %s. " % why + h[0]["details"])[:900]
+                hs += h
+            return hs, None
+        for g, (hs, _) in zip(grp, pmap([(g[2], g[3]) for g in grp], test)):
+            place(g[2], g[3], g[3]["vendor"], [x[0] for x in g[4]], hs)
+
+    # 2. Edge firewall: whichever connected firewall translates the destination (FortiGate VIP, Palo Alto NAT rule).
+    L1 = list(legs)
+    nl = len(L1[:FLOW_MAX_LEGS])
+    fgv, pdb, own = {}, {}, [[] for _ in range(nl)]
+
+    def dnat_read(x):
+        try:
+            return fg_cmdb(x[1], "vip", "") if x[1]["vendor"] == "fortigate" else pan_dnat_rules(x[1])
+        except Exception:   # an unreachable firewall: not an edge here
+            return None
+    if L1 and fws:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(fws))) as ex:
+            for (k, s_), d in zip(fws, ex.map(dnat_read, fws)):
+                (fgv if s_["vendor"] == "fortigate" else pdb)[k] = d
+        for i, l in enumerate(L1[:FLOW_MAX_LEGS]):
+            own[i] = ([k for k, v in fgv.items() if isinstance(v, list) and flow_fg_vip(v, l)[0]] +
+                      [k for k, v in pdb.items() if v and pan_dnat_for(v, l)[0]])
+    owners = [x for x in fws if any(x[0] in o for o in own)]
+    others = [x for x in fws if x not in owners]
+    # a flow without a destination NAT (internal, or a public IP no firewall translates): firewalls by the routes
+    free = [l for i, l in enumerate(L1[:FLOW_MAX_LEGS]) if not own[i]]
+    fw_find(others, [l for l in free if l["dst"] not in f5map])
+    # the VIP list knows this address's VIP firewall, which is not connected: no guessing from routes alone
+    fw_find(others, [l for l in free if l["dst"] in f5map], fallback=False)
+    L2 = L1
+    if owners:
+        def edge_one(k, s_):
+            mine = [l for i, l in enumerate(L1[:FLOW_MAX_LEGS]) if k in own[i]]
+            if s_["vendor"] == "fortigate":
+                h, out = flow_trace_fg(s_, k, mine, proto, within, logs, proxied, fgv.get(k))
+            else:
+                h, out = flow_trace_pa_edge(s_, k, mine, pdb[k], proto, within, logs, proxied)
+            return h, (mine, out)
+        nxt, after = [], []
+        for (k, s_), (h, extra) in zip(owners, pmap(owners, edge_one)):
+            place(k, s_, s_["vendor"], extra[0] if extra else L1, h)
+            out = (extra[1] if extra else []) or []
+            nxt += out
+            after.append((k, [l for l in out if l not in L1]))
+        L2 = flow_dedupe(nxt + [l for i, l in enumerate(L1[:FLOW_MAX_LEGS]) if not own[i]])
+        for k, ls in after:   # between the edge firewall and the translated address (the F5 VIP, or a server)
+            fw_find([x for x in others if not placed(x[0])], ls, anchor=k, after=True, fallback=False)
+    if L2 and f5map:   # the VIP was not found on a connected firewall: use the F5 VIP from the VIP list
+        L2 = flow_dedupe([flow_leg(l["src"], f5map[l["dst"]][0], f5map[l["dst"]][1] or l["port"],
+                                   "VIP list %s: %s -> F5 VIP %s" % (f5map[l["dst"]][2], l["dst"], f5map[l["dst"]][0]))
+                          if l["dst"] in f5map else l for l in L2])
+    # 3. Load balancer: the F5 that has the virtual server; pool members and the source address (SNAT) it uses.
+    L3, f5out = L2, []
+    if (L2 or host) and by("f5"):
         nxt = []
-        for h, out in each("fortigate", lambda k, s: flow_trace_fg(s, k, legs, proto, within, logs, proxied)):
-            hops += h
-            nxt += out or []
-        legs = flow_dedupe(nxt) or legs
-    # 3. F5 DMZ: virtual server, pool members and the SNAT address the Palo Alto will see.
-    if (legs or host) and by("f5"):
-        nxt = []
-        for h, out in each("f5", lambda k, s: flow_trace_f5(s, k, legs, src, host, within, logs, proxied)):
-            hops += h
-            nxt += out or []
-        legs = flow_dedupe(nxt) or legs
-    # 4. Palo Alto: policy verdict for F5 SNAT address -> pool member.
-    if legs and by("paloalto"):
-        for h, _ in each("paloalto", lambda k, s: flow_trace_pa(s, k, legs, proto, within, logs)):
-            hops += h
-    hops.sort(key=lambda h: h["order"])
+        for (k, s_), (h, out) in zip(by("f5"), each("f5", lambda k, s: flow_trace_f5(s, k, L2, src, host, within, logs, proxied))):
+            out = out or []
+            hit = any(l["via"].startswith("F5 ") for l in out)
+            waf = any(x["check"].startswith("WAF") and x["details"] for x in h)
+            failed = any(x["result"].startswith("NOT CHECKED") for x in h)
+            if hit or waf or failed:
+                place(k, s_, "f5", L2, [x for x in h if not (hit and x["result"].startswith("no virtual server listens"))])
+                mine = [l for l in out if l["via"].startswith("F5 ")]
+                nxt += mine
+                f5out.append((k, mine))
+        if nxt:
+            L3 = flow_dedupe(nxt)
+    # 4. Firewalls between the F5 and the servers (a DC firewall), from the F5's routes and the servers' subnets.
+    for k, ls in f5out:
+        fw_find(fws, ls, anchor=k, after=True, fallback=False)
+    legs = L3
+    # Only the devices on the path are shown: one that did not answer at all is left out (its place is unknown).
+    for nd in [x for x in nodes if x["vendor"] != "nat" and x["hops"]
+               and all(h["result"].startswith("NOT CHECKED") for h in x["hops"])]:
+        nodes.remove(nd)
+    for i, nd in enumerate(nodes):
+        for h in nd["hops"]:
+            h["order"], h["layer"] = i, "%d %s · %s" % (i + 1, FLOW_ROLE[nd["vendor"]], FLOW_VNAME[nd["vendor"]])
+        hops += nd["hops"]
     if not src:
-        notes.append("No client IP given: Cloudflare events and the FortiGate verdict for a client that is not proxied "
-                     "were not checked.")
-    notes.append("Path followed: Cloudflare -> FortiGate DMZ -> F5 DMZ -> Palo Alto; each device is tested with the "
-                 "addresses it sees (Cloudflare edge address, FortiGate VIP mapping, F5 SNAT -> pool member). Devices not "
-                 "connected are skipped. Routing between the devices is not checked, and whether FortiOS policy lookup "
-                 "matches a VIP's external address is not yet verified on a real FortiGate.")
+        notes.append("No client IP given: Cloudflare events and the firewall verdicts were not checked for the client.")
+    notes.append("Path found from the devices' routes, VIPs and virtual servers; policy-based routing and SD-WAN rules "
+                 "are not taken into account.")
     if not logs:
         notes.append("Configuration only: tick 'Also search logs' to add the F5 WAF log and firewall traffic logs.")
     bad = [h for h in hops if h["state"] == "bad"]
@@ -3348,10 +4924,25 @@ def do_flow_trace(b):
         verdict = {"label": "STOPS AT %s (%s): %s" % (bad[0]["device"], bad[0]["layer"], bad[0]["result"]), "kind": "bad"}
     elif unk:
         verdict = {"label": "NO BLOCK FOUND, %d check(s) not conclusive" % len(unk), "kind": "warn"}
-    else:
+    elif hops:
         verdict = {"label": "NO BLOCK FOUND on %d device(s)" % len({h["device"] for h in hops}), "kind": "ok"}
+    elif not src and fws:
+        verdict = {"label": "ENTER THE CLIENT IP: the firewalls need a source address to be tested", "kind": "warn"}
+    else:
+        verdict = {"label": "NO DEVICE ON THIS PATH: none of the connected devices is crossed by this flow", "kind": "warn"}
     summary = ["%s · %s · %s: %s" % (h["layer"], h["device"], h["check"], h["result"]) for h in hops]
-    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
+    stages = []
+    for nd in nodes:
+        hs, v = nd["hops"], nd["vendor"]
+        stt = ("blocked" if any(h["state"] == "bad" for h in hs) else "unclear" if any(h["state"] == "warn" for h in hs)
+               else "passed" if any(h["state"] == "ok" for h in hs) else "checked")
+        stages.append({"vendor": v, "layer": "%s · %s" % (FLOW_ROLE[v], FLOW_VNAME[v]), "state": stt,
+                       "devices": ["public → private"] if v == "nat" else [nd["sess"].get("name") or nd["sess"]["host"]],
+                       "sees": [flow_txt(l) for l in nd["sees"][:3]],
+                       "checks": ["%s: %s" % (h["check"], h["result"]) for h in hs][:8]})
+    path = {"client": src or "client", "target": dst + (":" + port if port else ""), "proto": proto, "stages": stages,
+            "servers": [flow_to(l) for l in legs[:3]], "verdict": verdict["kind"]}
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "path": path,
             "request": "flow trace %s -> %s%s/%s on %d device(s)" % (src or "?", dst, ":" + port if port else "", proto, len(sess)),
             "verdict": verdict, "summary": summary + notes,
             "data": {"hops": [dict({k: h[k] for k in ("layer", "device", "check", "result", "details")},
@@ -3363,6 +4954,10 @@ def do_flow_trace_api(b):
         return do_flow_trace(b)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "a device did not answer in time (%s). Check that every connected device is "
+                                      "reachable, or disconnect the one that is not, and run the trace again."
+                                      % getattr(e, "reason", e)}
 
 
 # ---- F5 active tools: log search + tcpdump (shell via util/bash) ------------
@@ -3901,16 +5496,35 @@ def f5_cert_key(name):
     return re.sub(r"\.(crt|cer|pem)$", "", n).strip("/")
 
 
+def f5_cert_exp(c):
+    """Expiry epoch of a certificate item. TMOS puts it in different places by endpoint and version:
+    expirationDate / expirationString (sys file ssl-cert), expiration or apiRawValues.expiration (sys crypto cert)."""
+    raw = c.get("apiRawValues") if isinstance(c.get("apiRawValues"), dict) else {}
+    for v in (c.get("expirationDate"), c.get("expirationString"), c.get("expiration"), raw.get("expiration")):
+        e = to_epoch(v)
+        if e:
+            return e
+    return None
+
+
 def f5_exp_text(c, epoch):
-    s = str(c.get("expirationString") or "").strip()
-    return s or (time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(epoch)) if epoch else "")
+    raw = c.get("apiRawValues") if isinstance(c.get("apiRawValues"), dict) else {}
+    s = str(c.get("expirationString") or c.get("expiration") or raw.get("expiration") or "").strip()
+    return s if s and epoch else (time.strftime("%b %d %H:%M:%S %Y GMT", time.gmtime(epoch)) if epoch else "")
 
 
-def f5_cert_rows(items):
-    """Certificate object, Common Name, SAN and expiry date; soonest expiry first, expired ones marked EXPIRED."""
+def f5_cert_rows(items, sess=None):
+    """Certificate object, Common Name, SAN and expiry date; soonest expiry first, expired ones marked EXPIRED.
+    Items without an expiry are completed from the 'sys file ssl-cert' list, which always has expirationDate."""
+    if sess and any(not f5_cert_exp(c) for c in items):
+        ok, d = f5_get(sess, "/mgmt/tm/sys/file/ssl-cert")
+        files = {f5_cert_key(f.get("fullPath") or f.get("name")): f
+                 for f in ((d.get("items") if ok and isinstance(d, dict) else None) or [])}
+        items = [dict(files.get(f5_cert_key(c.get("fullPath") or c.get("name")), {}), **{k: v for k, v in c.items() if v not in (None, "")})
+                 if not f5_cert_exp(c) else c for c in items]
     rows = []
     for c in items:
-        exp = to_epoch(c.get("expirationDate")) or to_epoch(c.get("expirationString"))
+        exp = f5_cert_exp(c)
         left = days_from_now(exp) if exp else None
         cn = c.get("commonName") or next((x.strip()[3:] for x in re.split(r"(?<!\\),", str(c.get("subject") or ""))
                                           if x.strip().upper().startswith("CN=")), "")
@@ -3966,7 +5580,7 @@ def f5_ssl_posture(sess, warn_days):
     cert_exp = {}   # normalised name -> (expiry text, days left), bundles included
     for c in f5_items(sess, "/mgmt/tm/sys/crypto/cert", notes, "certificates") or []:
         name = c.get("fullPath") or c.get("name")
-        exp = to_epoch(c.get("expirationDate")) or to_epoch(c.get("expirationString"))
+        exp = f5_cert_exp(c)
         left = days_from_now(exp) if exp else None
         cert_exp[f5_cert_key(name)] = (f5_exp_text(c, exp), left)
         if c.get("isBundle") in (True, "true"):
@@ -3989,7 +5603,7 @@ def f5_ssl_posture(sess, warn_days):
             findings.append(finding("medium" if users else "low", name, "RSA key is only %d bits" % size, where))
         inv.append({"type": "certificate", "name": name, "subject": c.get("subject"),
                     "status": "" if left is None else "EXPIRED" if left < 0 else "valid",
-                    "expires": c.get("expirationString"), "days_left": left, "key": "%s %s" % (ktype, size or ""),
+                    "expires": f5_exp_text(c, exp), "days_left": left, "key": "%s %s" % (ktype, size or ""),
                     "used_by": users})
     # certificate expiry next to each profile's certificates; names not in the list are read one by one
     # (profiles reference 'sys file ssl-cert' objects, which the crypto list does not always show under the same name)
@@ -3997,7 +5611,7 @@ def f5_ssl_posture(sess, warn_days):
                            if c and not cert_exp.get(f5_cert_key(c), ("",))[0]})
     if need():
         for c in f5_items(sess, "/mgmt/tm/sys/file/ssl-cert", notes, "certificate files") or []:
-            exp = to_epoch(c.get("expirationDate")) or to_epoch(c.get("expirationString"))
+            exp = f5_cert_exp(c)
             k = f5_cert_key(c.get("fullPath") or c.get("name"))
             if exp and not cert_exp.get(k, ("",))[0]:
                 cert_exp[k] = (f5_exp_text(c, exp), days_from_now(exp))
@@ -4006,7 +5620,7 @@ def f5_ssl_posture(sess, warn_days):
         ref = urllib.parse.quote(c.replace("/", "~"))
         for base in ("/mgmt/tm/sys/file/ssl-cert/", "/mgmt/tm/sys/crypto/cert/"):
             st, ok, d = rest_get(sess, base + ref)
-            exp = (to_epoch(d.get("expirationDate")) or to_epoch(d.get("expirationString"))) if ok and isinstance(d, dict) else None
+            exp = f5_cert_exp(d) if ok and isinstance(d, dict) else None
             if exp:
                 cert_exp[f5_cert_key(c)] = (f5_exp_text(d, exp), days_from_now(exp))
                 break
@@ -4026,6 +5640,10 @@ def f5_ssl_posture(sess, warn_days):
                                        txt if left is None else "%s (%s)" % (txt, "EXPIRED %d day(s) ago" % -left if left < 0
                                                                              else "%d day(s) left" % left)))
             r["cert_expiry"] = out
+    # The inventory shows profile, use, certificates and expiry only; cipher / option issues are in the findings.
+    for r in inv:
+        for k in ("ciphers", "cipher_group", "status", "options", "not_explicitly_disabled"):
+            r.pop(k, None)
     notes.append("'Used by' covers client-SSL profiles attached to virtual servers. Certificates referenced "
                  "only by server-SSL, APM, or monitors show as unused.")
     return findings, inv, notes
@@ -4175,13 +5793,18 @@ def f5_asm_by_header(sess, b, t0):
     if status not in ("", "blocked", "alerted", "passed"):
         raise ValueError("invalid status")
     hostq = (b.get("hostname") or "").strip().lower().replace("*", "")
+    ipq = str(parse_ip(b.get("ip"), "client IP")) if str(b.get("ip") or "").strip() else ""
+    hip = str(parse_ip(b.get("header_ip"), "True-Client-IP")) if str(b.get("header_ip") or "").strip() else ""
+    urlq = (b.get("url") or "").strip().lower()
+    if len(urlq) > 200:
+        raise ValueError("URL path is too long (max 200 characters)")
     top = num(b.get("top"), 1, 200, 50, "max rows")
     scan = num(b.get("scan"), 100, 5000, 1000, "entries to scan")
     cutoff = cutoff_epoch(b)
     hkey, vq = hname.lower(), hval.lower()
     audit(sess, "ASM request log by header: %s %s %s" % (hname, ("contains '%s'" % hval) if hval else "present",
                                                            status or "any status"))
-    flt = asm_status_flt(sess, status)
+    flt = " and ".join(x for x in (asm_status_flt(sess, status), ("clientIp eq '%s'" % ipq) if ipq else "") if x)
     base = "/mgmt/tm/asm/events/requests?" + ("$filter=%s&" % urllib.parse.quote(flt) if flt else "")
     order = "$orderby=requestDatetime%20desc&"
     st, ok0, d0 = rest_get(sess, base + order + "$top=1")
@@ -4209,7 +5832,8 @@ def f5_asm_by_header(sess, b, t0):
         scanned += len(page)
         for i in page:
             if not asm_recent(i, cutoff) or not asm_status_ok(i, status) or (
-                    hostq and asm_hostname(i) and hostq not in asm_hostname(i).lower()):
+                    hostq and asm_hostname(i) and hostq not in asm_hostname(i).lower()) or (
+                    ipq and i.get("clientIp") and i.get("clientIp") != ipq):
                 continue
             # The list view may omit the raw request; fetch the full record (bounded by time and count).
             if not i.get("rawRequest") and fetched < 1500 and time.time() - t0 < 100 and asm_enrich(sess, i):
@@ -4217,6 +5841,10 @@ def f5_asm_by_header(sess, b, t0):
             if i.get("rawRequest"):
                 with_raw += 1
             if hostq and hostq not in asm_hostname(i).lower():
+                continue
+            if urlq and urlq not in str(first(i, "url", "uri") or "").lower():
+                continue
+            if hip and hip not in (str(i.get("trueClientIp") or ""), asm_header_ip(i)):
                 continue
             vals = hdr_values(i)
             if vals and (not vq or any(vq in v.lower() for v in vals)):
@@ -4249,8 +5877,11 @@ def f5_asm_by_header(sess, b, t0):
     notes = ["Header %s %s; scanned %d log entries (%d with raw request data)%s." % (
         hname, ("value contains '%s'" % hval) if hval else "present (any value)", scanned, with_raw,
         ", status " + status if status else "")]
-    if status and not flt:
+    if status and not asm_status_flt(sess, status):
         notes.append("The device accepts no status filter, so '%s' was matched locally." % status)
+    extra = ["client IP " + ipq] * bool(ipq) + ["True-Client-IP " + hip] * bool(hip) + ["URL contains '%s'" % urlq] * bool(urlq)         + ["hostname contains '%s'" % hostq] * bool(hostq)
+    if extra:
+        notes.append("Also filtered by " + ", ".join(extra) + ".")
     if cutoff:
         notes.append("Time range: %s (applied to the request time of each entry)." % b.get("within"))
     notes.append("Times are shown in UTC+3." if newest_first else
@@ -5794,6 +7425,9 @@ def do_f5_sync(b):
 
 
 # ---- Packet capture: Palo Alto (live, via packet-diag) and FortiGate (commands) ----
+# PAN-OS packet capture is DISABLED: it changes packet-diag state on the firewall. The API refuses it before
+# anything is sent and the page does not show it. (F5 tcpdump and FortiGate are not affected.)
+PAN_CAPTURE_ENABLED = False
 CAPTURE_BUSY = threading.Lock()
 PCAP_MAGICS = (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d", b"\x0a\x0d\x0d\x0a")
 CAP_PROTOS = {"any": None, "tcp": 6, "udp": 17, "icmp": 1}
@@ -5814,6 +7448,8 @@ def cap_filter(b):
 
 def do_pan_capture(b):
     sess = SESSIONS.get(b.get("id"))
+    if not PAN_CAPTURE_ENABLED:
+        return {"ok": False, "error": "packet capture is disabled for Palo Alto firewalls in this console"}
     if not sess or sess["vendor"] != "paloalto":
         return {"ok": False, "error": "connect a Palo Alto firewall first"}
     if not b.get("ack"):
@@ -7001,12 +8637,12 @@ def cf_m_ray(sess, b, t0):
     notes = [cf_scope(sess, zones), "Time range: " + span + searched] + f5_notes
     if not events and not reqs:
         notes.append("Security events exist only for requests a security feature acted on or logged, and sampled "
-                     "request data does not hold every request. Widen the time range (or enter the time the "
-                     "dashboard shows as a custom From / To), or pick the zone.")
+                     "request data does not hold every request; only the last 24 hours are searched. 'Trace Ray ID: "
+                     "Cloudflare → F5' also searches the F5 log, which keeps every logged request.")
         if len(sess.get("zones") or []) > len(zones) > 1:
-            notes.append("Only the first %d zones were searched; choose the zone of this request." % len(zones))
+            notes.append("Only the first %d zones were searched." % len(zones))
     if f5_rows is None:
-        notes.append("Tip: choose an F5 device under 'Cross-check on F5' to also find this request in the ASM log "
+        notes.append("Tip: 'Trace Ray ID: Cloudflare → F5' also finds this request in the ASM log of the connected F5 "
                      "(Cloudflare sends the Ray ID to the origin in the CF-Ray header).")
     return cf_result(t0, "GraphQL firewallEventsAdaptive + httpRequestsAdaptive (rayName %s)" % ray, label, kind,
                      notes + cf_gql_notes(zones, res, dropped),
@@ -8240,7 +9876,7 @@ def cf_m_trace(sess, b, t0, ray=None, f5_hint=None, ident=""):
     elif ev:
         cf_res = "passed (not blocked) · %s%s" % (rule_txt(ev), "; edge HTTP %s" % edge if edge else "")
     else:
-        cf_res = "not found in Cloudflare data (sampled; widen the time range)"
+        cf_res = "not found in Cloudflare data (sampled, last 24 hours)"
     hops.append({"hop": "1 · Cloudflare", "seen_at": seen.get("time", ""),
                  "result": cf_res, "details": " ".join(x for x in (
                      "client %s" % seen.get("client_ip") if seen.get("client_ip") else "",
@@ -8286,7 +9922,7 @@ def cf_m_trace(sess, b, t0, ray=None, f5_hint=None, ident=""):
                          "details": "no ASM log entry with CF-Ray %s (%s)" % (ray, within)})
     else:
         hops.append({"hop": "3 · F5 ASM", "seen_at": "", "result": "not checked",
-                     "details": "choose an F5 under 'Cross-check on F5'"})
+                     "details": "no F5 connected"})
     if f5_rows:   # Cloudflare's sampled data may lack the request; the F5 log has its time and host
         t_req = t_req or cf_epoch3(f5_rows[0].get("time"))
         host = host or str(f5_rows[0].get("hostname") or "")
@@ -8511,7 +10147,7 @@ def cf_m_trace_sid(sess, b, t0):
         raise ValueError("support ID must be 5-25 digits")
     f5 = SESSIONS.get(b.get("f5") or "")
     if not f5 or f5["vendor"] != "f5":
-        raise ValueError("choose the F5 device under 'Cross-check on F5' to trace by support ID")
+        raise ValueError("connect the F5 device to trace by support ID")
     hint, d5 = f5_trace_hint(b["f5"], sid)
     if not d5.get("ok"):
         return d5
@@ -8545,7 +10181,7 @@ def cf_m_trace_client(sess, b, t0):
         since, until, span = cf_window(b)
         if to_epoch(until) - to_epoch(since) > CF_RAW_SLICE:
             since = cf_iso(to_epoch(until) - CF_RAW_SLICE)
-            span = "the last 24 hours of the scope range (enter a request time to search another moment)"
+            span = "the last 24 hours (enter a request time to search another moment)"
     what = "%s%s%s" % (ip, " → " + host if host else "", " path contains " + path if path else "")
     audit(sess, "trace by client " + what)
     notes = ["Started from client %s, %s." % (what, span)]
@@ -8587,7 +10223,7 @@ def cf_m_trace_client(sess, b, t0):
                          + ("" if t is None else " within ±%ds of %s" % (window, at)) + ".")
             r = cf_result(t0, "Trace client %s" % what, "NO REQUEST FROM %s FOUND" % ip, "info", [], {})
     else:
-        notes.append("Nothing in Cloudflare's sampled data. Choose an F5 under 'Cross-check on F5' to search its log "
+        notes.append("Nothing in Cloudflare's sampled data. Connect the F5 to search its log "
                      "(it keeps every logged request, not a sample).")
         r = cf_result(t0, "Trace client %s" % what, "NO REQUEST FROM %s FOUND" % ip, "info", [], {})
     r["summary"] = notes + r.get("summary", [])
@@ -8905,11 +10541,42 @@ def llm_chat_ollama(messages, tools, est):
     return msg, {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct, "num_ctx": ctx, "_est": est}
 
 
-def llm_chat(messages, tools=None):
+def llm_text(msg):
+    """The answer text of a reply: content as a string or as parts, without a reasoning model's <think> block
+    (also one cut off before </think>, which holds no answer)."""
+    c = msg.get("content")
+    if isinstance(c, list):
+        c = "".join(str(p.get("text") or "") for p in c if isinstance(p, dict))
+    c = re.sub(r"(?s)<think>.*?</think>", "", str(c or ""))
+    return re.sub(r"(?s)^\s*<think>.*", "", c).strip()
+
+
+def llm_retry_msgs(messages):
+    """For a second try after an empty answer: Qwen3's soft switch to answer without thinking first."""
+    out = [dict(m) for m in messages]
+    if "qwen3" in str(LLM_CFG["model"]).lower():
+        for m in reversed(out):
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                m["content"] += " /no_think"
+                break
+    return out
+
+
+def llm_empty_note(usage):
+    fin = usage.get("_finish") or "unknown"
+    return ("(The model returned no answer text%s. %s Try again, ask a shorter question, or lower the context budget in "
+            "the AI settings.)" % (" (finish reason: %s)" % fin,
+                                    "It used its whole output allowance on reasoning before writing the answer."
+                                    if fin == "length" or usage.get("_reasoning") else ""))
+
+
+def llm_chat(messages, tools=None, max_tokens=None):
     est = (sum(len(json.dumps(m, default=str)) for m in messages) + (len(json.dumps(tools)) if tools else 0)) // 3
     if llm_is_ollama():
         return llm_chat_ollama(messages, tools, est)
     body = {"model": LLM_CFG["model"], "messages": messages, "temperature": 0.2, "stream": False}
+    if max_tokens:
+        body["max_tokens"] = max_tokens
     if tools:
         body["tools"], body["tool_choice"] = tools, "auto"
     st, d = llm_http("POST", "/chat/completions", body, timeout=LLM_WAIT)
@@ -8919,7 +10586,10 @@ def llm_chat(messages, tools=None):
             raise ValueError("the model server rejected tool calling (HTTP %s: %s). Use a model that supports tools "
                              "(e.g. qwen2.5 / qwen3, llama3.1+, mistral-nemo) or ask without running checks." % (st, err))
         raise ValueError(llm_404(st, "/chat/completions", d))
-    return d["choices"][0].get("message") or {}, dict(d.get("usage") or {}, _est=est)
+    ch = d["choices"][0]
+    msg = ch.get("message") or {}
+    return msg, dict(d.get("usage") or {}, _est=est, _finish=ch.get("finish_reason") or "",
+                     _reasoning=bool(msg.get("reasoning_content") or msg.get("reasoning")))
 
 
 # Agent tools: only the console's own read-only lookups, on every connected device (tool names start with the vendor:
@@ -8947,12 +10617,15 @@ def llm_tools():
     if not devs:
         return tools
     conn = ["%s (%s)" % (l, s["vendor"]) for l, (_, s) in devs.items()]
-    tool("flow_trace", "Follow ONE flow along the path Cloudflare -> FortiGate DMZ -> F5 DMZ -> Palo Alto on every "
-         "connected device (%s): Cloudflare DNS + WAF events, FortiGate policy + VIP mapping, F5 virtual server / pool "
-         "members / SNAT (+ WAF log), Palo Alto policy for F5 SNAT -> pool member (+ traffic logs). Use it first for "
+    tool("flow_trace", "Follow ONE flow hop by hop through the connected devices it actually crosses (%s), found from "
+         "their routes, VIPs and virtual servers; devices not on the path are only listed. Checks Cloudflare DNS + WAF "
+         "events, FortiGate policy + VIP mapping, F5 virtual server / pool "
+         "members / SNAT (+ WAF log), Palo Alto policy for F5 SNAT -> pool member (+ traffic logs); a public IP that "
+         "is 1:1 NAT'ed to a private IP before the FortiGate is followed (upstream NAT list, or inferred). Use it first for "
          "internet-facing flows: a public client IP or a published hostname ('can client X reach shop.example.com', "
-         "'why is X blocked on our site'). Returns one row per device and check, and where it stops. Not for two "
-         "internal addresses: use policy_check." % "; ".join(conn),
+         "'why is X blocked on our site'), and for internal flows when the user wants the path. Returns one row per "
+         "device and check, and where it stops. For a plain rule check between two internal addresses on every "
+         "firewall, use policy_check." % "; ".join(conn),
          {"src": S("client / source IP (needed for firewall verdicts and WAF logs)"),
           "dst": S("destination IP or hostname, e.g. shop.example.com"), "port": S("destination port, e.g. 443"),
           "proto": S("tcp, udp or icmp (default tcp)"), "logs": {"type": "boolean", "description": "also search the F5 WAF "
@@ -9252,7 +10925,10 @@ def do_llm_chat(b):
                                "needed (e.g. a question about a rule, flow or log that is not in the output), say so in one "
                                "sentence and suggest the 'Ask & run checks' button, which can query the device.")
         msg, usage = llm_chat(msgs)
-        answer = msg.get("content") or ""
+        answer = llm_text(msg)
+        if not answer:   # e.g. a reasoning model spent its output on thinking: once more, with room and no thinking
+            msg, usage = llm_chat(llm_retry_msgs(msgs), max_tokens=4096)
+            answer = llm_text(msg) or llm_empty_note(usage)
     else:
         if not alldev:
             raise ValueError("connect a device first: the model runs its checks on the connected devices")
@@ -9278,7 +10954,10 @@ def do_llm_chat(b):
             msg, usage = llm_chat(msgs, tools if rnd < 8 else None)
             calls = msg.get("tool_calls") or []
             if not calls:
-                answer = msg.get("content") or ""
+                answer = llm_text(msg)
+                if not answer:   # same as above: one more try for the final answer, without tools
+                    msg, usage = llm_chat(llm_retry_msgs(msgs), max_tokens=4096)
+                    answer = llm_text(msg) or llm_empty_note(usage)
                 break
             msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
             for c in calls[:4]:
@@ -9309,9 +10988,11 @@ def do_llm_chat(b):
                 msgs.append({"role": "tool", "tool_call_id": c.get("id") or name, "name": name, "content": txt})
         if not answer:
             answer = "(The model stopped without a final answer.)"
-    answer = re.sub(r"(?s)<think>.*?</think>", "", answer).strip() or answer   # reasoning models' scratchpad
+    answer = llm_text({"content": answer}) or answer
     warn = ""
     pt, est = usage.get("prompt_tokens") or 0, usage.pop("_est", 0)
+    usage.pop("_finish", None)
+    usage.pop("_reasoning", None)
     if pt and est and pt < est * 0.5 and not usage.get("num_ctx"):
         warn = ("The model server read only about %d of the roughly %d tokens sent: its context window is too small, so "
                 "the answer may not be based on the output. Raise the model's context length (LM Studio: Context "
@@ -9435,9 +11116,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad json"})
         if not isinstance(body, dict):
             return self._send(400, {"error": "body must be a JSON object"})
-        routes = {"/api/connect": do_connect, "/api/run": do_run,
-                  "/api/raw": do_raw, "/api/disconnect": do_disconnect,
-                  "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/f5host": do_f5_host, "/api/f5logs": do_f5_logs,
+        routes = {"/api/connect": do_connect, "/api/run": do_run, "/api/ssh": do_ssh, "/api/term/open": do_term_open, "/api/term/read": do_term_read,
+                  "/api/term/write": do_term_write, "/api/term/resize": do_term_resize, "/api/term/close": do_term_close,
+                  "/api/raw": do_raw, "/api/disconnect": do_disconnect, "/api/vault": do_vault,
+                  "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/natmap": do_nat_map, "/api/vipmap": do_vip_map, "/api/f5host": do_f5_host, "/api/f5logs": do_f5_logs,
                   "/api/f5capture": do_f5_capture, "/api/f5file": do_f5_file, "/api/policy": do_policy_search, "/api/profile/save": do_profile_save,
                   "/api/profile/delete": do_profile_delete, 
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
@@ -9464,6 +11146,25 @@ PAGE = r"""<!doctype html>
 :root{--bg:#0B0A17;--panel:#14132a;--panel2:#1b1a38;--line:#2a2850;--text:#e9e8ff;--dim:#8f8cb8;
 --mint:#2EE6C5;--coral:#FF7A59;--violet:#7C6CFF}
 *{box-sizing:border-box}
+.fdwrap{margin:0 0 16px;padding:10px 10px 8px;border:1px solid var(--line);border-radius:14px;overflow-x:auto;
+background:radial-gradient(700px 220px at 85% 110%,#7C6CFF14,transparent),var(--panel2)}
+.fdsvg{width:100%;height:auto;display:block}.fdbase{fill:none;stroke:#2a2850;stroke-width:2}
+.fdflow{fill:none;stroke-width:2.4;stroke-linecap:round;stroke-dasharray:4 14;animation:fdmove 1.1s linear infinite;opacity:.95}
+@keyframes fdmove{to{stroke-dashoffset:-18}}@media (prefers-reduced-motion:reduce){.fdflow{animation:none;stroke-dasharray:none;opacity:.6}}
+.fdcard{fill:#1b1a38;stroke-width:1.2}.fdcard.nc{stroke-dasharray:4 4;fill:#16152e}.fdic{fill:#0B0A17;stroke-width:1.2}
+.fdglyph{fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.fdt{fill:#e9e8ff;font:600 13.5px system-ui,Segoe UI,sans-serif}.fdr{fill:#8f8cb8;font:600 9px system-ui,Segoe UI,sans-serif;letter-spacing:.08em;text-transform:uppercase}.fds{fill:#8f8cb8;font:11px system-ui,Segoe UI,sans-serif}
+.fdpill{font:600 9.5px system-ui,Segoe UI,sans-serif;letter-spacing:.04em;text-transform:uppercase}
+.fdlab{fill:#b9b6e6;font:10.5px Consolas,'Cascadia Mono',monospace}
+.fdnode.dim{opacity:.38}.fdnode{cursor:default}
+.fdleg{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--dim);padding:4px 6px 0}
+.fdleg i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:0}
+.termcard{padding:12px 14px}.termcard .thd{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.termcard .thd b{font-size:14px}.termcard .thd .st{flex:1;font-size:12px;color:var(--dim)}
+.term{background:#0a0a12;color:#d6d6e6;font:13px/1.25 Consolas,'Cascadia Mono','Courier New',monospace;
+border:1px solid var(--line);border-radius:8px;padding:6px 8px;overflow-y:auto;overflow-x:hidden;white-space:pre;outline:none;cursor:text}
+.term:focus{border-color:var(--mint);box-shadow:0 0 0 1px #2EE6C555}.term .tl{height:1.25em}
+.term .cur{background:#d6d6e6;color:#0a0a12}.term .curoff{outline:1px solid #d6d6e6}
 body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#1d1a4a55,transparent),var(--bg);
 color:var(--text);font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;min-height:100vh}
 h1{margin:0;font-size:22px;background:linear-gradient(90deg,var(--mint),var(--violet) 60%,var(--coral));
@@ -9640,7 +11341,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
     <div id="perr" class="err"></div>
     <p class="muted" style="margin:8px 0 0">Only device details are saved locally. Passwords, usernames, and API keys are never stored in profiles.</p>
   </div>
-  <div class="card"><h3>Devices</h3><div id="devs" class="muted">No devices connected.</div></div>
+  <div class="card"><h3>Devices</h3><div id="vault"></div><div id="devs" class="muted">No devices connected.</div></div>
   <div class="card"><h3>Connect</h3>
     <label>Vendor</label>
     <select id="vendor"><option value="f5">F5 BIG-IP (iControl REST)</option>
@@ -9655,6 +11356,8 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
     <div id="f-key"><label id="keylbl">API key</label><input id="apikey" type="password" autocomplete="off"></div>
     <div id="f-acct" style="display:none"><label>Account ID (optional; needed for account-owned tokens)</label><input id="account" autocomplete="off" placeholder="32 hex characters"></div>
     <div class="chk" id="f-ins"><input type="checkbox" id="insecure"><span>Skip TLS verification (self-signed mgmt cert). Credentials are then sent to whatever answers at that address: use only on a trusted network.</span></div>
+    <div class="chk" id="f-rem"><input type="checkbox" id="remember" onchange="remUi()"><span>Remember this login on this PC (encrypted for your Windows account and a passphrase; saved_logins.dat, not in git)</span></div>
+    <div id="f-vpass" style="display:none"><label id="vpasslbl">Saved-logins passphrase</label><input id="vpass" type="password" autocomplete="new-password"></div>
     <div style="margin-top:12px"><button class="primary" onclick="connect()">Connect</button></div>
     <div id="cerr" class="err"></div>
   </div>
@@ -9679,7 +11382,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
   </svg></div>
 </div>
 <div>
-  <div id="flowtrace"></div><div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
+  <div id="sshtool"></div><div id="terms"></div><div id="flowtrace"></div><div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
   <div id="iplookup"></div><div id="f5tools"></div>
   <div class="card" id="main"><h3>Checks</h3><div class="muted">Connect a device to begin.</div></div>
   <div class="card"><h3>Raw read-only query</h3>
@@ -9761,19 +11464,46 @@ function fields(){const v=$("#vendor").value,cf=v==="cloudflare";
  else if($("#host").value==="api.cloudflare.com")$("#host").value="";
  $("#keylbl").textContent=cf?"API token (read-only permissions)":v==="fortigate"?"REST API token":"API key (or leave blank and use user/password)"}
 $("#vendor").onchange=fields;fields();
+let vault={};
+async function vaultLoad(){vault=await api("/api/vault",{action:"status"});renderVault();remUi()}
+function remUi(){const on=$("#remember").checked,need=on&&!vault.unlocked;$("#f-vpass").style.display=need?"":"none";
+ $("#vpasslbl").textContent=vault.exists?"Saved-logins passphrase":"Choose a passphrase for saved logins (8+ characters; needed after every restart)";
+ if(vault.ok&&!vault.windows)$("#f-rem").style.display="none"}
+function renderVault(){const el=$("#vault");el.innerHTML="";if(!vault.ok||!vault.exists)return;
+ if(!vault.unlocked){el.innerHTML='<div class="row" style="gap:8px;align-items:center;margin-bottom:10px"><input id="vunlock" type="password" placeholder="Saved-logins passphrase" style="flex:1" onkeydown="if(event.key===\'Enter\')vaultUnlock()">'+
+  '<button class="primary" onclick="vaultUnlock()">Unlock & connect all</button></div><div id="verr" class="err"></div>'+
+  '<p class="muted" style="margin:0 0 10px"><a href="#" onclick="vaultReset(event)">Forgot the passphrase? Delete the saved logins</a></p>';return}
+ const l=vault.logins||[];
+ el.innerHTML='<p class="muted" style="margin:0 0 6px">Saved logins ('+l.length+'): '+l.map(x=>'<span class="tag '+esc(x.vendor)+'">'+esc(x.name)+
+  '</span> <a href="#" title="forget this login" onclick="vaultForget(event,\''+esc(x.id)+'\')">✕</a>').join(" ")+'</p>'+
+  '<div class="row" style="gap:8px;margin-bottom:10px"><button onclick="vaultConnect()">Connect all saved</button><button onclick="vaultLock()">Lock</button></div><div id="verr" class="err"></div>'}
+function vaultAdd(r){(r.results||[]).forEach(x=>{if(x.ok&&!devices.some(d=>d.id===x.id))devices.push(x)});
+ const bad=(r.results||[]).filter(x=>!x.ok);if(devices.length&&!cur)cur=devices[0].id;vault=r;renderVault();renderAll();remUi();
+ const e=$("#verr");if(e)e.textContent=bad.length?"Not connected: "+bad.map(x=>x.name+" ("+x.error+")").join("; "):""}
+async function vaultUnlock(){const e=$("#verr");e.textContent="Unlocking and connecting…";
+ const r=await api("/api/vault",{action:"unlock",passphrase:$("#vunlock").value});if(!r.ok){e.textContent=r.error;return}vaultAdd(r)}
+async function vaultConnect(){$("#verr").textContent="Connecting…";const r=await api("/api/vault",{action:"connect"});
+ if(!r.ok){$("#verr").textContent=r.error;return}vaultAdd(r)}
+async function vaultForget(ev,id){ev.preventDefault();if(!confirm("Forget this saved login?"))return;
+ const r=await api("/api/vault",{action:"forget",id});if(r.ok){vault=r;renderVault()}else $("#verr").textContent=r.error}
+async function vaultLock(){vault=await api("/api/vault",{action:"lock"});renderVault();remUi()}
+async function vaultReset(ev){ev.preventDefault();if(!confirm("Delete all saved logins? You will have to log in to each device again."))return;
+ vault=await api("/api/vault",{action:"reset"});renderVault();remUi()}
 async function connect(){$("#cerr").textContent="Connecting…";
  const b={vendor:$("#vendor").value,name:$("#name").value,host:$("#host").value,port:$("#port").value,
  username:$("#username").value,password:$("#password").value,apikey:$("#apikey").value,insecure:$("#insecure").checked,account:$("#account").value};
+ if($("#remember").checked){b.remember=true;b.vault_pass=$("#vpass").value}
  const r=await api("/api/connect",b);
  if(!r.ok){$("#cerr").textContent=r.error;return}
- $("#cerr").textContent=r.vendor==="cloudflare"?"Token sees "+r.zones.length+" zone(s) in "+r.accounts+" account(s)."+(r.note?" Note: "+r.note:""):"";
- $("#password").value="";$("#apikey").value="";
- devices.push(r);select(r.id)}
+ $("#cerr").textContent=(r.vendor==="cloudflare"?"Token sees "+r.zones.length+" zone(s) in "+r.accounts+" account(s)."+(r.note?" Note: "+r.note:""):"")+
+  (r.remember_error?" Connected, but the login was not saved: "+r.remember_error:r.remembered?" Login saved (encrypted).":"");
+ $("#password").value="";$("#apikey").value="";$("#vpass").value="";
+ devices.push(r);select(r.id);if(r.remembered)vaultLoad()}
 async function disconnect(id,ev){ev.stopPropagation();await api("/api/disconnect",{id});
  devices=devices.filter(d=>d.id!==id);if(cur===id)cur=devices.length?devices[0].id:null;renderAll()}
 function select(id){cur=id;renderAll()}
 function dev(){return devices.find(d=>d.id===cur)}
-function renderAll(){renderDevs();renderChecks();renderCf();renderAcc();renderAppsec();renderIp();renderF5();const d=dev();
+function renderAll(){renderDevs();renderChecks();renderSsh();renderCf();renderAcc();renderAppsec();renderIp();renderF5();const d=dev();
  $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:""}
 function renderFlow(){const box=$("#flowtrace");if(!devices.length){box.innerHTML="";return}
  const vs=[...new Set(devices.map(d=>d.vendor))].map(v=>({cloudflare:"Cloudflare",f5:"F5",paloalto:"Palo Alto",fortigate:"FortiGate"})[v]||v).join(" · ");
@@ -9784,8 +11514,26 @@ function renderFlow(){const box=$("#flowtrace");if(!devices.length){box.innerHTM
   '<div><label>Events / logs time range</label><select id="ft_within"><option>last 15 minutes</option><option>last hour</option><option>last 6 hours</option><option>last 12 hours</option><option selected>last 24 hours</option></select></div></div>'+
   '<div class="chk"><input type="checkbox" id="ft_logs"><span>Also search logs (F5 WAF log, Palo Alto / FortiGate traffic logs). Slower: up to a few minutes.</span></div>'+
   '<div class="row" style="margin-top:10px"><button class="primary" onclick="flowTrace()">Trace flow</button></div>'+
-  '<p class="muted" style="margin:8px 0 0" id="ft_note"></p></div>'}
- $("#ft_note").textContent="Follows the path Cloudflare → FortiGate DMZ → F5 DMZ → Palo Alto on the "+devices.length+" connected device(s) ("+vs+"). Each device is tested with the addresses it sees: Cloudflare edge address → origin IP on the FortiGate, the VIP's mapped address on the F5, the F5 SNAT address → pool member on the Palo Alto. Devices not connected are skipped. Read-only."}
+  '<p class="muted" style="margin:8px 0 0" id="ft_note"></p>'+
+  '<details style="margin-top:10px" ontoggle="if(this.open)natLoad()"><summary class="muted" style="cursor:pointer">Upstream NAT (optional): public → private IP in front of the firewall</summary>'+
+  '<textarea id="nat_text" rows="5" spellcheck="false" style="width:100%;margin-top:8px;font-family:Consolas,monospace" placeholder="203.0.113.10 10.20.1.15   # shop"></textarea>'+
+  '<div class="row" style="margin-top:6px;gap:10px;align-items:center"><button onclick="natSave()">Save list</button><span id="nat_msg" class="muted"></span></div>'+
+  '<p class="muted" style="margin:6px 0 0">Only needed where a public IP is 1:1 NAT\'ed to a private IP before the first firewall (e.g. cloud public IPs). '+
+  'One "public-IP private-IP" pair per line, # for comments; saved in nat_map.txt next to the console, kept out of git. Without an entry, the trace '+
+  'infers the private IP when exactly one FortiGate VIP maps to the F5 virtual server of the hostname, and marks it as inferred.</p></details>'+
+  '<details style="margin-top:8px" ontoggle="if(this.open)vipLoad()"><summary class="muted" style="cursor:pointer">VIP list (optional): name or hostname → FortiGate VIP → F5 VIP</summary>'+
+  '<textarea id="vip_text" rows="6" spellcheck="false" style="width:100%;margin-top:8px;font-family:Consolas,monospace" placeholder="Shop portal VIP\t10.20.1.15\t10.30.1.20"></textarea>'+
+  '<div class="row" style="margin-top:6px;gap:10px;align-items:center"><button onclick="vipSave()">Save list</button><span id="vip_msg" class="muted"></span></div>'+
+  '<p class="muted" style="margin:6px 0 0">Paste the rows straight from a spreadsheet: name, FortiGate VIP, F5 VIP (optionally :port). A header row and extra columns are ignored. '+
+  'The name can be a hostname or a label: its words are matched against the hostname you trace (VIP, F5, FG and similar words are ignored). '+
+  'Tells the trace which FortiGate VIP belongs to a hostname; each row is checked against the live FortiGate and F5. Saved in vip_map.txt next to the console, kept out of git.</p></details></div>'}
+ $("#ft_note").textContent="Finds the path through the "+devices.length+" connected device(s) ("+vs+") from their own configuration: the firewall that translates the address (FortiGate VIP or Palo Alto NAT), the F5 with the virtual server, any firewall between it and the servers, and Cloudflare for its hostnames. Only the devices the flow crosses are shown, each tested with the addresses it sees. Read-only."}
+async function natLoad(){const r=await api("/api/natmap",{});if(r.ok){$("#nat_text").value=r.text;$("#nat_msg").textContent=r.count+" pair(s)"}}
+async function natSave(){const m=$("#nat_msg"),r=await api("/api/natmap",{set:true,text:$("#nat_text").value});
+ m.className=r.ok?"ok":"bad";m.textContent=r.ok?"saved · "+r.count+" pair(s)":"error: "+r.error;if(r.ok)$("#nat_text").value=r.text}
+async function vipLoad(){const r=await api("/api/vipmap",{});if(r.ok){$("#vip_text").value=r.text;$("#vip_msg").textContent=r.count+" row(s)"}}
+async function vipSave(){const m=$("#vip_msg"),r=await api("/api/vipmap",{set:true,text:$("#vip_text").value});
+ m.className=r.ok?"ok":"bad";m.textContent=r.ok?"saved · "+r.count+" row(s)":"error: "+r.error;if(r.ok)$("#vip_text").value=r.text}
 async function flowTrace(){if(!g("ft_dst").trim())return show({ok:false,error:"enter the destination IP or hostname"},"flow trace");
  setBusy("flow trace on "+devices.length+" device(s)"+($("#ft_logs").checked?" + logs (up to a few minutes)":""));
  show(await api("/api/flowtrace",{src:g("ft_src").trim(),dst:g("ft_dst").trim(),port:g("ft_port"),proto:g("ft_proto"),
@@ -9799,6 +11547,141 @@ function renderDevs(){const el=$("#devs");el.innerHTML="";renderFlow();
   const h=document.createElement("small");h.className="muted";h.textContent=" "+d.host;l.appendChild(h);
   const b=document.createElement("button");b.textContent="✕";b.onclick=e=>disconnect(d.id,e);
   x.appendChild(l);x.appendChild(b);el.appendChild(x)})}
+function renderSsh(){const box=$("#sshtool");if(!box)return;box.innerHTML="";const d=dev();
+ if(!d||!["f5","fortigate","paloalto"].includes(d.vendor))return;
+ box.innerHTML='<div class="card"><h3>SSH · '+esc(d.name)+'</h3><div class="row3">'+
+  fld("ssh_user","SSH user name",d.vendor==="fortigate"?"admin":"admin",d.user||"")+fld("ssh_port","SSH port","22","22")+
+  '<div><label>&nbsp;</label><div class="row" style="gap:8px;flex-wrap:wrap"><button class="primary" onclick="termOpen()">Open SSH in this page</button>'+
+  '<button onclick="sshOpen()">Open in a separate window</button></div></div></div>'+
+  '<div class="chk"><input type="checkbox" id="ssh_legacy"><span>Allow older algorithms for this connection (old devices that answer &quot;Unable to negotiate&quot;: SHA-1 key exchange, ssh-rsa, AES-CBC; the hmac-sha1 MAC is always allowed)</span></div>'+
+  '<p class="muted" style="margin:8px 0 0">Connects to '+esc(d.host)+' with this PC\'s <code>ssh</code>. In the page, click the terminal to type; keystrokes (the password too) pass through the console '+
+  'to ssh and are never stored, logged or shown to the AI. The session is a normal CLI session: it is not read-only.</p>'+
+  '<p id="ssh_msg" class="muted" style="margin:6px 0 0"></p></div>'}
+// ---- In-page SSH terminal: a small VT emulator fed by the console's pseudo-console relay ----
+const VTPAL=["#1e1e2a","#e05561","#7ccf7a","#e6c07b","#61afef","#c678dd","#56b6c2","#d6d6e6",
+ "#5c6370","#ff6b7a","#98e08f","#ffd68a","#7cc4ff","#e19bff","#7fe0ea","#ffffff"];
+function vtColor(n){if(n<16)return VTPAL[n];if(n>=232){const v=8+(n-232)*10;return "rgb("+v+","+v+","+v+")"}
+ n-=16;const c=x=>x?55+x*40:0;return "rgb("+c(Math.floor(n/36))+","+c(Math.floor(n/6)%6)+","+c(n%6)+")"}
+class VT{
+ constructor(cols,rows){this.cols=cols;this.rows=rows;this.sb=[];this.reset()}
+ reset(){this.x=0;this.y=0;this.a={fg:null,bg:null,b:0,i:0,u:0};this.top=0;this.bot=this.rows-1;this.saved=[0,0];
+  this.vis=true;this.st=0;this.ps="";this.alt=null;this.scr=[];for(let r=0;r<this.rows;r++)this.scr.push(this.blank());this.out=""}
+ blank(){const l=[];for(let c=0;c<this.cols;c++)l.push([" ",null]);return l}
+ key(){const a=this.a;return a.fg===null&&a.bg===null&&!a.b&&!a.i&&!a.u?null:a.fg+"|"+a.bg+"|"+a.b+"|"+a.i+"|"+a.u}
+ resize(cols,rows){if(cols===this.cols&&rows===this.rows)return;this.cols=cols;
+  const fit=l=>{while(l.length<cols)l.push([" ",null]);l.length=cols;return l};
+  this.scr=this.scr.map(fit);if(this.alt)this.alt.scr=this.alt.scr.map(fit);
+  while(this.scr.length<rows)this.scr.push(this.blank());
+  while(this.scr.length>rows){const l=this.scr.shift();if(!this.alt)this.sb.push(l);this.y=Math.max(0,this.y-1)}
+  this.rows=rows;this.top=0;this.bot=rows-1;this.x=Math.min(this.x,cols-1);this.y=Math.min(this.y,rows-1)}
+ up(top,bot,n){for(let k=0;k<n;k++){const l=this.scr.splice(top,1)[0];if(top===0&&!this.alt){this.sb.push(l);if(this.sb.length>3000)this.sb.shift()}
+  this.scr.splice(bot,0,this.blank())}}
+ down(top,bot,n){for(let k=0;k<n;k++){this.scr.splice(bot,1);this.scr.splice(top,0,this.blank())}}
+ lf(){if(this.y===this.bot)this.up(this.top,this.bot,1);else if(this.y<this.rows-1)this.y++}
+ put(ch){if(this.x>=this.cols){this.x=0;this.lf()}this.scr[this.y][this.x]=[ch,this.key()];this.x++}
+ erase(l,a,b){for(let c=Math.max(0,a);c<Math.min(this.cols,b);c++)l[c]=[" ",null]}
+ write(s){for(const ch of s){const c=ch.charCodeAt(0);
+  if(this.st===0){
+   if(c===27)this.st=1;else if(c===13)this.x=0;else if(c===10||c===11||c===12)this.lf();
+   else if(c===8)this.x=Math.max(0,Math.min(this.x,this.cols)-1);else if(c===9)this.x=Math.min(this.cols-1,(this.x>>3)*8+8);
+   else if(c>=32&&c!==127)this.put(ch)}
+  else if(this.st===1){this.st=0;
+   if(ch==="["){this.st=2;this.ps=""}else if(ch==="]")this.st=3;else if(ch==="("||ch===")"||ch==="#")this.st=4;
+   else if(ch==="7")this.saved=[this.x,this.y];else if(ch==="8"){[this.x,this.y]=this.saved}
+   else if(ch==="M"){if(this.y===this.top)this.down(this.top,this.bot,1);else if(this.y>0)this.y--}
+   else if(ch==="D")this.lf();else if(ch==="E"){this.x=0;this.lf()}else if(ch==="c")this.reset()}
+  else if(this.st===2){if(c>=0x40&&c<=0x7e){this.st=0;this.csi(ch,this.ps)}else this.ps+=ch;if(this.ps.length>64)this.st=0}
+  else if(this.st===3){if(c===7)this.st=0;else if(c===27)this.st=5}
+  else if(this.st===4)this.st=0;
+  else if(this.st===5)this.st=0}}
+ csi(f,ps){const priv=ps[0]==="?";const p=(priv?ps.slice(1):ps).split(";").map(x=>parseInt(x,10));
+  const n=(i,d)=>isNaN(p[i])||p[i]===0?(d===undefined?1:d):p[i],cl=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const L=this.scr[this.y];
+  switch(f){
+   case"A":this.y=cl(this.y-n(0),this.y>=this.top?this.top:0,this.rows-1);break;
+   case"B":this.y=cl(this.y+n(0),0,this.y<=this.bot?this.bot:this.rows-1);break;
+   case"C":this.x=cl(this.x+n(0),0,this.cols-1);break;case"D":this.x=cl(Math.min(this.x,this.cols-1)-n(0),0,this.cols-1);break;
+   case"E":this.x=0;this.y=cl(this.y+n(0),0,this.rows-1);break;case"F":this.x=0;this.y=cl(this.y-n(0),0,this.rows-1);break;
+   case"G":case"`":this.x=cl(n(0)-1,0,this.cols-1);break;case"d":this.y=cl(n(0)-1,0,this.rows-1);break;
+   case"H":case"f":this.y=cl(n(0)-1,0,this.rows-1);this.x=cl(n(1)-1,0,this.cols-1);break;
+   case"J":{const m=isNaN(p[0])?0:p[0];
+    if(m===0){this.erase(L,this.x,this.cols);for(let r=this.y+1;r<this.rows;r++)this.scr[r]=this.blank()}
+    else if(m===1){this.erase(L,0,this.x+1);for(let r=0;r<this.y;r++)this.scr[r]=this.blank()}
+    else{for(let r=0;r<this.rows;r++)this.scr[r]=this.blank();if(m===3)this.sb=[]}break}
+   case"K":{const m=isNaN(p[0])?0:p[0];if(m===0)this.erase(L,this.x,this.cols);else if(m===1)this.erase(L,0,this.x+1);else this.erase(L,0,this.cols);break}
+   case"X":this.erase(L,this.x,this.x+n(0));break;
+   case"P":{const k=Math.min(n(0),this.cols-this.x);L.splice(this.x,k);for(let i=0;i<k;i++)L.push([" ",null]);break}
+   case"@":{const k=Math.min(n(0),this.cols-this.x);for(let i=0;i<k;i++)L.splice(this.x,0,[" ",null]);L.length=this.cols;break}
+   case"L":if(this.y>=this.top&&this.y<=this.bot)this.down(this.y,this.bot,Math.min(n(0),this.bot-this.y+1));break;
+   case"M":if(this.y>=this.top&&this.y<=this.bot)this.up(this.y,this.bot,Math.min(n(0),this.bot-this.y+1));break;
+   case"S":this.up(this.top,this.bot,n(0));break;case"T":this.down(this.top,this.bot,n(0));break;
+   case"r":this.top=cl(n(0)-1,0,this.rows-1);this.bot=cl(n(1,this.rows)-1,this.top,this.rows-1);this.x=0;this.y=0;break;
+   case"s":this.saved=[this.x,this.y];break;case"u":[this.x,this.y]=this.saved;break;
+   case"n":if(p[0]===6)this.out+="\x1b["+(this.y+1)+";"+(this.x+1)+"R";break;
+   case"m":this.sgr(ps===""?[0]:p);break;
+   case"h":case"l":if(priv){const on=f==="h";p.forEach(m=>{
+     if(m===25)this.vis=on;
+     else if(m===1049||m===1047||m===47){if(on&&!this.alt){this.alt={scr:this.scr,x:this.x,y:this.y};this.scr=[];for(let r=0;r<this.rows;r++)this.scr.push(this.blank())}
+      else if(!on&&this.alt){this.scr=this.alt.scr;this.x=this.alt.x;this.y=this.alt.y;this.alt=null;this.resize(this.cols,this.rows)}}})}break}}
+ sgr(p){const a=this.a;for(let i=0;i<p.length;i++){const v=isNaN(p[i])?0:p[i];
+  if(v===0){a.fg=null;a.bg=null;a.b=0;a.i=0;a.u=0}else if(v===1)a.b=1;else if(v===22)a.b=0;else if(v===4)a.u=1;else if(v===24)a.u=0;
+  else if(v===7)a.i=1;else if(v===27)a.i=0;else if(v>=30&&v<=37)a.fg=VTPAL[v-30];else if(v===39)a.fg=null;
+  else if(v>=40&&v<=47)a.bg=VTPAL[v-40];else if(v===49)a.bg=null;else if(v>=90&&v<=97)a.fg=VTPAL[v-82];else if(v>=100&&v<=107)a.bg=VTPAL[v-92];
+  else if(v===38||v===48){let col=null;if(p[i+1]===5){col=vtColor(p[i+2]||0);i+=2}else if(p[i+1]===2){col="rgb("+(p[i+2]||0)+","+(p[i+3]||0)+","+(p[i+4]||0)+")";i+=4}
+   if(v===38)a.fg=col;else a.bg=col}}}
+ lineHtml(l,cur){let h="",run="",k;const flush=()=>{if(!run)return;
+   if(k==null)h+=esc(run);else{const [fg,bg,b,inv,u]=k.split("|");let f=fg==="null"?null:fg,g=bg==="null"?null:bg;
+    if(inv==="1"){const t=f;f=g||"#0a0a12";g=t||"#d6d6e6"}
+    h+='<span style="'+(f?"color:"+f+";":"")+(g?"background:"+g+";":"")+(b==="1"?"font-weight:700;":"")+(u==="1"?"text-decoration:underline;":"")+'">'+esc(run)+"</span>"}run=""};
+  for(let c=0;c<l.length;c++){if(c===cur){flush();h+='<span class="cur">'+esc(l[c][0])+"</span>";k=undefined;continue}
+   if(l[c][1]!==k){flush();k=l[c][1]}run+=l[c][0]}flush();return h}}
+const TERMS={};
+function termSize(el){const m=document.createElement("span");m.textContent="MMMMMMMMMM";m.style.visibility="hidden";el.appendChild(m);
+ const w=m.getBoundingClientRect().width/10||7.7;m.remove();return Math.max(40,Math.min(300,Math.floor((el.clientWidth-18)/w)))}
+async function termOpen(){const d=dev(),m=$("#ssh_msg");if(!d)return;m.className="muted";m.textContent="opening…";
+ const card=mk("div","card termcard"),hd=mk("div","thd"),title=mk("b",null,"SSH · "+d.name+" ("+d.host+")"),st=mk("span","st","starting…");
+ const bx=mk("button",null,"Disconnect"),body=mk("div","term");body.tabIndex=0;hd.append(title,st,bx);card.append(hd,body);$("#terms").prepend(card);
+ const rows=30;body.style.height="calc("+rows+" * 1.25em + 14px)";const cols=termSize(body);
+ let r;try{r=await api("/api/term/open",{id:cur,user:g("ssh_user"),port:g("ssh_port"),legacy:$("#ssh_legacy").checked,cols,rows})}catch(e){r={ok:false,error:e.message}}
+ if(!r.ok){card.remove();m.className="bad";m.textContent="Error: "+r.error;return}
+ m.className="ok";m.textContent="Opened below: click inside the terminal to type.";
+ const t={tid:r.tid,vt:new VT(cols,rows),body,st,pos:0,alive:true,q:"",sending:false,raf:0};TERMS[r.tid]=t;
+ st.textContent=r.command+" · click inside to type";
+ bx.onclick=async()=>{if(t.alive){t.alive=false;await api("/api/term/close",{tid:t.tid});st.textContent="disconnected";bx.textContent="Close"}else{card.remove();delete TERMS[t.tid]}};
+ body.addEventListener("keydown",e=>termKey(t,e));
+ body.addEventListener("paste",e=>{e.preventDefault();termSend(t,(e.clipboardData.getData("text")||"").replace(/\r?\n/g,"\r"))});
+ body.addEventListener("focus",()=>termDraw(t));body.addEventListener("blur",()=>termDraw(t));
+ termDraw(t);body.focus();termPoll(t)}
+function termDraw(t){if(t.raf)return;t.raf=requestAnimationFrame(()=>{t.raf=0;const vt=t.vt,b=t.body;
+ const atEnd=b.scrollHeight-b.scrollTop-b.clientHeight<30,foc=document.activeElement===b;
+ const sbh=vt.sb.slice(-1500).map(l=>'<div class="tl">'+vt.lineHtml(l,-1)+"</div>").join("");
+ const scr=vt.scr.map((l,r)=>'<div class="tl">'+vt.lineHtml(l,t.alive&&vt.vis&&foc&&r===vt.y?Math.min(vt.x,vt.cols-1):-1)+"</div>").join("");
+ b.innerHTML=sbh+scr;if(atEnd)b.scrollTop=b.scrollHeight})}
+async function termPoll(t){while(TERMS[t.tid]===t){let r;
+  try{r=await api("/api/term/read",{tid:t.tid,pos:t.pos})}catch(e){await new Promise(z=>setTimeout(z,1000));continue}
+  if(!r.ok){t.alive=false;t.st.textContent="ended: "+r.error;break}
+  if(r.data){t.vt.write(r.data);if(t.vt.out){termSend(t,t.vt.out);t.vt.out=""}termDraw(t)}t.pos=r.pos;
+  if(!r.alive){t.alive=false;t.st.textContent="session ended"+(r.exit!=null?" (exit code "+r.exit+")":"")+" · press Disconnect to close";termDraw(t);break}}}
+function termSend(t,s){if(!s||!t.alive)return;t.q+=s;if(t.sending)return;t.sending=true;
+ (async()=>{while(t.q){const d=t.q;t.q="";try{await api("/api/term/write",{tid:t.tid,data:d})}catch(e){}}t.sending=false})()}
+const TKEYS={Enter:"\r",Backspace:"\x7f",Tab:"\t",Escape:"\x1b",ArrowUp:"\x1b[A",ArrowDown:"\x1b[B",ArrowRight:"\x1b[C",ArrowLeft:"\x1b[D",
+ Home:"\x1b[H",End:"\x1b[F",Delete:"\x1b[3~",Insert:"\x1b[2~",PageUp:"\x1b[5~",PageDown:"\x1b[6~",F1:"\x1bOP",F2:"\x1bOQ",F3:"\x1bOR",F4:"\x1bOS"};
+function termKey(t,e){if(e.isComposing)return;
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="c"&&String(getSelection()).length)return;   // copy the selection
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="v")return;                                  // paste event sends it
+ let s=null;
+ if(TKEYS[e.key])s=(e.shiftKey&&e.key==="Tab")?"\x1b[Z":TKEYS[e.key];
+ else if(e.ctrlKey&&!e.altKey&&e.key.length===1){const c=e.key.toUpperCase().charCodeAt(0);
+  if(c>=64&&c<=95)s=String.fromCharCode(c-64);else if(e.key===" ")s="\x00"}
+ else if(e.key.length===1&&!e.metaKey)s=(e.altKey?"\x1b":"")+e.key;
+ if(s===null)return;e.preventDefault();termSend(t,s);t.body.scrollTop=t.body.scrollHeight}
+let termRT=0;window.addEventListener("resize",()=>{clearTimeout(termRT);termRT=setTimeout(()=>{Object.values(TERMS).forEach(t=>{if(!t.alive)return;
+ const c=termSize(t.body);if(c!==t.vt.cols){t.vt.resize(c,t.vt.rows);api("/api/term/resize",{tid:t.tid,cols:c,rows:t.vt.rows});termDraw(t)}})},300)});
+async function sshOpen(){const m=$("#ssh_msg");m.className="muted";m.textContent="opening…";
+ let r;try{r=await api("/api/ssh",{id:cur,user:g("ssh_user"),port:g("ssh_port"),legacy:$("#ssh_legacy").checked})}catch(e){r={ok:false,error:e.message}}
+ m.className=r.ok?"ok":"bad";
+ m.textContent=r.ok?(r.launched?"Opened a window titled 'SSH "+(dev()||{}).host+"': check the taskbar if you do not see it. Any connection error stays in that window.":"Run in a terminal: "+r.command):"Error: "+(r.error||"no answer");
+ show(r,"SSH")}
 function renderChecks(){const m=$("#main");m.innerHTML="<h3>Checks</h3>";const d=dev();
  if(!d){m.innerHTML+="<div class='muted'>Connect a device to begin.</div>";return}
  const list=catalog[d.vendor];const groups=[...new Set(list.map(c=>c.group))];
@@ -9906,8 +11789,55 @@ function secNode(s){const w=mk("div","rsec");
  else if(s.lines){const b=mk("div","tx");s.lines.forEach(l=>b.appendChild(mk("div","logln",l)));w.appendChild(b)}
  else{const b=mk("div","tx");String(s.text).split("\n").forEach(l=>b.appendChild(mk("div","logln",l||" ")));w.appendChild(b)}
  return w}
+// ---- Flow trace diagram: client -> Cloudflare -> FortiGate -> F5 -> Palo Alto -> server, with where it stops ----
+const FD_ICON={
+ client:'<rect x="-9" y="-8" width="18" height="12" rx="2"/><path d="M-4 8h8M0 4v4"/>',
+ cloudflare:'<path d="M-9 5h17a4.5 4.5 0 0 0 0-9 6.5 6.5 0 0 0-12.4-1.6A4.6 4.6 0 0 0-9 5z"/>',
+ fortigate:'<rect x="-9" y="-8" width="18" height="16" rx="1.5"/><path d="M-9-2.7h18M-9 2.7h18M-3-8v5.3M3-2.7v5.4M-3 2.7V8"/>',
+ f5:'<circle cx="-6" cy="0" r="2.6"/><circle cx="7" cy="-6" r="2.2"/><circle cx="7" cy="0" r="2.2"/><circle cx="7" cy="6" r="2.2"/><path d="M-3.4 0H4.8M-3.6-1.2 4.9-5M-3.6 1.2 4.9 5"/>',
+ paloalto:'<path d="M0-9 8-6v5c0 5-3.4 8.4-8 10-4.6-1.6-8-5-8-10v-5z"/><path d="M-3.5 0l2.5 2.6 4.6-5"/>',
+ nat:'<path d="M-9-4h13M1-7.5 4.5-4 1-.5M9 4H-4M-1 .5-4.5 4-1 7.5"/>',
+ server:'<rect x="-8" y="-9" width="16" height="7" rx="1.5"/><rect x="-8" y="2" width="16" height="7" rx="1.5"/><path d="M-4.5-5.5h.1M-4.5 5.5h.1"/>'};
+const FD_COL={passed:"#2EE6C5",blocked:"#FF5C7A",unclear:"#FFB547",checked:"#7C6CFF","not connected":"#5d5a88",client:"#7C6CFF",server:"#7C6CFF",skipped:"#3a3866"};
+function flowDiagram(p){
+ const stages=p.stages||[],nodes=[{kind:"client",role:"Source",title:"Client",sub:p.client,state:"client"}];
+ stages.forEach(s=>{const [role,vend]=String(s.layer).split(" · ");
+  nodes.push({kind:s.vendor,role,title:vend||s.layer,sub:s.devices.length?s.devices.join(", "):"not connected",state:s.state,checks:s.checks,sees:s.sees})});
+ nodes.push({kind:"server",role:"Destination",title:"Server",sub:(p.servers&&p.servers.length?p.servers.join(", "):p.target),state:"server"});
+ // traffic gets as far as the first device that blocks it; after that the path is greyed out
+ const stop=nodes.findIndex(n=>n.state==="blocked");
+ const NW=168,NH=86,W=Math.max(1240,24+NW+(nodes.length-1)*190),gap=(W-24-NW)/(nodes.length-1),TOP=44,LOW=124,H=LOW+NH+44;
+ const xs=nodes.map((_,i)=>12+i*gap),ys=nodes.map((_,i)=>i%2?LOW:TOP);
+ const e=s=>esc(s),cut=(s,n)=>{s=String(s||"");return s.length>n?s.slice(0,n-1)+"…":s};
+ let svg='<svg class="fdsvg" viewBox="0 0 '+W+' '+H+'"'+(W>1240?' style="min-width:'+Math.round(W*.72)+'px"':'')+' role="img" aria-label="Flow trace path"><defs>'+
+  '<filter id="fdsh" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000" flood-opacity=".45"/></filter></defs>';
+ for(let i=0;i<nodes.length-1;i++){
+  const x1=xs[i]+NW,y1=ys[i]+NH/2,x2=xs[i+1],y2=ys[i+1]+NH/2,mx=(x1+x2)/2,d="M"+x1+" "+y1+" C"+mx+" "+y1+" "+mx+" "+y2+" "+x2+" "+y2;
+  const after=stop>=0&&i>=stop,nx=nodes[i+1].state,col=nx==="blocked"?FD_COL.blocked:nx==="unclear"?FD_COL.unclear:nx==="not connected"?"#8f8cb8":FD_COL.passed;
+  svg+='<path d="'+d+'" class="fdbase"/>'+(after?"":'<path d="'+d+'" class="fdflow" style="stroke:'+col+'"/>')}
+ nodes.forEach((n,i)=>{const x=xs[i],y=ys[i],c=FD_COL[n.state]||FD_COL.checked,dim=stop>=0&&i>stop,nc=n.state==="not connected",end=n.state==="client"||n.state==="server";
+  svg+='<g class="fdnode'+(dim?" dim":"")+'" transform="translate('+x+' '+y+')"><title>'+e(n.role+" · "+n.title+" · "+n.sub+(n.sees&&n.sees.length?"\nsees: "+n.sees.join(", "):"")+(n.checks&&n.checks.length?"\n"+n.checks.join("\n"):""))+'</title>'+
+   '<rect width="'+NW+'" height="'+NH+'" rx="14" class="fdcard'+(nc?" nc":"")+'" style="stroke:'+(end?"#3b3970":c)+'" filter="url(#fdsh)"/>'+
+   '<g transform="translate(27 '+(NH/2)+')"><circle r="17" class="fdic" style="stroke:'+c+'"/><g class="fdglyph" style="stroke:'+c+'">'+(FD_ICON[n.kind]||"")+'</g></g>'+
+   '<text x="54" y="21" class="fdr">'+e(cut(n.role,22))+'</text><text x="54" y="39" class="fdt">'+e(cut(n.title,14))+'</text>'+
+   '<text x="54" y="55" class="fds">'+e(cut(n.sub,19))+'</text>';
+  if(!end)svg+='<g transform="translate(54 63)"><rect width="'+(n.state.length*6.2+14)+'" height="15" rx="7.5" style="fill:'+c+'22;stroke:'+c+'66"/>'+
+   '<text x="7" y="11" class="fdpill" style="fill:'+c+'">'+e(n.state)+'</text></g>';
+  // the addresses this device sees: above the top-row cards, below the bottom-row ones (clear of the lines)
+  const see=n.sees&&n.sees[0]?n.sees[0].split(" -> "):null;
+  if(see&&!dim){const ty=i%2?NH+16:-22;
+   svg+='<text class="fdlab" x="'+(NW/2)+'" y="'+ty+'" text-anchor="middle">'+e(cut(see[0],24))+'</text>'+
+    '<text class="fdlab" x="'+(NW/2)+'" y="'+(ty+13)+'" text-anchor="middle">→ '+e(cut(see[1]||"",24))+(n.sees.length>1?" +"+(n.sees.length-1):"")+'</text>'}
+  svg+='</g>'});
+ svg+='</svg>';
+ const wrap=mk("div","fdwrap");wrap.innerHTML=svg;
+ const leg=mk("div","fdleg");[["passed","allowed"],["blocked","blocks it"],["unclear","not conclusive / inferred"]].forEach(([k,t])=>{
+  const s=mk("span");s.innerHTML='<i style="background:'+FD_COL[k]+'"></i>'+esc(t);leg.appendChild(s)});
+ leg.appendChild(mk("span","muted","Next to each device: the source → destination it sees (after Cloudflare proxying, VIP mapping and SNAT). Hover a device for its checks."));
+ wrap.appendChild(leg);return wrap}
 function renderOut(){const box=$("#pretty");box.textContent="";if(!last)return;
  if(last.error){box.appendChild(mk("div","bad",last.error));return}
+ if(last.path&&Array.isArray(last.path.stages))box.appendChild(flowDiagram(last.path));
  box.classList.toggle("tall",!!(last.dashboard||last.charts||last.acc||last.tiles||last.bars));
  if(Array.isArray(last.tiles)&&last.tiles.length)box.appendChild(tilesNode(last.tiles));
  if(Array.isArray(last.charts)&&last.charts.length&&last.bars)box.appendChild(chartsNode(last.charts,last.heat));
@@ -10043,16 +11973,14 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
  if(v==="f5"){
   h+='<div class="grp">ASM / Advanced WAF request log</div><div class="row3">'+fld("asm_sid","Support ID (from block page)","1234567890123456789")+wsel("asm_sw")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="asmLookup(\'supportid\')">Look up support ID</button></div>'+
-  '<div class="row3" style="margin-top:8px">'+fld("asm_ip","Client IP (device-seen)","203.0.113.7")+
-  fld("asm_tci","True-Client-IP (behind Cloudflare)","198.51.100.9")+fld("asm_host","Hostname contains","app.example.com")+fld("asm_url","URL path contains","/login")+
-  sel("asm_st","Status",["","blocked","alerted","passed"],"")+fld("asm_top","Max rows","50","50")+wsel("asm_w")+
-  '</div><div style="margin-top:8px"><button onclick="asmLookup(\'search\')">Search requests</button></div>'+
-  '<div class="grp" style="margin-top:14px">Requests by HTTP header</div><div class="row3">'+
-  fld("asm_hn","Header name","X-Request-ID")+fld("asm_hv","Value contains (blank = any)","abc123")+
-  fld("asm_hh","Hostname contains (optional)","app.example.com")+sel("asm_hst","Status",["","blocked","alerted","passed"],"")+
-  fld("asm_htop","Max rows","50","50")+fld("asm_hscan","Entries to scan","1000","1000")+wsel("asm_hw")+
-  '</div><div style="margin-top:8px"><button onclick="asmLookup(\'header\')">Search by header</button> '+
-  '<span class="muted">(shows header value, IP, True-Client-IP, hostname, URL, time, support ID, POST body)</span></div>'+
+  '<div class="grp" style="margin-top:14px">Search requests</div><div class="row3">'+fld("asm_ip","Client IP","203.0.113.7")+
+  fld("asm_tci","True-Client-IP","198.51.100.9")+fld("asm_host","Hostname contains","app.example.com")+fld("asm_url","URL path contains","/login")+
+  fld("asm_hn","HTTP header name","X-Request-ID")+fld("asm_hv","Header value contains","abc123")+
+  sel("asm_st","Status",["","blocked","alerted","passed"],"")+fld("asm_top","Max rows","50","50")+fld("asm_hscan","Entries to scan","1000","1000")+sel("asm_w","Time range",WITHIN,"any time")+
+  '</div><div style="margin-top:8px"><button class="primary" onclick="asmLookup(\'search\')">Search requests</button> '+
+  '<p class="muted" style="margin:6px 0 0">Fill any combination. Client IP is the address the F5 sees; True-Client-IP is the real client behind Cloudflare. '+
+  'Header name and value are optional (blank value = any); with a header name the result also shows its value and the POST body, '+
+  'and "Entries to scan" limits that search. Time range goes back at most 1 day.</p></div>'+
   '<div class="grp" style="margin-top:14px">Top 10 hostnames by violations</div><div class="row3">'+
   sel("asm_tst","Status",["","blocked","alerted"],"")+fld("asm_scan","Entries to scan","1000","1000")+wsel("asm_tw")+
   '</div><div style="margin-top:8px"><button onclick="asmLookup(\'tophosts\')">Top 10 hostnames by violations</button> '+
@@ -10074,13 +12002,6 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
  if(v==="f5")h+='<div class="grp">Config sync · changes made here and whether the peer has them</div><div class="row3">'+
   fld("sy_h","Look back (hours)","24","24")+fld("sy_n","Max rows","200","200")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="f5Sync()">Review config sync</button></div>';
- if(v==="paloalto"){
-  h+='<div class="grp">Packet capture (live, then download .pcap)</div>'+
-  '<div class="chk"><input type="checkbox" id="pc_ack"><span>I understand this turns on packet-diag capture on the firewall for a short time, clears all packet-diag settings (ending any capture another admin has running) and may expose traffic; approved for this device</span></div>'+
-  '<div class="row3">'+fld("pc_src","Source IP","203.0.113.7")+fld("pc_dst","Destination IP","198.51.100.9")+fld("pc_port","Port","443")+
-  sel("pc_proto","Protocol",["any","tcp","udp","icmp"],"tcp")+
-  fld("pc_dur","Seconds (5-60)","20","20")+fld("pc_cnt","Max packets","10000","10000")+sel("pc_stage","Stage",["receive","firewall","transmit","drop"],"receive")+
-  '</div><p class="muted" style="margin:6px 0 0">At least one IP or port is required.</p><div style="margin-top:8px"><button class="primary" onclick="capture()">Capture &amp; download</button></div>'}
  h+='<div class="grp">Configuration backup (saved, then downloaded to this PC)</div>'+
   (v==="f5"?'<div class="chk"><input type="checkbox" id="bk_ack"><span>I understand this creates a UCS archive on the BIG-IP and copies it through the shell (Administrator role); approved for this device</span></div>':'')+
   (v==="fortigate"?'<div class="row3">'+fld("bk_vdom","VDOM (optional, blank = whole device)","root")+'</div>':'')+
@@ -10092,9 +12013,6 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   (v!=="paloalto"?wsel("au_w"):"")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="adminAudit()">Search admin activity</button></div>';
  box.innerHTML=h+'</div>'}
-async function capture(){setBusy("packet capture (up to "+g("pc_dur")+"s, then download)");
- const r=await api("/api/pancapture",{id:cur,ack:$("#pc_ack").checked,src:g("pc_src"),dst:g("pc_dst"),port:g("pc_port"),proto:g("pc_proto"),
-  duration:g("pc_dur"),count:g("pc_cnt"),stage:g("pc_stage")});show(r,"packet capture")}
 async function backup(){setBusy("configuration backup (F5 archives can take several minutes)");
  const r=await api("/api/backup",{id:cur,ack:!!($("#bk_ack")&&$("#bk_ack").checked),vdom:g("bk_vdom")});show(r,"configuration backup");
  if(r&&r.ok&&r.download){const a=document.createElement("a");a.href=r.download+"?t="+T;a.click()}}
@@ -10104,9 +12022,12 @@ async function adminAudit(){setBusy("admin audit (can take up to a minute)");
  const r=await api("/api/adminaudit",{id:cur,user:g("au_user"),action:g("au_act"),count:g("au_n"),period:g("au_period"),within:g("au_w"),log_source:g("au_src"),vdom:g("au_vdom")});show(r,"admin audit")}
 async function appsec(c){const names={waf:"coverage",ssl:"SSL posture"};setBusy(names[c]);
  const r=await api("/api/appsec",{id:cur,check:c,vsys:g("as_vsys"),vdom:g("as_vdom"),days:g("as_days")});show(r,names[c])}
-async function asmLookup(m){setBusy("ASM request log");
- if(m==="header"){const r=await api("/api/f5asm",{id:cur,mode:m,header_name:g("asm_hn"),header_value:g("asm_hv"),hostname:g("asm_hh"),
-  status:g("asm_hst"),top:g("asm_htop"),scan:g("asm_hscan"),within:g("asm_hw")});return show(r,"ASM requests by header")}
+async function asmLookup(m){
+ if(m==="search"&&g("asm_hv").trim()&&!g("asm_hn").trim())return show({ok:false,error:"enter the HTTP header name for the header value"},"ASM request search");
+ setBusy("ASM request log");
+ if(m==="search"&&g("asm_hn").trim()){const r=await api("/api/f5asm",{id:cur,mode:"header",header_name:g("asm_hn"),header_value:g("asm_hv"),
+  hostname:g("asm_host"),ip:g("asm_ip"),header_ip:g("asm_tci"),url:g("asm_url"),status:g("asm_st"),top:g("asm_top"),scan:g("asm_hscan"),within:g("asm_w")});
+  return show(r,"ASM requests · header "+g("asm_hn"))}
  const r=await api("/api/f5asm",{id:cur,mode:m,support_id:g("asm_sid"),ip:g("asm_ip"),header_ip:g("asm_tci"),hostname:g("asm_host"),url:g("asm_url"),status:m==="tophosts"?g("asm_tst"):g("asm_st"),top:g("asm_top"),scan:g("asm_scan"),within:m==="tophosts"?g("asm_tw"):m==="supportid"?g("asm_sw"):g("asm_w")});
  show(r,m==="supportid"?"support ID lookup":m==="tophosts"?"top hostnames by violations":"ASM request search")}
 const CFW=["last 15 minutes","last hour","last 6 hours","last 12 hours","last 24 hours","last 3 days","last 7 days","last 30 days"];
@@ -10115,16 +12036,7 @@ const CF_EVBY=["action","source","rule","client IP","host","path","country","ASN
 const CF_HTBY=["host","edge status","origin status","edge + origin status","cache status","client IP","path","country","ASN","user agent","colo","security action","TLS version","HTTP version","time"];
 const CF_ST=["","2xx","3xx","4xx","5xx","4xx + 5xx","origin errors (520-527)"];
 function renderCf(){const box=$("#cftools");box.innerHTML="";const d=dev();if(!d||d.vendor!=="cloudflare")return;
- const f5=devices.filter(x=>x.vendor==="f5");
- let h='<div class="card"><h3>Cloudflare · scope for every lookup below</h3><div class="row3">'+
-  '<div><label>Zone (blank = all zones)</label><input id="cf_zone" list="cf_zl" placeholder="example.com"><datalist id="cf_zl">'+
-  (d.zones||[]).map(z=>'<option value="'+esc(z)+'">').join("")+'</datalist></div>'+
-  sel("cf_w","Time range",CFW,"last 24 hours")+fld("cf_since","Custom from (UTC+3, optional)","2026-11-01 08:00")+
-  fld("cf_until","Custom to (UTC+3, optional)","2026-11-01 09:00")+
-  '<div><label>Cross-check on F5 (optional)</label><select id="cf_f5"><option value="">none</option>'+
-  f5.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+'</option>').join("")+'</select></div></div>'+
-  '<p class="muted" style="margin:8px 0 0">How far back you can query, and which datasets exist, depends on the zone plan. Times are shown in UTC+3.'+
-  (f5.length?'':' Connect an F5 device to cross-check Ray IDs and IPs against the ASM request log.')+'</p></div>';
+ let h='';   // no scope card: every lookup uses all zones, the last 24 hours, no F5 cross-check
  h+='<div class="card"><h3>WHOIS · IP and domain registration</h3><div class="row3">'+
   fld("cf_w_ip","IP address","198.51.100.9")+fld("cf_w_host","Domain or hostname","app.example.com")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="cfWhois()">WHOIS lookup</button></div>'+
@@ -10139,7 +12051,7 @@ function renderCf(){const box=$("#cftools");box.innerHTML="";const d=dev();if(!d
   fld("cf_u_url","URL","https://app.example.com/api/login")+sel("cf_u_match","Path match",["exact","starts with","contains"],"exact")+
   sel("cf_u_st","Edge status",CF_ST,"")+fld("cf_u_cache","Cache status (optional)","miss, dynamic")+fld("cf_u_ip","Client IP (optional)","198.51.100.9")+
   fld("cf_u_n","Slowest requests to list","50","50")+'</div><div style="margin-top:8px"><button class="primary" onclick="cfUrl()">Look up URL timing</button></div>'+
-  '<p class="muted" style="margin:8px 0 0">Edge TTFB and origin (e.g. F5) response time: p50 / p95 / p99, a timeline, breakdowns by status, cache, colo and method, and the slowest requests with DNS / TCP / TLS / header timings to the origin. Uses the scope time range.</p></div>';
+  '<p class="muted" style="margin:8px 0 0">Edge TTFB and origin (e.g. F5) response time: p50 / p95 / p99, a timeline, breakdowns by status, cache, colo and method, and the slowest requests with DNS / TCP / TLS / header timings to the origin. Covers the last 24 hours.</p></div>';
  h+='<div class="card"><h3>Security events · WAF, rate limiting, bots, IP rules</h3><div class="row3">'+
   fld("cf_e_ip","Client IP","198.51.100.9")+fld("cf_e_host","Host (* wildcard)","app.example.com")+fld("cf_e_path","Path contains","/login")+
   fld("cf_e_ray","Ray ID","8d3c1a2b3c4d5e6f")+sel("cf_e_act","Action",CF_ACT,"")+
@@ -10163,17 +12075,18 @@ function renderCf(){const box=$("#cftools");box.innerHTML="";const d=dev();if(!d
   '<button onclick="cfLb()">Load balancers &amp; health checks</button></div></div>';
  h+='<div class="card"><h3>Audit log · who changed what</h3><div class="row3">'+fld("cf_a_email","Actor e-mail","admin@example.com")+
   fld("cf_a_act","Action contains","change, delete, login")+fld("cf_a_res","Resource / text contains","firewall")+fld("cf_a_n","Max rows","100","100")+
-  '</div><div style="margin-top:8px"><button class="primary" onclick="cfAudit()">Search audit log</button> <span class="muted">(uses the scope zone and time range)</span></div></div>';
+  '</div><div style="margin-top:8px"><button class="primary" onclick="cfAudit()">Search audit log</button> <span class="muted">(all zones, last 24 hours)</span></div></div>';
  box.innerHTML=h}
-async function cfRun(mode,label,extra){setBusy(label+(g("cf_f5")&&(mode==="ip"||mode==="ray")?" + F5 cross-check (up to a few minutes)":""));
- const r=await api("/api/cf",Object.assign({id:cur,mode,zone:g("cf_zone"),within:g("cf_w"),since:g("cf_since"),until:g("cf_until"),f5:g("cf_f5")},extra));show(r,label)}
+async function cfRun(mode,label,extra){setBusy(label);
+ const r=await api("/api/cf",Object.assign({id:cur,mode},extra));show(r,label)}
 function cfIp(){cfRun("ip","Cloudflare IP investigation",{ip:g("cf_ip")})}
 function cfHost(){cfRun("host","Cloudflare hostname investigation",{host:g("cf_host"),days:g("cf_days")})}
 function cfRay(){cfRun("ray","Cloudflare Ray ID lookup",{ray:g("cf_ray")})}
 function cfWhois(){cfRun("whois","WHOIS",{ip:g("cf_w_ip"),host:g("cf_w_host"),days:g("cf_days")})}
-function cfTraceBy(m,label,extra){setBusy(label+": Cloudflare → F5 (can take a few minutes)");
- api("/api/cf",Object.assign({id:cur,mode:m,zone:g("cf_zone"),within:g("cf_w"),since:g("cf_since"),until:g("cf_until"),
-  f5:g("cf_f5"),window:g("cf_win")},extra)).then(r=>show(r,label))}
+// The trace follows the request into the connected F5 (the first one, if several are connected).
+function cfTraceBy(m,label,extra){const f5=devices.find(x=>x.vendor==="f5");
+ setBusy(label+(f5?": Cloudflare → F5 "+f5.name+" (can take a few minutes)":": Cloudflare only (no F5 connected)"));
+ api("/api/cf",Object.assign({id:cur,mode:m,f5:f5?f5.id:"",window:g("cf_win")},extra)).then(r=>show(r,label))}
 function cfTrace(){cfTraceBy("trace","Ray ID trace",{ray:g("cf_ray")})}function cfEvF(){return {ip:g("cf_e_ip"),host:g("cf_e_host"),path:g("cf_e_path"),ray:g("cf_e_ray"),action:g("cf_e_act"),source:g("cf_e_src"),
  rule:g("cf_e_rule"),country:g("cf_e_cc"),asn:g("cf_e_asn"),ua:g("cf_e_ua"),method:g("cf_e_m")}}
 function cfEvents(){cfRun("events","Cloudflare security events",Object.assign(cfEvF(),{top:g("cf_e_n")}))}
@@ -10497,7 +12410,7 @@ function exportHtml(){if(!last||last.error||!last.data){alert("Run a check first
  (f?'<h2>Findings</h2>'+table(f)+'<h2>Inventory</h2>'+table(d.inventory)+
  '<h2>Notes</h2>'+(d.notes||[]).map(n=>"<p>"+esc(n)+"</p>").join(""):sectionsHtml())+'</body></html>';
  dlText(fname("html"),"text/html",html)}
-api("/api/catalog").then(c=>catalog=c);loadProfiles();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true)}catch(e){}
+api("/api/catalog").then(c=>catalog=c);loadProfiles();vaultLoad();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true)}catch(e){}
 </script></body></html>
 """
 
