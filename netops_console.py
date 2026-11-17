@@ -54,6 +54,7 @@ import shlex
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import threading
 import time
@@ -10712,10 +10713,35 @@ def llm_retry_msgs(messages):
 
 def llm_empty_note(usage):
     fin = usage.get("_finish") or "unknown"
-    return ("(The model returned no answer text%s. %s Try again, ask a shorter question, or lower the context budget in "
-            "the AI settings.)" % (" (finish reason: %s)" % fin,
-                                    "It used its whole output allowance on reasoning before writing the answer."
-                                    if fin == "length" or usage.get("_reasoning") else ""))
+    ct, pt = usage.get("completion_tokens"), usage.get("prompt_tokens")
+    if fin == "length" or usage.get("_reasoning"):
+        why = "It used its whole output allowance on reasoning before writing the answer."
+    elif ct == 0:
+        why = ("The server says the model generated 0 tokens: the request most likely did not reach the model as sent "
+               "(prompt too long for the model's context, or filtered by the server / gateway).")
+    elif ct:
+        why = ("The server counted %s generated tokens but sent no text back: the gateway in front of the model "
+               "(e.g. LiteLLM) may be dropping the reply. Open 'model reply (raw)' below to see what came back." % ct)
+    else:
+        why = "The server did not say how many tokens it generated."
+    return ("(The model returned no answer text (finish reason: %s%s). %s Try again, ask a shorter question, or lower "
+            "the context budget in the AI settings.)" % (fin, ", prompt tokens: %s" % pt if pt else "", why))
+
+
+def llm_fallback(msg, usage):
+    """After two empty answers: the model's reasoning if it wrote any (better than nothing), else an explanation."""
+    r = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    if not r:
+        c = msg.get("content")
+        if isinstance(c, list):
+            c = "".join(str(p.get("text") or "") for p in c if isinstance(p, dict))
+        m = re.search(r"(?s)<think>(.*?)(</think>|$)", str(c or ""))
+        r = m.group(1) if m else ""
+    r = str(r).strip()
+    if r:
+        return ("**The model wrote no separate answer. This is its reasoning, which may contain the answer:**\n\n"
+                + (r if len(r) <= 8000 else r[:8000] + " …"))
+    return llm_empty_note(usage)
 
 
 def llm_chat(messages, tools=None, max_tokens=None):
@@ -10737,7 +10763,8 @@ def llm_chat(messages, tools=None, max_tokens=None):
     ch = d["choices"][0]
     msg = ch.get("message") or {}
     return msg, dict(d.get("usage") or {}, _est=est, _finish=ch.get("finish_reason") or "",
-                     _reasoning=bool(msg.get("reasoning_content") or msg.get("reasoning")))
+                     _reasoning=bool(msg.get("reasoning_content") or msg.get("reasoning")),
+                     _raw=json.dumps(ch, default=str, ensure_ascii=False)[:6000])
 
 
 # Agent tools: only the console's own read-only lookups, on every connected device (tool names start with the vendor:
@@ -11077,7 +11104,7 @@ def do_llm_chat(b):
         answer = llm_text(msg)
         if not answer:   # e.g. a reasoning model spent its output on thinking: once more, with room and no thinking
             msg, usage = llm_chat(llm_retry_msgs(msgs), max_tokens=4096)
-            answer = llm_text(msg) or llm_empty_note(usage)
+            answer = llm_text(msg) or llm_fallback(msg, usage)
     else:
         if not alldev:
             raise ValueError("connect a device first: the model runs its checks on the connected devices")
@@ -11106,7 +11133,7 @@ def do_llm_chat(b):
                 answer = llm_text(msg)
                 if not answer:   # same as above: one more try for the final answer, without tools
                     msg, usage = llm_chat(llm_retry_msgs(msgs), max_tokens=4096)
-                    answer = llm_text(msg) or llm_empty_note(usage)
+                    answer = llm_text(msg) or llm_fallback(msg, usage)
                 break
             msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
             for c in calls[:4]:
@@ -11142,6 +11169,7 @@ def do_llm_chat(b):
     pt, est = usage.get("prompt_tokens") or 0, usage.pop("_est", 0)
     usage.pop("_finish", None)
     usage.pop("_reasoning", None)
+    raw_reply = usage.pop("_raw", "")
     if pt and est and pt < est * 0.5 and not usage.get("num_ctx"):
         warn = ("The model server read only about %d of the roughly %d tokens sent: its context window is too small, so "
                 "the answer may not be based on the output. Raise the model's context length (LM Studio: Context "
@@ -11155,7 +11183,9 @@ def do_llm_chat(b):
             "check the output panel or run the check yourself." % ", ".join(unseen))
     return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "answer": answer, "steps": steps,
             "model": LLM_CFG["model"], "trimmed": trimmed, "usage": usage, "warning": warn, "sent": sent,
-            "unseen": unseen}
+            "unseen": unseen,
+            # what the server sent back, when it held no usable answer (to see why)
+            "raw": raw_reply if answer.startswith(("(The model returned no answer", "**The model wrote no separate")) else ""}
 
 
 def llm_wrap(fn):
@@ -11276,6 +11306,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, profiles)
             except (OSError, ValueError, json.JSONDecodeError) as e:
                 return self._send(500, {"error": "could not load saved profiles: %s" % e})
+        if u.path == "/api/devices":   # the sessions this console holds, so a reloaded page shows them again
+            return self._send(200, devices_public())
         if u.path == "/api/version":
             return self._send(200, {"gen": HOT["gen"], "page": HOT["page"], "error": HOT["error"], "time": HOT["time"]})
         if u.path == "/api/audit":
@@ -11286,6 +11318,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._host_ok() or not self._tok_ok():
             return self._send(403, {"error": "forbidden"})
+        if self.path == "/api/pcap":   # raw capture file in the body (kept in memory only)
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                n = 0
+            if n <= 0:
+                return self._send(200, {"ok": False, "error": "the file is empty"})
+            if n > PCAP_MAX:
+                self.close_connection = True
+                return self._send(200, {"ok": False, "error": "the file is %.1f MB; the limit is %d MB. Cut it down first "
+                                        "(e.g. Wireshark: File > Export Specified Packets, or editcap -r)"
+                                        % (n / 1048576, PCAP_MAX // 1048576)})
+            raw = self.rfile.read(n)
+            try:
+                result = do_pcap_upload(raw, self.headers.get("X-Filename", ""))
+            except Exception as e:  # noqa: BLE001 - a malformed capture must not break the console
+                result = {"ok": False, "error": "could not analyse the capture: %s: %s" % (type(e).__name__, e)}
+            return self._send(200, result)
         try:
             n = int(self.headers.get("Content-Length", "0"))
             lim = 20_000_000 if self.path == "/api/llm/chat" else 1_000_000   # the chat carries the current output
@@ -11497,6 +11547,11 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #aicard textarea:focus{outline:none;border-color:#2b2b2e}
 #aicard #ai_send{flex:0 0 auto;width:42px;height:42px;padding:0;border-radius:50%;border:0;background:#2b2b2e;color:#fff;font-size:17px;box-shadow:none}
 #aicard #ai_send:hover{background:#1f8a7a}
+#aicard #ai_att{flex:0 0 auto;width:42px;height:42px;padding:0;border-radius:50%;background:#fff;color:#1d1d1f;border:1px solid #d0d5dd;font-size:17px;box-shadow:none}
+#aicard #ai_att:hover{border-color:#2b2b2e}
+#aicard .aimsg.bot>button{background:#fff;color:#1d1d1f;border:1.5px solid #2b2b2e;border-radius:10px;padding:7px 14px;font-size:14px;box-shadow:none}
+#aicard .aimsg.bot>button:hover{background:#2b2b2e;color:#fff}
+[data-theme=light] #aicard .aimsg.bot>button{border-color:#0b6fd0;color:#0b6fd0}[data-theme=light] #aicard .aimsg.bot>button:hover{background:#0b6fd0;color:#fff}
 #aicard .aiby{text-align:center;font-size:11.5px;color:#6b7280;padding:6px 0 2px}#aicard .aiby b{color:#1f8a7a;font-weight:600}
 #aifab{position:fixed;right:20px;bottom:20px;z-index:61;width:auto;height:52px;padding:0 20px;border-radius:26px;border:0;display:flex;flex-direction:row;align-items:center;gap:8px;background:linear-gradient(135deg,#1f8a7a,#2EE6C5);color:#04201c;box-shadow:0 6px 20px #0009;cursor:pointer;font-weight:700;font-size:15px;letter-spacing:.06em}
 #aifab:hover{filter:brightness(1.1);transform:translateY(-2px)}#aifab .fi{font-size:18px}
@@ -11671,9 +11726,9 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
       <div id="ai_cfgmsg" class="muted"></div><div id="ai_mlist"></div>
     </details>
     <div id="ai_log"></div>
-    <div id="ai_chips"><button onclick="aiAsk('explain')">Explain the current output</button><button onclick="aiAsk('chat')">Ask about the current output</button><button onclick="aiAsk('agent')">Ask &amp; run read-only checks</button><button onclick="aiClear()">Start a new conversation</button></div>
+    <div id="ai_chips"><button onclick="aiAsk('explain')">Explain the current output</button><button onclick="aiAsk('chat')">Ask about the current output</button><button onclick="aiAsk('agent')">Ask &amp; run read-only checks</button><button onclick="$('#ai_file').click()">Analyse a packet capture (.pcap)</button><button onclick="aiClear()">Start a new conversation</button></div>
     </div>
-    <div class="aifoot"><div class="aiinput"><textarea id="ai_q" rows="1" placeholder="Type your message…" title="Enter sends, Shift+Enter adds a new line"></textarea>
+    <div class="aifoot"><div class="aiinput"><button id="ai_att" onclick="$('#ai_file').click()" title="Attach a packet capture (.pcap / .pcapng) to analyse" aria-label="Attach a packet capture">📎</button><input type="file" id="ai_file" accept=".pcap,.pcapng,.cap" hidden onchange="aiPcap(this.files&&this.files[0]);this.value=''"><textarea id="ai_q" rows="1" placeholder="Type your message…" title="Enter sends, Shift+Enter adds a new line"></textarea>
       <button id="ai_send" onclick="aiSend()" title="Send" aria-label="Send">➤</button></div>
       <div class="aiby">Powered by <b>✦ <span id="ai_by">local LLM</span></b> · read-only</div></div>
   </div>
@@ -11754,7 +11809,7 @@ async function connect(){$("#cerr").textContent="Connecting…";
  devices.push(r);select(r.id);if(r.remembered)vaultLoad()}
 async function disconnect(id,ev){ev.stopPropagation();await api("/api/disconnect",{id});
  devices=devices.filter(d=>d.id!==id);if(cur===id)cur=devices.length?devices[0].id:null;renderAll()}
-function select(id){cur=id;renderAll()}
+function select(id){cur=id;try{sessionStorage.setItem("cur",id||"")}catch(e){}renderAll()}
 function dev(){return devices.find(d=>d.id===cur)}
 function renderAll(){renderDevs();renderChecks();renderSsh();renderCf();renderAcc();renderAppsec();renderIp();renderF5();const d=dev();
  $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:""}
@@ -12546,6 +12601,9 @@ function aiAdd(kind,text,r){const box=$("#ai_log"),d=mk("div","aimsg "+kind);
   if(r.warning)d.insertBefore(mk("div","aiwarn","⚠ "+r.warning),d.firstChild);
   if(r.sent){const lk=mk("span","aimeta lnk"," data sent to the model ("+r.sent.length.toLocaleString()+" characters)");lk.style.cursor="pointer";lk.style.color="var(--mint)";
    const pre=mk("pre",null,r.sent);pre.style.display="none";pre.style.maxHeight="300px";pre.style.overflow="auto";
+   lk.onclick=()=>{pre.style.display=pre.style.display?"":"none"};d.appendChild(lk);d.appendChild(pre)}
+  if(r.raw){const lk=mk("div","aimeta lnk","model reply (raw)");lk.style.cursor="pointer";
+   const pre=mk("pre",null,r.raw);pre.style.display="none";pre.style.maxHeight="300px";pre.style.overflow="auto";
    lk.onclick=()=>{pre.style.display=pre.style.display?"":"none"};d.appendChild(lk);d.appendChild(pre)}}
  else d.textContent=text;box.appendChild(aiRow(kind,d));aiScroll()}
 function aiScroll(){const sc=$("#aicard .aibody");sc.scrollTop=sc.scrollHeight}
@@ -12553,13 +12611,13 @@ function aiToggle(force){const c=$("#aicard"),open=force==null?c.hidden:!!force;
  try{localStorage.setItem("ai_open",open?"1":"")}catch(e){}if(open)setTimeout(()=>$("#ai_q").focus(),0)}
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#aicard").hidden)aiToggle(false)});
 function aiClear(){aiHist=[];$("#ai_log").innerHTML="";aiWelcome()}
-async function aiAsk(mode){const q=g("ai_q").trim();
+async function aiAsk(mode,qx,sx){const q=qx||g("ai_q").trim();
  if(mode!=="explain"&&!q)return aiAdd("err","Type a question first.");
  if(mode!=="agent"&&!last)return aiAdd("err","Run a check first: there is no output to talk about yet.");
  if(mode==="agent"&&!devices.length)return aiAdd("err","Connect a device first: the checks run on the connected devices.");
  if(!await aiSave(false))return;
  if(mode==="explain"){aiHist=[];$("#ai_log").innerHTML=""}
- const shown=q||"Explain the current output ("+(lastCtx.label||"output")+")";
+ const shown=sx||q||"Explain the current output ("+(lastCtx.label||"output")+")";
  aiAdd("user",shown+(mode==="agent"?"  · may run read-only checks on the connected devices":mode==="chat"?"  · answers from the output on screen only":""));
  $("#ai_q").value="";
  // a visible "waiting" bubble with a timer; the buttons stay disabled so the same question is not sent twice
@@ -12572,6 +12630,32 @@ async function aiAsk(mode){const q=g("ai_q").trim();
  finally{clearInterval(iv);wrow.remove();card.classList.remove("busy");btns.forEach(b=>b.disabled=false)}
  if(!r.ok)return aiAdd("err",r.error||"error");
  aiAdd("bot",r.answer,r);aiHist.push({role:"user",content:shown},{role:"assistant",content:r.answer})}
+// Packet capture: the file goes to the console (memory only), which sends back a summary; that summary becomes the
+// current output, so Explain / Ask / Ask & run checks all work on it. The model never gets the packets themselves.
+const PCAP_Q="Analyse this packet capture (a summary the console made from the capture file). Say: 1) what traffic it shows "+
+ "(main conversations and protocols); 2) every problem with its evidence: failed or reset TCP connections and which side sent the reset, "+
+ "retransmissions, slow handshakes, zero windows, DNS errors or unanswered queries, TLS alerts with the server name, ICMP unreachable / "+
+ "fragmentation needed, ARP conflicts; 3) the most likely cause; 4) what to check next (which side or device, and which console check). "+
+ "Quote IPs, ports, names and counts exactly as they appear in the data; if the capture looks healthy, say so.";
+async function aiPcap(f){if(!f)return;aiToggle(true);
+ const mb=(f.size/1048576).toFixed(1);
+ if(f.size>64*1048576)return aiAdd("err",f.name+" is "+mb+" MB; the limit is 64 MB. Cut it down first (Wireshark: File > Export Specified Packets, or editcap).");
+ aiAdd("user","📎 "+f.name+" ("+mb+" MB)");
+ const wait=mk("div","aimsg bot aiwait");wait.innerHTML='<span class="aidots"><i></i><i></i><i></i></span> reading the capture…';const wrow=aiRow("bot",wait);
+ $("#ai_log").appendChild(wrow);aiScroll();
+ let r;try{const res=await fetch("/api/pcap",{method:"POST",headers:{"X-Token":T,"X-Filename":encodeURIComponent(f.name),"Content-Type":"application/octet-stream"},body:f});r=await res.json()}
+ catch(e){r={ok:false,error:"upload failed: "+e.message}}
+ finally{wrow.remove()}
+ if(!r.ok)return aiAdd("err",r.error||"could not read the capture");
+ show(r,"Packet capture "+f.name);lastCtx.device="";aiHist=[];
+ const s=r.summary||[],d=mk("div","aimsg bot");
+ d.innerHTML=aiMd("Capture **"+f.name+"** read: "+(s[0]||"")+".\n\n"+(s.length>1?"Found:\n"+s.slice(1,7).map(x=>"- "+x).join("\n")+(s.length>7?"\n- and "+(s.length-7)+" more in the Output panel":""):"No obvious problems found.")+
+  "\n\nThe full summary is in the Output panel. Ask me anything about it, or:");
+ const b=mk("button",null,"Analyse this capture");b.style.marginTop="8px";b.onclick=()=>aiAsk("chat",PCAP_Q,"Analyse the capture "+f.name);
+ d.appendChild(b);$("#ai_log").appendChild(aiRow("bot",d));aiScroll()}
+document.addEventListener("dragover",e=>{if(e.target.closest&&e.target.closest("#aicard"))e.preventDefault()});
+document.addEventListener("drop",e=>{if(!(e.target.closest&&e.target.closest("#aicard")))return;e.preventDefault();
+ const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];if(f)aiPcap(f)});
 document.addEventListener("keydown",e=>{if(e.target&&e.target.id==="ai_q"&&e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();if(!$("#ai_send").disabled)aiSend()}});
 document.addEventListener("input",e=>{if(e.target&&e.target.id==="ai_q"){e.target.style.height="auto";e.target.style.height=Math.min(e.target.scrollHeight+2,140)+"px";e.target.style.overflowY=e.target.scrollHeight>138?"auto":"hidden"}});
 function barsNode(list){const grid=mk("div","dgrid tops");grid.style.marginBottom="16px";
@@ -12681,9 +12765,555 @@ async function hotCheck(){let v;try{v=await api("/api/version")}catch(e){return}
   else{hotBar("ok","Console updated at "+esc(v.time)+" (server side), already active.");clearTimeout(hotT);hotT=setTimeout(()=>{const b=$("#hotbar");if(b&&b.className==="ok")b.hidden=true},6000)}}
  hotV=Object.assign({},v,{page:v.page!==hotV.page&&v.gen!==hotV.gen?hotV.page:v.page})}
 setInterval(hotCheck,4000);hotCheck();
-api("/api/catalog").then(c=>catalog=c);loadProfiles();vaultLoad();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true)}catch(e){}
+// a reloaded page (e.g. after a live update) picks up the devices the console is still connected to
+async function devicesRestore(){let l;try{l=await api("/api/devices")}catch(e){return}if(!Array.isArray(l)||!l.length)return;
+ l.forEach(x=>{if(!devices.some(d=>d.id===x.id))devices.push(x)});
+ let pick=null;try{pick=sessionStorage.getItem("cur")}catch(e){}
+ if(!cur)cur=devices.some(d=>d.id===pick)?pick:devices[0].id;renderAll()}
+api("/api/catalog").then(c=>{catalog=c;devicesRestore()});loadProfiles();vaultLoad();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true)}catch(e){}
 </script></body></html>
 """
+
+
+# ---- Packet capture analysis: a .pcap / .pcapng uploaded in the AI assistant is read here (standard library only) ----
+# The capture is parsed in memory and never written to disk. What the model gets is the summary below (flows, TCP
+# problems, DNS, TLS server names / alerts, HTTP request lines without query strings, ICMP, ARP), never packet payloads.
+PCAP_MAX = 64 * 1024 * 1024
+PCAP_MAX_PKTS = 500000
+PCAP_LINKS = {0: "BSD loopback", 1: "Ethernet", 12: "raw IP", 14: "raw IP", 101: "raw IP", 108: "OpenBSD loopback",
+              113: "Linux cooked (SLL)", 228: "raw IPv4", 229: "raw IPv6", 276: "Linux cooked v2 (SLL2)"}
+PCAP_PROTO = {1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP", 47: "GRE", 50: "ESP", 51: "AH", 58: "ICMPv6", 89: "OSPF",
+              112: "VRRP", 132: "SCTP"}
+TLS_ALERTS = {0: "close_notify", 10: "unexpected_message", 20: "bad_record_mac", 22: "record_overflow",
+              40: "handshake_failure", 42: "bad_certificate", 43: "unsupported_certificate", 44: "certificate_revoked",
+              45: "certificate_expired", 46: "certificate_unknown", 47: "illegal_parameter", 48: "unknown_ca",
+              49: "access_denied", 50: "decode_error", 51: "decrypt_error", 70: "protocol_version",
+              71: "insufficient_security", 80: "internal_error", 86: "inappropriate_fallback", 90: "user_canceled",
+              109: "missing_extension", 110: "unsupported_extension", 112: "unrecognized_name",
+              113: "bad_certificate_status_response", 116: "certificate_required", 120: "no_application_protocol"}
+TLS_VER = {0x0300: "SSL 3.0", 0x0301: "TLS 1.0", 0x0302: "TLS 1.1", 0x0303: "TLS 1.2", 0x0304: "TLS 1.3"}
+DNS_TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 65: "HTTPS",
+             255: "ANY"}
+DNS_RCODES = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
+ICMP4 = {(3, 0): "net unreachable", (3, 1): "host unreachable", (3, 2): "protocol unreachable", (3, 3): "port unreachable",
+         (3, 4): "fragmentation needed", (3, 9): "net administratively prohibited",
+         (3, 10): "host administratively prohibited", (3, 13): "communication administratively prohibited",
+         (11, 0): "TTL exceeded in transit", (11, 1): "fragment reassembly time exceeded", (5, 0): "redirect (net)",
+         (5, 1): "redirect (host)", (0, 0): "echo reply", (8, 0): "echo request"}
+ICMP6 = {1: "destination unreachable", 2: "packet too big", 3: "time exceeded", 4: "parameter problem",
+         128: "echo request", 129: "echo reply", 133: "router solicitation", 134: "router advertisement",
+         135: "neighbor solicitation", 136: "neighbor advertisement"}
+HTTP_METHODS = (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ", b"OPTIONS ", b"PATCH ", b"CONNECT ")
+
+
+def pcap_frames(data, info):
+    """Yield (time, linktype, frame) from a classic pcap or a pcapng file. Sets info['format'] / info['truncated']."""
+    magic = bytes(data[:4])
+    if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+        e = "<" if magic[0] in (0xd4, 0x4d) else ">"
+        div = 1e9 if magic in (b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d") else 1e6
+        if len(data) < 24:
+            raise ValueError("the file is too short to be a capture")
+        info["format"] = "pcap"
+        link = struct.unpack(e + "I", data[20:24])[0] & 0x0FFFFFF
+        off, n = 24, len(data)
+        while off + 16 <= n:
+            s, frac, cap, _orig = struct.unpack(e + "IIII", data[off:off + 16])
+            off += 16
+            if off + cap > n or cap > 0x40000:
+                info["truncated"] = True
+                return
+            yield s + frac / div, link, data[off:off + cap]
+            off += cap
+        if off != n:
+            info["truncated"] = True
+        return
+    if magic == b"\x0a\x0d\x0d\x0a":
+        info["format"] = "pcapng"
+        off, n, e, ifs, last_t = 0, len(data), "<", [], 0.0
+        while off + 12 <= n:
+            if bytes(data[off:off + 4]) == b"\x0a\x0d\x0d\x0a":   # section header: byte order, new interface list
+                e = "<" if bytes(data[off + 8:off + 12]) == b"\x4d\x3c\x2b\x1a" else ">"
+                ifs = []
+            btype, blen = struct.unpack(e + "II", data[off:off + 8])
+            if blen < 12 or off + blen > n:
+                info["truncated"] = True
+                return
+            body = data[off + 8:off + blen - 4]
+            if btype == 1 and len(body) >= 8:   # interface description: link type, time resolution option
+                link, res, p = struct.unpack(e + "H", body[0:2])[0], 1e-6, 8
+                while p + 4 <= len(body):
+                    code, ln = struct.unpack(e + "HH", body[p:p + 4])
+                    if code == 0:
+                        break
+                    if code == 9 and ln >= 1:
+                        v = body[p + 4]
+                        res = 2.0 ** -(v & 0x7F) if v & 0x80 else 10.0 ** -v
+                    p += 4 + ((ln + 3) & ~3)
+                ifs.append((link, res))
+            elif btype == 6 and len(body) >= 20:   # enhanced packet
+                iid, hi, lo, cap, _orig = struct.unpack(e + "IIIII", body[:20])
+                if iid < len(ifs):
+                    last_t = ((hi << 32) | lo) * ifs[iid][1]
+                    yield last_t, ifs[iid][0], body[20:20 + cap]
+            elif btype == 3 and len(body) >= 4 and ifs:   # simple packet (no time stamp)
+                yield last_t, ifs[0][0], body[4:]
+            elif btype == 2 and len(body) >= 20:   # obsolete packet block
+                iid, _dr, hi, lo, cap, _orig = struct.unpack(e + "HHIIII", body[:20])
+                if iid < len(ifs):
+                    last_t = ((hi << 32) | lo) * ifs[iid][1]
+                    yield last_t, ifs[iid][0], body[20:20 + cap]
+            off += blen
+        return
+    raise ValueError("not a pcap or pcapng file (unknown file header); save the capture as .pcap or .pcapng")
+
+
+def pcap_l3(link, f):
+    """(ethertype, layer-3 bytes, source MAC) for the link types tcpdump / Wireshark / F5 / PAN / FortiGate write."""
+    if link == 1:
+        if len(f) < 14:
+            return None, b"", ""
+        et, p = (f[12] << 8) | f[13], 14
+        while et in (0x8100, 0x88A8, 0x9100) and len(f) >= p + 4:
+            et, p = (f[p + 2] << 8) | f[p + 3], p + 4
+        return et, f[p:], ":".join("%02x" % b for b in f[6:12])
+    if link in (12, 14, 101):
+        v = f[0] >> 4 if f else 0
+        return (0x0800 if v == 4 else 0x86DD if v == 6 else None), f, ""
+    if link == 228:
+        return 0x0800, f, ""
+    if link == 229:
+        return 0x86DD, f, ""
+    if link == 113 and len(f) >= 16:
+        return (f[14] << 8) | f[15], f[16:], ""
+    if link == 276 and len(f) >= 20:
+        return (f[0] << 8) | f[1], f[20:], ""
+    if link in (0, 108) and len(f) >= 4:
+        fam = f[0] or f[3]
+        return (0x0800 if fam == 2 else 0x86DD if fam in (10, 24, 28, 30) else None), f[4:], ""
+    return None, b"", ""
+
+
+def pcap_ip(et, b):
+    """(src, dst, proto, layer-4 bytes, first fragment?) or None."""
+    if et == 0x0800 and len(b) >= 20 and b[0] >> 4 == 4:
+        ihl, tot = (b[0] & 15) * 4, (b[2] << 8) | b[3]
+        end = tot if ihl <= tot <= len(b) else len(b)
+        first = ((b[6] & 0x1F) << 8 | b[7]) == 0
+        return socket.inet_ntoa(bytes(b[12:16])), socket.inet_ntoa(bytes(b[16:20])), b[9], b[ihl:end], first
+    if et == 0x86DD and len(b) >= 40 and b[0] >> 4 == 6:
+        nh, p, first = b[6], 40, True
+        end = min(len(b), 40 + ((b[4] << 8) | b[5])) if (b[4] or b[5]) else len(b)
+        while nh in (0, 43, 44, 60) and p + 8 <= end:
+            if nh == 44:
+                first = ((b[p + 2] << 8 | b[p + 3]) >> 3) == 0
+                nh, p = b[p], p + 8
+            else:
+                nh, p = b[p], p + (b[p + 1] + 1) * 8
+        return (socket.inet_ntop(socket.AF_INET6, bytes(b[8:24])), socket.inet_ntop(socket.AF_INET6, bytes(b[24:40])),
+                nh, b[p:end], first)
+    return None
+
+
+def dns_name(m, p, depth=0):
+    labels, jumped, end = [], False, p
+    while p < len(m) and depth < 20:
+        ln = m[p]
+        if ln == 0:
+            p += 1
+            break
+        if ln & 0xC0 == 0xC0:
+            if p + 1 >= len(m):
+                break
+            if not jumped:
+                end = p + 2
+            jumped, depth, p = True, depth + 1, ((ln & 0x3F) << 8) | m[p + 1]
+            continue
+        labels.append(bytes(m[p + 1:p + 1 + ln]).decode("ascii", "replace"))
+        p += 1 + ln
+    return ".".join(labels) or ".", (end if jumped else p)
+
+
+def dns_parse(m):
+    """(id, is response, rcode, name, qtype, answers) of a DNS message, or None."""
+    if len(m) < 12:
+        return None
+    tid, fl, qd, an = struct.unpack(">HHHH", m[:8])
+    if qd < 1:
+        return None
+    name, p = dns_name(m, 12)
+    if p + 4 > len(m):
+        return None
+    qtype = (m[p] << 8) | m[p + 1]
+    p += 4
+    answers = []
+    for _ in range(min(an, 20)):
+        _n, p = dns_name(m, p)
+        if p + 10 > len(m):
+            break
+        typ, _cl, _ttl, rdl = struct.unpack(">HHIH", m[p:p + 10])
+        rd = m[p + 10:p + 10 + rdl]
+        if typ == 1 and rdl == 4:
+            answers.append(socket.inet_ntoa(bytes(rd)))
+        elif typ == 28 and rdl == 16:
+            answers.append(socket.inet_ntop(socket.AF_INET6, bytes(rd)))
+        elif typ == 5:
+            answers.append("CNAME " + dns_name(m, p + 10)[0])
+        p += 10 + rdl
+    return tid, bool(fl & 0x8000), fl & 15, name, DNS_TYPES.get(qtype, str(qtype)), answers
+
+
+def tls_hello(p):
+    """(kind, sni / selected version) from the first TLS handshake record of a TCP segment."""
+    try:
+        if len(p) < 9 or p[0] != 22 or p[1] != 3:
+            return None
+        ht, q = p[5], 9
+        if ht not in (1, 2):
+            return None
+        ver = (p[q] << 8) | p[q + 1]
+        q += 34
+        q += 1 + p[q]                          # session id
+        if ht == 1:
+            q += 2 + ((p[q] << 8) | p[q + 1])  # cipher suites
+            q += 1 + p[q]                      # compression methods
+        else:
+            q += 3                             # chosen cipher + compression
+        ext_end = q + 2 + ((p[q] << 8) | p[q + 1]) if q + 2 <= len(p) else q
+        q += 2
+        sni, sel = "", None
+        while q + 4 <= min(ext_end, len(p)):
+            et, ln = (p[q] << 8) | p[q + 1], (p[q + 2] << 8) | p[q + 3]
+            d = p[q + 4:q + 4 + ln]
+            if et == 0 and ht == 1 and len(d) > 5:
+                sni = bytes(d[5:5 + ((d[3] << 8) | d[4])]).decode("ascii", "replace")
+            elif et == 43 and ht == 2 and len(d) >= 2:
+                sel = (d[0] << 8) | d[1]
+            q += 4 + ln
+        return ("client_hello", sni) if ht == 1 else ("server_hello", TLS_VER.get(sel or ver, hex(sel or ver)))
+    except IndexError:
+        return None
+
+
+def pcap_analyze(data, fname):
+    t_start = time.time()
+    info = {"format": "", "truncated": False}
+    pk = by = l2 = frags = 0
+    protos, talk = collections.Counter(), {}
+    flows, dns_q, dns_rows, tls_rows, http_rows, http_codes = {}, {}, [], {}, collections.Counter(), collections.Counter()
+    http_tx, first_t = [], []
+    rel_t = lambda t: round(t - first_t[0], 3) if first_t else 0.0   # noqa: E731
+    icmp, arp_map, arp_n, links = collections.Counter(), collections.defaultdict(set), collections.Counter(), collections.Counter()
+    t0 = t1 = None
+    for ts, link, f in pcap_frames(data, info):
+        if pk >= PCAP_MAX_PKTS:
+            info["cut"] = True
+            break
+        pk += 1
+        by += len(f)
+        links[link] += 1
+        t0 = ts if t0 is None else min(t0, ts)
+        if not first_t:
+            first_t.append(ts)
+        t1 = ts if t1 is None else max(t1, ts)
+        et, b, mac = pcap_l3(link, f)
+        if et == 0x0806 and len(b) >= 28:
+            op, sip = (b[6] << 8) | b[7], socket.inet_ntoa(bytes(b[14:18]))
+            arp_n["request" if op == 1 else "reply" if op == 2 else "other"] += 1
+            if op == 2 or (op == 1 and bytes(b[14:18]) == bytes(b[24:28])):
+                arp_map[sip].add(":".join("%02x" % x for x in b[8:14]))
+            protos["ARP"] += 1
+            continue
+        ip = pcap_ip(et, b) if et else None
+        if not ip:
+            l2 += 1
+            protos["other L2" if et is None else "802.3 / LLC (non-IP)" if et < 0x0600 else "ethertype 0x%04x" % et] += 1
+            continue
+        src, dst, proto, l4, first = ip
+        pname = PCAP_PROTO.get(proto, "IP proto %d" % proto)
+        protos[pname] += 1
+        for h in (src, dst):
+            t = talk.setdefault(h, [0, 0])
+            t[0] += 1
+            t[1] += len(f)
+        if not first:
+            frags += 1
+            continue
+        sp = dp = 0
+        if proto in (6, 17) and len(l4) >= 8:
+            sp, dp = (l4[0] << 8) | l4[1], (l4[2] << 8) | l4[3]
+        elif proto in (1, 58) and len(l4) >= 4:
+            typ, code = l4[0], l4[1]
+            if proto == 1:
+                what = ICMP4.get((typ, code), "type %d code %d" % (typ, code))
+                if typ == 3 and code == 4 and len(l4) >= 8:
+                    what += " (next-hop MTU %d)" % ((l4[6] << 8) | l4[7])
+                inner = pcap_ip(0x0800, l4[8:]) if typ in (3, 11, 5) else None
+            else:
+                what = ICMP6.get(typ, "type %d" % typ)
+                if typ == 2 and len(l4) >= 8:
+                    what += " (MTU %d)" % struct.unpack(">I", bytes(l4[4:8]))[0]
+                inner = pcap_ip(0x86DD, l4[8:]) if typ in (1, 2, 3) else None
+            about = ""
+            if inner:
+                ip_ = inner[3]
+                about = "%s -> %s%s %s" % (inner[0], inner[1], (":%d" % ((ip_[2] << 8) | ip_[3]))
+                                            if inner[2] in (6, 17) and len(ip_) >= 4 else "", PCAP_PROTO.get(inner[2], ""))
+            icmp[(("ICMPv6 " if proto == 58 else "") + what, src, dst, about.strip())] += 1
+        key = (proto,) + ((src, sp, dst, dp) if (src, sp) <= (dst, dp) else (dst, dp, src, sp))
+        fl = flows.get(key)
+        if fl is None:
+            # no handshake seen yet: assume the lower port is the server (a SYN below corrects it)
+            cs = ((src, sp), (dst, dp)) if not (sp and dp) or sp >= dp else ((dst, dp), (src, sp))
+            fl = flows[key] = {"proto": pname, "c": cs[0], "s": cs[1], "pk": 0, "by": 0, "t0": ts, "t1": ts,
+                               "syn": 0, "synack": 0, "syn_t": None, "hs": None, "rst": set(), "fin": 0, "retx": 0,
+                               "zwin": 0, "seen": {}, "data": 0}
+        fl["pk"] += 1
+        fl["by"] += len(f)
+        fl["t1"] = max(fl["t1"], ts)
+        if proto == 6 and len(l4) >= 20:
+            flags, off = l4[13], (l4[12] >> 4) * 4
+            seq, win, pay = struct.unpack(">I", bytes(l4[4:8]))[0], (l4[14] << 8) | l4[15], l4[off:]
+            if flags & 0x02 and not flags & 0x10:   # SYN: the sender is the client
+                fl["syn"] += 1
+                fl["c"], fl["s"] = (src, sp), (dst, dp)
+                fl["syn_t"] = fl["syn_t"] or ts
+            elif flags & 0x12 == 0x12:
+                fl["synack"] += 1
+                fl["c"], fl["s"] = (dst, dp), (src, sp)
+                if fl["syn_t"] is not None and fl["hs"] is None:
+                    fl["hs"] = (ts - fl["syn_t"]) * 1000
+            if flags & 0x04:
+                fl["rst"].add(src)
+            if flags & 0x01:
+                fl["fin"] += 1
+            if win == 0 and not flags & 0x04:
+                fl["zwin"] += 1
+            if pay:
+                fl["data"] += 1
+                seen = fl["seen"].setdefault(src, set())
+                k = (seq, len(pay))
+                rx = k in seen
+                if rx:
+                    fl["retx"] += 1
+                elif len(seen) < 50000:
+                    seen.add(k)
+                if pay[:1] == b"\x16":
+                    h = tls_hello(pay)
+                    if h:
+                        tk = (fl["c"], fl["s"])
+                        row = tls_rows.setdefault(tk, {"client": fl["c"][0], "server": "%s:%d" % fl["s"], "sni": "",
+                                                       "version": "", "alert": ""})
+                        if h[0] == "client_hello":
+                            row["sni"] = row["sni"] or h[1]
+                            row.setdefault("_ch", ts)
+                        else:
+                            row["version"] = h[1]
+                            if "_ch" in row and "server_hello_ms" not in row:
+                                row["server_hello_ms"] = round((ts - row["_ch"]) * 1000, 1)
+                elif pay[:1] == b"\x15" and len(pay) == 7 and pay[1] == 3:   # plain-text alert (not encrypted)
+                    tk = (fl["c"], fl["s"])
+                    row = tls_rows.setdefault(tk, {"client": fl["c"][0], "server": "%s:%d" % fl["s"], "sni": "",
+                                                   "version": "", "alert": ""})
+                    row["alert"] = "%s %s from %s" % ("fatal" if pay[5] == 2 else "warning",
+                                                      TLS_ALERTS.get(pay[6], str(pay[6])), src)
+                elif bytes(pay[:8]).startswith(HTTP_METHODS):
+                    head = bytes(pay[:2048]).split(b"\r\n")
+                    parts = head[0].decode("latin-1", "replace").split(" ")
+                    host = next((x[5:].strip().decode("latin-1", "replace") for x in head[1:]
+                                 if x[:5].lower() == b"host:"), "")
+                    path = parts[1].split("?")[0] + ("?…" if len(parts) > 1 and "?" in parts[1] else "") if len(parts) > 1 else ""
+                    http_rows[(src, "%s:%d" % (dst, dp), parts[0], host, path[:200])] += 1
+                    if not rx:   # pair with the next response on this connection (HTTP/1.x answers in order)
+                        fl.setdefault("http", []).append((ts, src, "%s:%d" % (dst, dp), host, parts[0], path[:200]))
+                elif pay[:7] == b"HTTP/1." and len(pay) >= 12:
+                    code = bytes(pay[9:12]).decode("latin-1", "replace")
+                    http_codes[code] += 1
+                    if not rx and not code.startswith("1") and fl.get("http"):
+                        t_req, cli, srv_, host, meth, path = fl["http"].pop(0)
+                        http_tx.append({"time_s": rel_t(t_req), "client": cli, "server": srv_, "host": host,
+                                        "method": meth, "path": path, "status": code,
+                                        "response_ms": round((ts - t_req) * 1000, 1)})
+        elif proto == 17 and len(l4) >= 8 and 53 in (sp, dp):
+            d = dns_parse(l4[8:])
+            if d:
+                tid, resp, rc, name, qt, ans = d
+                if not resp:
+                    dns_q[(src, sp, tid, name)] = (ts, dst, qt)
+                else:
+                    q = dns_q.pop((dst, dp, tid, name), None)
+                    dns_rows.append({"client": dst, "server": src, "name": name, "type": qt,
+                                     "result": DNS_RCODES.get(rc, "rcode %d" % rc),
+                                     "answers": ", ".join(ans[:6]) + (" …" if len(ans) > 6 else ""),
+                                     "ms": round((ts - q[0]) * 1000, 1) if q else None})
+    if not pk:
+        raise ValueError("the capture holds no packets" + (" (the file is cut short)" if info["truncated"] else ""))
+    dur = max(0.0, (t1 or 0) - (t0 or 0))
+    rel = lambda t: round(t - t0, 3)   # noqa: E731
+    findings, kind = [], "ok"
+
+    def bad(text, k="bad"):
+        nonlocal kind
+        findings.append(text)
+        kind = "bad" if k == "bad" or kind == "bad" else "warn"
+
+    tcp = [f for f in flows.values() if f["proto"] == "TCP"]
+    noreply = collections.Counter("%s:%d" % f["s"] for f in tcp if f["syn"] and not f["synack"] and not f["rst"])
+    refused = collections.Counter("%s:%d" % f["s"] for f in tcp if f["syn"] and not f["synack"] and f["rst"])
+    if noreply:
+        bad("%d TCP connection attempt(s) got no reply (SYN only): %s" % (sum(noreply.values()), ", ".join(
+            "%s (%d)" % kv for kv in noreply.most_common(5))))
+    if refused:
+        bad("%d TCP connection attempt(s) were refused with a reset: %s" % (sum(refused.values()), ", ".join(
+            "%s (%d)" % kv for kv in refused.most_common(5))))
+    resets = [f for f in tcp if f["rst"] and f["synack"]]
+    if resets:
+        by_who = collections.Counter(h for f in resets for h in f["rst"])
+        bad("%d established TCP connection(s) were reset, reset sent by: %s" % (len(resets), ", ".join(
+            "%s (%d)" % kv for kv in by_who.most_common(5))))
+    mid = [f for f in tcp if f["rst"] and not f["syn"] and not f["synack"]]
+    if mid:
+        by_who = collections.Counter(h for f in mid for h in f["rst"])
+        bad("%d TCP reset(s) on connections whose start is not in the capture, sent by: %s" % (len(mid), ", ".join(
+            "%s (%d)" % kv for kv in by_who.most_common(5))), "warn")
+    data_segs, retx = sum(f["data"] for f in tcp), sum(f["retx"] for f in tcp)
+    if retx:
+        worst = max(tcp, key=lambda f: f["retx"])
+        pct = 100.0 * retx / max(1, data_segs)
+        bad("%d TCP retransmission(s) (%.1f%% of data segments); most on %s:%d -> %s:%d (%d)" % (
+            retx, pct, worst["c"][0], worst["c"][1], worst["s"][0], worst["s"][1], worst["retx"]),
+            "bad" if pct >= 3 else "warn")
+    zw = [f for f in tcp if f["zwin"]]
+    if zw:
+        bad("Zero-window (receiver full) seen on %d connection(s)" % len(zw), "warn")
+    slow = [f for f in tcp if f["hs"] is not None and f["hs"] > 200]
+    if slow:
+        f = max(slow, key=lambda x: x["hs"])
+        bad("Slow TCP handshake on %d connection(s); slowest %.0f ms to %s:%d" % (len(slow), f["hs"], *f["s"]), "warn")
+    dfail = [r for r in dns_rows if r["result"] != "NOERROR"]
+    if dfail:
+        c = collections.Counter("%s %s" % (r["result"], r["name"]) for r in dfail)
+        bad("DNS errors: %s" % ", ".join("%s (%d)" % kv for kv in c.most_common(6)))
+    if dns_q:
+        bad("%d DNS quer(y/ies) got no answer in the capture: %s" % (len(dns_q), ", ".join(
+            sorted({k[3] for k in dns_q})[:5])), "warn")
+    alerts = [r for r in tls_rows.values() if r["alert"] and "close_notify" not in r["alert"]]
+    if alerts:
+        bad("TLS alerts: %s" % "; ".join("%s -> %s (%s)" % (r["client"], r["server"], r["alert"]) for r in alerts[:5]))
+    for (what, s, d, about), n in icmp.most_common():
+        if "echo" not in what and "neighbor" not in what and "router" not in what:
+            bad("ICMP %s from %s to %s%s (%d)" % (what, s, d, (" about " + about) if about else "", n), "warn")
+            if len(findings) > 25:
+                break
+    if http_tx:
+        worst = max(http_tx, key=lambda x: x["response_ms"])
+        if worst["response_ms"] >= 1000:
+            bad("Slowest HTTP response %.0f ms: %s %s%s (%s, status %s)" % (worst["response_ms"], worst["method"],
+                worst["host"] or worst["server"], worst["path"], worst["server"], worst["status"]), "warn")
+        e5 = [x for x in http_tx if x["status"].startswith("5")]
+        if e5:
+            c = collections.Counter("%s %s" % (x["status"], x["host"] or x["server"]) for x in e5)
+            bad("HTTP server errors: %s" % ", ".join("%s (%d)" % kv for kv in c.most_common(5)), "warn")
+    http_open = [r for f in flows.values() for r in f.get("http") or []]
+    if http_open:
+        c = collections.Counter(r[3] or r[2] for r in http_open)
+        bad("%d HTTP request(s) got no response in the capture: %s" % (len(http_open), ", ".join(
+            "%s (%d)" % kv for kv in c.most_common(5))), "warn")
+    for ipa, macs in arp_map.items():
+        if len(macs) > 1:
+            bad("ARP: %s is claimed by %d MAC addresses (%s): IP conflict or failover" % (ipa, len(macs), ", ".join(sorted(macs))))
+    if info["truncated"]:
+        bad("The capture file is cut short (last packet incomplete); results cover what could be read", "warn")
+    if info.get("cut"):
+        bad("Only the first %d packets were analysed" % PCAP_MAX_PKTS, "warn")
+
+    def state(f):
+        if f["proto"] != "TCP":
+            return ""
+        if f["syn"] and not f["synack"]:
+            return "refused (RST)" if f["rst"] else "no reply to SYN"
+        if f["rst"]:
+            return "reset by " + ", ".join(sorted(f["rst"]))
+        if f["fin"]:
+            return "closed (FIN)"
+        return "established" if f["synack"] else "mid-stream (handshake not in capture)"
+
+    def frow(f):
+        return {"proto": f["proto"], "client": f["c"][0] + (":%d" % f["c"][1] if f["c"][1] else ""),
+                "server": f["s"][0] + (":%d" % f["s"][1] if f["s"][1] else ""), "packets": f["pk"], "bytes": f["by"],
+                "start_s": rel(f["t0"]), "duration_s": round(f["t1"] - f["t0"], 3), "state": state(f),
+                "handshake_ms": round(f["hs"], 1) if f["hs"] is not None else "", "retransmissions": f["retx"] or ""}
+
+    problem = [f for f in flows.values() if f["proto"] == "TCP" and (f["rst"] or (f["syn"] and not f["synack"]) or f["retx"] or f["zwin"])]
+    problem.sort(key=lambda f: (-(f["syn"] and not f["synack"]), -len(f["rst"]), -f["retx"]))
+    top = sorted(flows.values(), key=lambda f: -f["by"])[:30]
+    when = lambda t: datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] if t else ""   # noqa: E731
+    data_out = collections.OrderedDict()
+    data_out["capture"] = collections.OrderedDict([
+        ("file", fname), ("format", info["format"]), ("link_type", ", ".join(PCAP_LINKS.get(k, "type %d" % k) for k in links)),
+        ("packets", pk), ("bytes", by), ("first_packet", when(t0)), ("last_packet", when(t1)),
+        ("duration_s", round(dur, 3)), ("conversations", len(flows)), ("ip_fragments", frags),
+        ("protocols", ", ".join("%s %d" % kv for kv in protos.most_common()))])
+    if problem:
+        data_out["problem_connections"] = [frow(f) for f in problem[:40]]
+    data_out["top_conversations"] = [frow(f) for f in top]
+    data_out["top_talkers"] = [{"ip": h, "packets": v[0], "bytes": v[1]} for h, v in
+                               sorted(talk.items(), key=lambda kv: -kv[1][1])[:15]]
+    if dns_rows or dns_q:
+        dns_rows.sort(key=lambda r: (r["result"] == "NOERROR", -(r["ms"] or 0)))
+        data_out["dns"] = dns_rows[:60] + [{"client": k[0], "server": v[1], "name": k[3], "type": v[2],
+                                            "result": "no answer", "answers": "", "ms": None}
+                                           for k, v in list(dns_q.items())[:20]]
+    if tls_rows:
+        for r in tls_rows.values():
+            r.pop("_ch", None)
+            r.setdefault("server_hello_ms", "")
+        data_out["tls"] = sorted(tls_rows.values(), key=lambda r: (not r["alert"], r["server"]))[:50]
+    if http_rows:
+        data_out["http_requests"] = [{"client": k[0], "server": k[1], "method": k[2], "host": k[3], "path": k[4], "count": n}
+                                     for k, n in http_rows.most_common(40)]
+    if http_tx or http_open:
+        hosts = collections.OrderedDict()
+        for x in http_tx:
+            hosts.setdefault(x["host"] or x["server"], []).append(x)
+        for r in http_open:
+            hosts.setdefault(r[3] or r[2], [])
+        rows = []
+        for h, xs in hosts.items():
+            ms = [x["response_ms"] for x in xs]
+            slow = max(xs, key=lambda x: x["response_ms"]) if xs else None
+            rows.append({"host": h, "requests": len(xs) + sum(1 for r in http_open if (r[3] or r[2]) == h),
+                         "answered": len(xs), "avg_ms": round(sum(ms) / len(ms), 1) if ms else "",
+                         "max_ms": max(ms) if ms else "",
+                         "slowest": "%s %s -> %s at +%ss" % (slow["method"], slow["path"], slow["status"], slow["time_s"])
+                         if slow else "",
+                         "errors_4xx_5xx": sum(1 for x in xs if x["status"][:1] in ("4", "5")) or ""})
+        rows.sort(key=lambda r: -(r["max_ms"] or 0))
+        data_out["http_response_times_by_host"] = rows[:50]
+        if http_tx:
+            data_out["http_slowest_responses"] = sorted(http_tx, key=lambda x: -x["response_ms"])[:25]
+    if http_codes:
+        data_out["http_status_codes"] = dict(http_codes.most_common())
+    if icmp:
+        data_out["icmp"] = [{"message": k[0], "from": k[1], "to": k[2], "about": k[3], "count": n}
+                            for k, n in icmp.most_common(30)]
+    if arp_n:
+        data_out["arp"] = [{"ip": ipa, "mac": ", ".join(sorted(m)), "conflict": "yes" if len(m) > 1 else ""}
+                           for ipa, m in sorted(arp_map.items(), key=lambda kv: -len(kv[1]))[:30]] or \
+                          [{"requests": arp_n["request"], "replies": arp_n["reply"]}]
+    summary = ["%d packets, %d conversations over %.1f s (%s)" % (pk, len(flows), dur, info["format"])] + findings
+    return {"ok": True, "status": 200, "ms": int((time.time() - t_start) * 1000),
+            "verdict": {"kind": kind, "label": "Capture: %s" % ("problems found" if kind == "bad" else
+                                                                  "worth a look" if kind == "warn" else "no obvious problems")},
+            "summary": summary, "request": "packet capture %s" % fname, "data": data_out}
+
+
+def do_pcap_upload(raw, fname):
+    fname = re.sub(r"[^\w.\- ()]", "_", urllib.parse.unquote(fname or "capture"))[:120] or "capture"
+    try:
+        return pcap_analyze(bytes(raw), fname)
+    except (ValueError, struct.error) as e:
+        return {"ok": False, "error": "could not read %s: %s" % (fname, e)}
 
 
 # ---- Live update: edits to this file are picked up while the console runs (no restart, nothing to re-enter) ----
@@ -12694,6 +13324,19 @@ api("/api/catalog").then(c=>catalog=c);loadProfiles();vaultLoad();aiInit();try{i
 LIVE_STATE = ("TOKEN", "SESSIONS", "AUDIT", "LOCK", "TERMS", "TERM_LOCK", "VAULT", "VAULT_LOCK", "F5_HOST_CACHE",
               "PAN_VRS", "CAPTURE_BUSY", "CF_EDGE", "WHOIS_BOOT", "LLM_CFG", "HOT")
 HOT = {"gen": 0, "page": "", "error": "", "time": ""}
+
+
+def devices_public():
+    with LOCK:
+        items = list(SESSIONS.items())
+    out = []
+    for sid, s in items:
+        d = {"ok": True, "id": sid, "name": s.get("name") or s.get("host"), "vendor": s.get("vendor"),
+             "host": s.get("host"), "user": s.get("user", "")}
+        if s.get("vendor") == "cloudflare":
+            d.update(zones=[z.get("name") for z in s.get("zones") or []], accounts=len(s.get("accounts") or {}))
+        out.append(d)
+    return out
 
 
 def hot_page_id(page):

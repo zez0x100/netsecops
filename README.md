@@ -159,6 +159,18 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
     log by its `CF-Ray` header, so one lookup shows whether Cloudflare or the F5 blocked it
   - The raw box accepts `/client/v4/...` GET paths or GraphQL queries (mutations are refused)
 
+- **Packet capture analysis (AI assistant)**
+  - 📎 in the assistant (or drag a file onto it): `.pcap` / `.pcapng` up to 64 MB, read by the console itself
+    (standard library only, no Wireshark needed; Ethernet, VLAN, Linux cooked, raw IP, loopback; first 500,000 packets)
+  - Summary in the Output panel: conversations, unanswered / refused / reset TCP connections and who sent the reset,
+    retransmissions, slow handshakes, zero windows, DNS errors and unanswered queries, TLS server names and alerts,
+    HTTP request lines and response times per hostname (request start to first response byte; slowest requests,
+    4xx/5xx, unanswered), TLS ClientHello-to-ServerHello time, ICMP unreachable / fragmentation needed, ARP conflicts,
+    top talkers
+  - "Analyse this capture" asks the model about that summary; follow-up questions and "Ask & run read-only checks"
+    work on it too. The model gets the summary only, never packet payloads; URL query strings and HTTP headers other
+    than Host are not included. The file is kept in memory only.
+
 - **Look**
   - Light theme by default, dark theme one click away (◐ in the header; the choice is remembered in the browser)
   - Optional organisation logo in the header: put `brand_logo.svg` or `brand_logo.png` (max 1 MB) next to the script.
