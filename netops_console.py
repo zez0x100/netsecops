@@ -114,6 +114,9 @@ CATALOG = {
         {"id": "poolall", "group": "LTM", "label": "All pool stats", "path": "/mgmt/tm/ltm/pool/stats"},
         {"id": "poolmem", "group": "LTM", "label": "Pool member stats", "path": "/mgmt/tm/ltm/pool/{pool}/members/stats",
          "params": [P("pool", "Pool", "~Common~my_pool")]},
+        {"id": "conns", "group": "LTM", "label": "Live connections by client IP (which pool member a client is on: "
+         "tmsh show sys connection)", "handler": "f5_conns",
+         "params": [P("ip", "Client IP", "203.0.113.5"), P("vip", "Virtual server IP (optional)", "10.1.1.10", required=False)]},
     ],
     "paloalto": [
         {"id": "sysinfo", "group": "Device", "label": "System info", "cmd": "<show><system><info/></system></show>"},
@@ -731,7 +734,8 @@ def term_close_all():
         t["pty"].close()
 
 
-atexit.register(term_close_all)
+if not globals().get("_HOT_RELOADING"):
+    atexit.register(term_close_all)
 
 
 # ---- Saved logins: credentials encrypted with Windows DPAPI (current user) + a passphrase-derived entropy ---------
@@ -1226,6 +1230,8 @@ def do_disconnect(b):
 # IP lookup (all vendors) + F5 active tools (log search, packet capture)
 # ----------------------------------------------------------------------------
 CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
+BRAND_DIR = os.path.dirname(os.path.abspath(__file__))
+BRAND_FILES = (("brand_logo.svg", "image/svg+xml"), ("brand_logo.png", "image/png"))
 F5_LOGS = ("ltm", "audit", "apm", "gtm", "tmm", "asm")
 IFACE_RE = re.compile(r'^(?!-)[0-9A-Za-z_.:\-]{1,32}$')   # no leading '-': it would be read as a tcpdump option
 FILE_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,120}\.(pcap|pms|ucs|xml|conf)$')
@@ -3772,10 +3778,86 @@ def pan_app_traffic(sess, v):
             "verdict": {"label": label + " · " + period.upper(), "kind": "info" if rows else "warn"}}
 
 
+def f5_addr_port(x):
+    """'10.1.1.1:443', '10.1.1.1%2:443' or IPv6 '2001:db8::1.443' -> (address, port) or (x, '')."""
+    x = str(x or "")
+    m = re.match(r"^([0-9.]+)(?:%\d+)?:(\d+|any)$", x) or re.match(r"^([0-9a-fA-F:]+)(?:%\d+)?\.(\d+|any)$", x)
+    return (m.group(1), m.group(2)) if m else (x, "")
+
+
+def f5_ha_state(sess):
+    """'ACTIVE', 'STANDBY', ... from cm failover-status, or '' when it cannot be read."""
+    try:
+        ok, d = f5_get(sess, "/mgmt/tm/cm/failover-status")
+    except (urllib.error.URLError, OSError, ValueError):
+        return ""
+    stack = [d] if ok else []
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            st = x.get("status")
+            if isinstance(st, dict) and st.get("description"):
+                return str(st["description"]).upper()
+            stack += list(x.values())
+        elif isinstance(x, list):
+            stack += x
+    return ""
+
+
+def f5_connections(sess, client="", vip="", diag=None):
+    """Live connections from the F5 connection table (read-only 'tmsh show sys connection', filtered on the F5) ->
+    rows: client, virtual server, F5 source address (self IP / SNAT), pool member. diag (a dict) receives the request
+    and the lines that could not be read, to explain an empty answer."""
+    opts = []
+    for k, v in (("cs-client-addr", client), ("cs-server-addr", vip)):
+        if v:
+            opts += [k, str(ipaddress.ip_address(v))]
+    if not opts:
+        raise ValueError("enter the client IP")
+    path = "/mgmt/tm/sys/connection?options=" + "+".join(opts)
+    ok, d = f5_get(sess, path)
+    if not ok:
+        raise ValueError("could not read the connection table (%s)" % (str(d)[:200] if d else "no answer"))
+    raw = str(((d.get("apiRawValues") or {}).get("apiAnonymous")) or "")
+    if diag is not None:
+        diag.update(request=path, unread=[], other=[] if raw else [json.dumps(d, default=str)[:300]])
+    rows = []
+    for line in raw.splitlines():
+        m = re.match(r"^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s+\(tmm:\s*(\d+)\)", line)
+        if not m:
+            if diag is not None and line.strip() and not re.match(r"^\s*(Sys::Connections|Total records returned)", line):
+                diag["unread"].append(line.strip()[:200])
+            continue
+        (ca, cp), (va, vp), (sa, sp), (pa, pp) = (f5_addr_port(m.group(i)) for i in (1, 2, 3, 4))
+        rows.append({"client": ca, "client_port": cp, "virtual_server": va, "virtual_port": vp, "f5_source": sa,
+                     "f5_source_port": sp, "pool_member": pa, "member_port": pp, "protocol": m.group(5),
+                     "idle_seconds": int(m.group(6)), "tmm": m.group(7)})
+        if len(rows) >= 1000:
+            break
+    return rows
+
+
+def f5_conns(sess, v):
+    t0 = time.time()
+    rows = f5_connections(sess, v.get("ip", ""), v.get("vip", ""))
+    ha = "" if rows else f5_ha_state(sess)
+    per = collections.Counter((r["virtual_server"] + ":" + r["virtual_port"], r["pool_member"] + ":" + r["member_port"])
+                              for r in rows)
+    summary = ["%s -> pool member %s: %d connection(s)" % (vs, mem, c) for (vs, mem), c in per.most_common(20)]
+    return dict(pan_result("show sys connection cs-client-addr %s%s" % (v.get("ip"), " cs-server-addr %s" % v["vip"]
+                                                                          if v.get("vip") else ""),
+                           {"connections": rows, "count": len(rows),
+                            "note": "Live connections only (the client must be connected now). Behind a proxy such as "
+                                    "Cloudflare the F5 sees the proxy's addresses, not the client's."}, t0),
+                summary=summary or ["No live connection from %s on this F5 right now%s." % (v.get("ip"), (
+                    ": this unit is %s, the connections are on the active unit" % ha) if ha and ha != "ACTIVE" else
+                    " (%s)" % ha if ha else "")])
+
+
 PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_routes, "pan_sessions": pan_sessions,
                 "pan_resources": pan_resources, "fg_resources": fg_resources,
                 "f5_perf": f5_perf, "f5_vs_top": f5_vs_top, "pan_app_traffic": pan_app_traffic,
-                "pan_snat": pan_snat, "fg_snat": fg_snat, "f5_snat": f5_snat_lookup}
+                "pan_snat": pan_snat, "fg_snat": fg_snat, "f5_snat": f5_snat_lookup, "f5_conns": f5_conns}
 
 
 def do_ipcheck(b):
@@ -4241,7 +4323,7 @@ def flow_fw_verdict(sess, sid, leg, proto, within, logs, log_src=True):
         if log_src:
             q["ip"] = leg["src"]
         lr = (do_pan_logs(dict(q, log_type="traffic", period=FLOW_PAN_PERIOD.get(within, "last-24-hrs"))) if v == "paloalto"
-              else do_fg_logs(dict(q, log_source="disk", within=within)))
+              else fg_auto_logs(do_fg_logs, dict(q, within=within)))
         ent = (lr.get("data") or {}).get("entries") or []
         hops.append(flow_hop(sess, "Traffic log %s -> %s" % (leg["src"] if log_src else "any", leg["dst"]), lr, [
             "%s %s -> %s:%s %s %s" % (e.get("time") or e.get("date_time", ""), e.get("source_ip", ""), e.get("destination_ip", ""),
@@ -4380,6 +4462,51 @@ def flow_trace_f5(sess, sid, legs, src, host, within, logs, proxied):
                                  {"ok": True, "verdict": {"label": label, "kind": kind}},
                                  ([leg["via"]] if leg["via"] else []) + [how] +
                                  ["member %s state %s %s" % (m.get("name"), m.get("state"), m.get("session", "")) for m in mem]))
+            # The pool member the client is really on (persistence / load balancing): its live connections.
+            live = []
+            if src and not proxied:
+                vip = f5_dest_ip(v.get("destination"))
+                try:
+                    # the same query as 'show sys connection cs-client-addr <client>', filtered here afterwards
+                    diag = {}
+                    allc = f5_connections(sess, src, diag=diag)
+                    cr = [c for c in allc
+                          if c["virtual_server"] == vip and (not leg["port"] or c["virtual_port"] in (leg["port"], "any"))]
+                    pairs = collections.Counter((c["f5_source"], c["pool_member"], c["member_port"]) for c in cr)
+                    live = [k for k, _ in pairs.most_common(FLOW_MAX_LEGS)]
+                    line = lambda c: "%s:%s -> %s:%s -> %s:%s -> %s:%s %s idle %ss" % (
+                        c["client"], c["client_port"], c["virtual_server"], c["virtual_port"], c["f5_source"],
+                        c["f5_source_port"], c["pool_member"], c["member_port"], c["protocol"], c["idle_seconds"])
+                    if live:
+                        lab = "client %s is on pool member %s (%d live connection(s), F5 source %s)" % (
+                            src, ", ".join("%s:%s" % (k[1], k[2]) for k in live), len(cr), ", ".join(dict.fromkeys(k[0] for k in live)))
+                        det = [line(c) for c in cr]
+                    else:   # say why: standby unit, connections to another virtual server, or an answer not understood
+                        ha = f5_ha_state(sess)
+                        vss_seen = sorted({"%s:%s" % (c["virtual_server"], c["virtual_port"]) for c in allc})
+                        if allc:
+                            lab = ("client %s has %d live connection(s) on this F5, but none to %s: they go to %s" % (
+                                src, len(allc), flow_to(leg), ", ".join(vss_seen[:4])))
+                        elif ha and ha != "ACTIVE":
+                            lab = ("no live connection from %s on this unit: it is %s, so the connections are on the "
+                                   "active unit (connect the active F5)" % (src, ha))
+                        elif diag.get("unread") or diag.get("other"):
+                            lab = "the connection table answered in a form the console could not read (see details)"
+                        else:
+                            lab = "no live connection from %s on this F5%s right now" % (src, " (%s)" % ha if ha else "")
+                        det = ([line(c) for c in allc] + ["request: " + diag.get("request", "")] +
+                               ["not read: " + x for x in (diag.get("unread") or [])[:5]] +
+                               ["answer: " + x for x in (diag.get("other") or [])[:1]])
+                    hops.append(flow_hop(sess, "Live connections from %s" % src, {"ok": True, "verdict": {
+                        "label": lab, "kind": "ok" if live else "info"}}, det))
+                except (urllib.error.URLError, OSError, ValueError) as e:
+                    hops.append(flow_hop(sess, "Live connections from %s" % src, {"ok": True, "verdict": {
+                        "label": "connection table not read: %s" % str(getattr(e, "reason", e))[:150], "kind": "info"}}))
+            if live:   # follow the real connection: F5 source address -> the member the client is on
+                for sa, ma, mp in live:
+                    out.append(flow_leg(sa, ma, mp, "F5 %s -> pool member %s:%s (live connection of %s)" % (
+                        v.get("fullPath"), ma, mp, src)))
+                continue
             for m in (up or mem)[:FLOW_MAX_LEGS]:
                 out.append(flow_leg(snat, strip_rd(str(m.get("address") or "")), f5_member_port(m.get("name")),
                                     "F5 %s -> pool member %s (%s)" % (v.get("fullPath"), m.get("name"), how)))
@@ -4628,7 +4755,7 @@ def flow_logs_seen(sess, sid, leg, within):
     """With 'Also search logs': does the device's traffic log show this source -> destination?"""
     q = {"id": sid, "ip": leg["src"], "dest_ip": leg["dst"], "count": "5"}
     r = (do_pan_logs(dict(q, log_type="traffic", period=FLOW_PAN_PERIOD.get(within, "last-24-hrs")))
-         if sess["vendor"] == "paloalto" else do_fg_logs(dict(q, log_source="disk", within=within)))
+         if sess["vendor"] == "paloalto" else fg_auto_logs(do_fg_logs, dict(q, within=within)))
     return bool((r.get("data") or {}).get("entries"))
 
 
@@ -6550,6 +6677,27 @@ def do_pan_logs(b):
 
 
 FG_LOG_SOURCES = ("disk", "memory", "fortianalyzer")
+# Automatic lookups (the AI assistant and the flow trace) never read the FortiGate's disk log store.
+FG_AUTO_LOG_SOURCES = ("memory", "fortianalyzer")
+
+
+def fg_auto_logs(fn, b):
+    """Run a FortiGate log reader (do_fg_logs / do_acc) on memory, then FortiAnalyzer: never on disk.
+    The first source that has entries wins; otherwise the first one that answered."""
+    first, errs = None, []
+    for src in FG_AUTO_LOG_SOURCES:
+        r = fn(dict(b, log_source=src))
+        if r.get("ok"):
+            d = r.get("data") or {}
+            if d.get("entries") or d.get("lines") or d.get("timeline"):
+                return r
+            first = first or r
+        else:
+            errs.append("%s: %s" % (src, r.get("error")))
+    if first:
+        return first
+    return {"ok": False, "error": "log query failed on memory and FortiAnalyzer (disk is not used for automatic "
+                                  "lookups). %s" % " | ".join(errs)}
 FG_BLOCK_UTM = ("block", "blocked")
 
 
@@ -10735,11 +10883,12 @@ def llm_run_tool(name, a):
         if v == "paloalto":
             b.update(log_type=s("log_type") or "traffic", period=s("period") or "last-24-hrs")
             return do_pan_logs(b)
-        return do_fg_logs(dict(b, log_source="disk"))
+        return fg_auto_logs(do_fg_logs, b)
     if name == "acc" and v in ("paloalto", "fortigate"):
         f = a.get("filters") if isinstance(a.get("filters"), dict) else {}
-        return do_acc({"id": sid, "period": s("period") or "last-hour", "sort": "bytes", "scan": "5000",
-                       "log_source": "disk", "filters": {k: str(x) for k, x in f.items() if x not in (None, "")}})
+        b = {"id": sid, "period": s("period") or "last-hour", "sort": "bytes", "scan": "5000",
+             "filters": {k: str(x) for k, x in f.items() if x not in (None, "")}}
+        return fg_auto_logs(do_acc, b) if v == "fortigate" else do_acc(b)
     if name == "hostname_lookup" and v == "f5":
         return do_f5_host({"id": sid, "hostname": s("hostname")})
     if name == "waf_log_search" and v == "f5":
@@ -11075,6 +11224,29 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
+    def _serve_brand(self):
+        """Optional organisation logo for the header: brand_logo.svg or brand_logo.png next to this
+        script (git-ignored, so an organisation's logo is never published with the tool)."""
+        for name, ctype in BRAND_FILES:
+            path = os.path.join(BRAND_DIR, name)
+            try:
+                if not os.path.isfile(path) or os.path.getsize(path) > 1024 * 1024:
+                    continue
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self._send(404, {"error": "no brand logo"})
+
     def do_GET(self):
         if not self._host_ok():
             return self._send(403, {"error": "bad host"})
@@ -11089,6 +11261,10 @@ class Handler(BaseHTTPRequestHandler):
             if not tok_ok(t):
                 return self._send(403, {"error": "bad token"})
             return self._serve_capture(u.path[len("/api/capture/"):])
+        if u.path == "/brand-logo":
+            if not tok_ok(urllib.parse.parse_qs(u.query).get("t", [""])[0]):
+                return self._send(403, {"error": "bad token"})
+            return self._serve_brand()
         if not self._tok_ok():
             return self._send(403, {"error": "bad token"})
         if u.path == "/api/catalog":
@@ -11100,6 +11276,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, profiles)
             except (OSError, ValueError, json.JSONDecodeError) as e:
                 return self._send(500, {"error": "could not load saved profiles: %s" % e})
+        if u.path == "/api/version":
+            return self._send(200, {"gen": HOT["gen"], "page": HOT["page"], "error": HOT["error"], "time": HOT["time"]})
         if u.path == "/api/audit":
             with LOCK:
                 return self._send(200, list(AUDIT)[-200:])
@@ -11144,7 +11322,7 @@ PAGE = r"""<!doctype html>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%232EE6C5'/%3E%3Cstop offset='.6' stop-color='%237C6CFF'/%3E%3Cstop offset='1' stop-color='%23FF7A59'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z' fill='%2314132a' stroke='url(%23g)' stroke-width='2.2' stroke-linejoin='round'/%3E%3Cpath d='m12 13 6 5-6 5' fill='none' stroke='%232EE6C5' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M20.5 24h5' stroke='%23FF7A59' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#0B0A17;--panel:#14132a;--panel2:#1b1a38;--line:#2a2850;--text:#e9e8ff;--dim:#8f8cb8;
---mint:#2EE6C5;--coral:#FF7A59;--violet:#7C6CFF}
+--mint:#2EE6C5;--coral:#FF7A59;--violet:#7C6CFF;--ok:var(--mint);--bad:var(--coral)}
 *{box-sizing:border-box}
 .fdwrap{margin:0 0 16px;padding:10px 10px 8px;border:1px solid var(--line);border-radius:14px;overflow-x:auto;
 background:radial-gradient(700px 220px at 85% 110%,#7C6CFF14,transparent),var(--panel2)}
@@ -11153,8 +11331,8 @@ background:radial-gradient(700px 220px at 85% 110%,#7C6CFF14,transparent),var(--
 @keyframes fdmove{to{stroke-dashoffset:-18}}@media (prefers-reduced-motion:reduce){.fdflow{animation:none;stroke-dasharray:none;opacity:.6}}
 .fdcard{fill:#1b1a38;stroke-width:1.2}.fdcard.nc{stroke-dasharray:4 4;fill:#16152e}.fdic{fill:#0B0A17;stroke-width:1.2}
 .fdglyph{fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
-.fdt{fill:#e9e8ff;font:600 13.5px system-ui,Segoe UI,sans-serif}.fdr{fill:#8f8cb8;font:600 9px system-ui,Segoe UI,sans-serif;letter-spacing:.08em;text-transform:uppercase}.fds{fill:#8f8cb8;font:11px system-ui,Segoe UI,sans-serif}
-.fdpill{font:600 9.5px system-ui,Segoe UI,sans-serif;letter-spacing:.04em;text-transform:uppercase}
+.fdt{fill:#e9e8ff;font:600 13.5px 'Segoe UI',system-ui,sans-serif}.fdr{fill:#8f8cb8;font:600 9px 'Segoe UI',system-ui,sans-serif;letter-spacing:.08em;text-transform:uppercase}.fds{fill:#8f8cb8;font:11px 'Segoe UI',system-ui,sans-serif}
+.fdpill{font:600 9.5px 'Segoe UI',system-ui,sans-serif;letter-spacing:.04em;text-transform:uppercase}
 .fdlab{fill:#b9b6e6;font:10.5px Consolas,'Cascadia Mono',monospace}
 .fdnode.dim{opacity:.38}.fdnode{cursor:default}
 .fdleg{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--dim);padding:4px 6px 0}
@@ -11166,7 +11344,7 @@ border:1px solid var(--line);border-radius:8px;padding:6px 8px;overflow-y:auto;o
 .term:focus{border-color:var(--mint);box-shadow:0 0 0 1px #2EE6C555}.term .tl{height:1.25em}
 .term .cur{background:#d6d6e6;color:#0a0a12}.term .curoff{outline:1px solid #d6d6e6}
 body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#1d1a4a55,transparent),var(--bg);
-color:var(--text);font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;min-height:100vh}
+color:var(--text);font:14px/1.5 'Segoe UI',system-ui,Roboto,sans-serif;min-height:100vh}
 h1{margin:0;font-size:22px;background:linear-gradient(90deg,var(--mint),var(--violet) 60%,var(--coral));
 -webkit-background-clip:text;background-clip:text;color:transparent}
 header{padding:14px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
@@ -11177,7 +11355,7 @@ header small{color:var(--dim)}
 @media(max-width:900px){.wrap{grid-template-columns:1fr}}
 /* Decorative emblem in the empty space below the sidebar; stays in view while the right column scrolls. */
 .bglogo{position:sticky;top:24px;margin:28px 12px 0;opacity:.6;pointer-events:none;user-select:none}
-.bglogo svg{width:100%;height:auto;display:block;font-family:system-ui,Segoe UI,Roboto,sans-serif}
+.bglogo svg{width:100%;height:auto;display:block;font-family:'Segoe UI',system-ui,Roboto,sans-serif}
 .bglogo .sweep{transform-origin:140px 150px;animation:bglspin 9s linear infinite}
 @keyframes bglspin{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){.bglogo .sweep{animation:none}}
@@ -11209,8 +11387,8 @@ border:1px solid transparent;cursor:pointer}
 pre{margin:0;background:#07061380;border:1px solid var(--line);border-radius:10px;padding:12px;
 max-height:560px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace}
 .meta{display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap;color:var(--dim);font-size:12px}
-.ok{color:var(--mint)}.bad{color:var(--coral)}
-.err{color:var(--coral);margin-top:8px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+.err{color:var(--bad);margin-top:8px}
 .muted{color:var(--dim)}
 .row3{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
 .badge{display:inline-block;padding:8px 16px;border-radius:10px;font-weight:700;font-size:15px;margin:2px 0 8px;letter-spacing:.03em}
@@ -11329,8 +11507,83 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .fchip{display:inline-block;border:1px solid var(--line);border-radius:99px;padding:0 9px;margin:0 0 4px 6px;cursor:pointer;color:var(--mint)}
 #pretty .fchip:hover{border-color:var(--coral)}
 #pretty .dtop .dvv{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
-</style></head><body>
-<header><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><small>read-only troubleshooting · F5 · Palo Alto · FortiGate · Cloudflare · local only</small></header>
+#hotbar{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:80;display:flex;gap:10px;align-items:center;max-width:min(860px,calc(100vw - 32px));padding:10px 12px 10px 16px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--text);box-shadow:0 8px 28px #0006;font-size:13.5px}
+#hotbar[hidden]{display:none}#hotbar.new{border-color:var(--mint)}#hotbar.bad{border-color:var(--bad);color:var(--bad)}#hotbar.ok{border-color:var(--ok)}
+#hotbar button{flex:none;padding:4px 10px}
+header .brand{height:34px;width:auto;flex:none}header .bsep{width:1px;height:30px;background:var(--line);flex:none}
+.themebtn{margin-left:auto;flex:none;width:34px;height:34px;padding:0;border-radius:50%;font-size:16px;line-height:1}
+/* ---- Light "portal" theme: white cards, blue accent, orange/purple highlights (toggle in the header) ---- */
+:root[data-theme=light]{--bg:#f4f6fa;--panel:#fff;--panel2:#f6f8fb;--line:#e1e6ee;--text:#1c2733;--dim:#5f6b7a;
+--mint:#0b6fd0;--coral:#e8572a;--violet:#6c3fc4;--ok:#16803c;--bad:#c62828;color-scheme:light}
+[data-theme=light] body{background:radial-gradient(900px 420px at 10% 108%,#dedcf4,transparent),radial-gradient(1000px 520px at 92% 112%,#d8e7f7,transparent),var(--bg);background-attachment:fixed}
+[data-theme=light] header{background:#fff;position:relative;padding:12px 28px}
+[data-theme=light] header::after{content:"";position:absolute;left:50%;bottom:-4px;width:100px;height:4px;transform:translateX(-50%);
+background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
+[data-theme=light] h1{background:none;color:var(--text);font-weight:600;letter-spacing:-.01em}
+[data-theme=light] header .logo{filter:none}
+[data-theme=light] .card{border-color:var(--line);box-shadow:0 1px 2px #1c27330a,0 8px 24px #1c27330d}
+[data-theme=light] .card h3,[data-theme=light] .grp{color:var(--mint);font-weight:600;letter-spacing:.14em}
+[data-theme=light] label{color:#2b3644;font-weight:600}
+[data-theme=light] input,[data-theme=light] select{background:#fff;border-color:#cfd7e3}
+[data-theme=light] input:focus,[data-theme=light] select:focus{border-color:var(--mint);box-shadow:0 0 0 3px #0b6fd022}
+[data-theme=light] button{background:#fff;border-color:#cfd7e3;font-weight:600;color:#1c2733}
+[data-theme=light] .dev{font-weight:600}[data-theme=light] .dev .muted,[data-theme=light] .dev small{font-weight:400}
+[data-theme=light] button:hover{border-color:var(--mint);color:var(--mint);box-shadow:none}
+[data-theme=light] button.primary{background:#0b6fd0;color:#fff;border:0}
+[data-theme=light] button.primary:hover{background:#095db0;color:#fff}
+[data-theme=light] .dev.sel{border-color:var(--mint);background:#eef5fd;box-shadow:none}
+[data-theme=light] .f5{background:#fdeee8;color:#c2410c}[data-theme=light] .paloalto{background:#e6f4ee;color:#0f7a4f}
+[data-theme=light] .fortigate{background:#efeafb;color:#5b34b0}[data-theme=light] .cloudflare{background:#fef1e4;color:#b45309}
+[data-theme=light] .chkrow{border-bottom-color:var(--line)}
+[data-theme=light] .chkrow .lbl{font-size:13.5px;color:#1c2733}
+/* Semibold Segoe UI everywhere in the light theme (the portal look); the SSH terminal keeps its regular weight */
+[data-theme=light] body,[data-theme=light] #pretty,[data-theme=light] pre,[data-theme=light] #aicard,[data-theme=light] .aimsg{font-weight:600}
+[data-theme=light] .term{font-weight:400}
+[data-theme=light] pre,[data-theme=light] #pretty{background:#fff}
+[data-theme=light] pre{background:var(--panel2)}
+[data-theme=light] .badge{box-shadow:none}
+[data-theme=light] .badge.ok{background:#e8f5ec;color:var(--ok);border-color:var(--ok)}
+[data-theme=light] .badge.bad{background:#fdecec;color:var(--bad);border-color:var(--bad)}
+[data-theme=light] .badge.warn{background:#fff4e0;color:#975a00;border-color:#e0a03a}
+[data-theme=light] .badge.info{background:#efeafb;color:var(--violet);border-color:var(--violet)}
+[data-theme=light] .warnbox{border-color:var(--bad);box-shadow:none}
+[data-theme=light] #pretty .kvr,[data-theme=light] #pretty td{border-bottom-color:var(--line)}
+[data-theme=light] #pretty th{background:#f1f4f8;color:#3a4655}
+[data-theme=light] #pretty tr:nth-child(even) td{background:#f9fafc}
+[data-theme=light] #pretty tr:hover td{background:#eef5fd}
+[data-theme=light] #pretty .pill.info{color:var(--violet)}
+[data-theme=light] #pretty td .expired,[data-theme=light] #pretty .sev-high{color:var(--bad)}
+[data-theme=light] #pretty .chip.expired{background:#fdecec;border-color:var(--bad);color:var(--bad)}
+[data-theme=light] #pretty tr.deny td{background:#fdecec!important;color:var(--bad)}
+[data-theme=light] #pretty .logln.deny,[data-theme=light] #pretty .kvr.deny .v{color:var(--bad)}
+[data-theme=light] #pretty .chip{background:#eef2f7}[data-theme=light] #pretty .sev-medium{color:#975a00}
+[data-theme=light] #pretty .dtile.bad{border-color:var(--bad);box-shadow:none}
+[data-theme=light] #pretty svg .hv:hover{fill:#0b6fd012}
+[data-theme=light] #pretty .dtabs button.on{border-color:var(--mint);box-shadow:none;color:var(--mint)}
+[data-theme=light] svg [fill="#8f8cb8"]{fill:#5f6b7a}[data-theme=light] svg [stroke="#2a2850"]{stroke:#e1e6ee}
+[data-theme=light] svg [fill="#14132a"]{fill:#fff}
+[data-theme=light] svg stop[stop-color="#2EE6C5"]{stop-color:#0b6fd0}[data-theme=light] svg stop[stop-color="#7C6CFF"]{stop-color:#6c3fc4}
+[data-theme=light] svg stop[stop-color="#FF7A59"]{stop-color:#f26b38}[data-theme=light] svg [stroke="#2EE6C5"]{stroke:#0b6fd0}
+[data-theme=light] svg [stroke="#FF7A59"]{stroke:#f26b38}[data-theme=light] svg [stroke="#7C6CFF"]{stroke:#6c3fc4}
+[data-theme=light] .fdwrap{background:radial-gradient(700px 220px at 85% 110%,#6c3fc40d,transparent),#fbfcfe}
+[data-theme=light] .fdbase{stroke:#e1e6ee}[data-theme=light] .fdcard{fill:#fff}[data-theme=light] .fdcard.nc{fill:var(--panel2)}
+[data-theme=light] .fdic{fill:#f4f6fa}[data-theme=light] .fdt{fill:var(--text)}
+[data-theme=light] .fdr,[data-theme=light] .fds{fill:var(--dim)}[data-theme=light] .fdlab{fill:#46536a}
+[data-theme=light] #fdsh feDropShadow{flood-color:#1c2733;flood-opacity:.10}
+[data-theme=light] #aicard{box-shadow:0 16px 48px #1c273340}
+[data-theme=light] #aicard .aihead{background:#0b2545}[data-theme=light] .aiav.big::after{border-color:#0b2545}
+[data-theme=light] .aiav{background:linear-gradient(135deg,#0b6fd0,#5aa3ec);color:#fff}
+[data-theme=light] .aimsg.user{background:#0b2545}
+[data-theme=light] #aicard #ai_send,[data-theme=light] #aicard #ai_cfg button.primary{background:#0b6fd0;border-color:#0b6fd0}
+[data-theme=light] #aicard #ai_send:hover{background:#095db0}
+[data-theme=light] #aicard #ai_chips button{border-color:#0b6fd0;color:#0b6fd0}
+[data-theme=light] #aicard #ai_chips button:hover{background:#0b6fd0;color:#fff}
+[data-theme=light] #aicard textarea:focus{border-color:#0b6fd0}[data-theme=light] #aicard .aiby b{color:#0b6fd0}
+[data-theme=light] #aifab{background:linear-gradient(135deg,#0b6fd0,#3b8ee8);color:#fff;box-shadow:0 6px 20px #0b6fd055}
+</style>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem("theme")||"light"}catch(e){document.documentElement.dataset.theme="light"}</script>
+</head><body>
+<header><img class="brand" src="/brand-logo?t=__TOKEN__" alt="" onload="this.nextElementSibling.hidden=false" onerror="this.remove()"><span class="bsep" hidden></span><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><button class="themebtn" onclick="themeToggle()" title="Switch light / dark theme" aria-label="Switch light / dark theme">◐</button></header>
 <div class="wrap">
 <div>
   <div class="card"><h3>Saved device profiles</h3>
@@ -11798,7 +12051,12 @@ const FD_ICON={
  paloalto:'<path d="M0-9 8-6v5c0 5-3.4 8.4-8 10-4.6-1.6-8-5-8-10v-5z"/><path d="M-3.5 0l2.5 2.6 4.6-5"/>',
  nat:'<path d="M-9-4h13M1-7.5 4.5-4 1-.5M9 4H-4M-1 .5-4.5 4-1 7.5"/>',
  server:'<rect x="-8" y="-9" width="16" height="7" rx="1.5"/><rect x="-8" y="2" width="16" height="7" rx="1.5"/><path d="M-4.5-5.5h.1M-4.5 5.5h.1"/>'};
-const FD_COL={passed:"#2EE6C5",blocked:"#FF5C7A",unclear:"#FFB547",checked:"#7C6CFF","not connected":"#5d5a88",client:"#7C6CFF",server:"#7C6CFF",skipped:"#3a3866"};
+const FD_DARK={passed:"#2EE6C5",blocked:"#FF5C7A",unclear:"#FFB547",checked:"#7C6CFF","not connected":"#5d5a88",client:"#7C6CFF",server:"#7C6CFF",skipped:"#3a3866",nclink:"#8f8cb8",end:"#3b3970"};
+const FD_LIGHT={passed:"#16a34a",blocked:"#dc2626",unclear:"#d97706",checked:"#0b6fd0","not connected":"#9aa5b4",client:"#6c3fc4",server:"#6c3fc4",skipped:"#c7cfdb",nclink:"#9aa5b4",end:"#cfd7e3"};
+const isLight=()=>document.documentElement.dataset.theme==="light";
+let FD_COL=isLight()?FD_LIGHT:FD_DARK;
+function themeToggle(){const t=isLight()?"dark":"light";document.documentElement.dataset.theme=t;try{localStorage.setItem("theme",t)}catch(e){}
+ FD_COL=t==="light"?FD_LIGHT:FD_DARK;try{renderOut()}catch(e){}}  // redraw diagrams/heatmaps in the new colours
 function flowDiagram(p){
  const stages=p.stages||[],nodes=[{kind:"client",role:"Source",title:"Client",sub:p.client,state:"client"}];
  stages.forEach(s=>{const [role,vend]=String(s.layer).split(" · ");
@@ -11813,11 +12071,11 @@ function flowDiagram(p){
   '<filter id="fdsh" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000" flood-opacity=".45"/></filter></defs>';
  for(let i=0;i<nodes.length-1;i++){
   const x1=xs[i]+NW,y1=ys[i]+NH/2,x2=xs[i+1],y2=ys[i+1]+NH/2,mx=(x1+x2)/2,d="M"+x1+" "+y1+" C"+mx+" "+y1+" "+mx+" "+y2+" "+x2+" "+y2;
-  const after=stop>=0&&i>=stop,nx=nodes[i+1].state,col=nx==="blocked"?FD_COL.blocked:nx==="unclear"?FD_COL.unclear:nx==="not connected"?"#8f8cb8":FD_COL.passed;
+  const after=stop>=0&&i>=stop,nx=nodes[i+1].state,col=nx==="blocked"?FD_COL.blocked:nx==="unclear"?FD_COL.unclear:nx==="not connected"?FD_COL.nclink:FD_COL.passed;
   svg+='<path d="'+d+'" class="fdbase"/>'+(after?"":'<path d="'+d+'" class="fdflow" style="stroke:'+col+'"/>')}
  nodes.forEach((n,i)=>{const x=xs[i],y=ys[i],c=FD_COL[n.state]||FD_COL.checked,dim=stop>=0&&i>stop,nc=n.state==="not connected",end=n.state==="client"||n.state==="server";
   svg+='<g class="fdnode'+(dim?" dim":"")+'" transform="translate('+x+' '+y+')"><title>'+e(n.role+" · "+n.title+" · "+n.sub+(n.sees&&n.sees.length?"\nsees: "+n.sees.join(", "):"")+(n.checks&&n.checks.length?"\n"+n.checks.join("\n"):""))+'</title>'+
-   '<rect width="'+NW+'" height="'+NH+'" rx="14" class="fdcard'+(nc?" nc":"")+'" style="stroke:'+(end?"#3b3970":c)+'" filter="url(#fdsh)"/>'+
+   '<rect width="'+NW+'" height="'+NH+'" rx="14" class="fdcard'+(nc?" nc":"")+'" style="stroke:'+(end?FD_COL.end:c)+'" filter="url(#fdsh)"/>'+
    '<g transform="translate(27 '+(NH/2)+')"><circle r="17" class="fdic" style="stroke:'+c+'"/><g class="fdglyph" style="stroke:'+c+'">'+(FD_ICON[n.kind]||"")+'</g></g>'+
    '<text x="54" y="21" class="fdr">'+e(cut(n.role,22))+'</text><text x="54" y="39" class="fdt">'+e(cut(n.title,14))+'</text>'+
    '<text x="54" y="55" class="fds">'+e(cut(n.sub,19))+'</text>';
@@ -12120,8 +12378,8 @@ function chartsNode(list,heat){const grid=mk("div","dgrid");grid.style.marginBot
   {fmt:DFMT[c.fmt]||dNum,noTotal:c.fmt!=="num",gaps:true})));
  (heat||[]).forEach(h=>grid.appendChild(dHeat(h)));return grid}
 // Heatmap: one row per core, one column per time bucket, colour = load (dark = idle, blue -> amber -> red)
-function dHeatColor(v){if(v==null)return "transparent";if(v<1)return "#1d1b3a";
- const st=[[0,[29,27,58]],[30,[57,135,229]],[70,[201,133,0]],[100,[217,89,38]]];v=Math.min(100,v);
+function dHeatColor(v){if(v==null)return "transparent";const lt=isLight();if(v<1)return lt?"#eef2f7":"#1d1b3a";
+ const st=[[0,lt?[226,234,244]:[29,27,58]],[30,[57,135,229]],[70,[201,133,0]],[100,[217,89,38]]];v=Math.min(100,v);
  for(let i=1;i<st.length;i++)if(v<=st[i][0]){const [a,ca]=st[i-1],[b,cb]=st[i],f=(v-a)/(b-a);
   return "rgb("+ca.map((x,k)=>Math.round(x+(cb[k]-x)*f)).join(",")+")"}return "rgb(217,89,38)"}
 function dHeat(h){const card=mk("div","dcard dwide");card.appendChild(mk("div","sec",h.title));
@@ -12135,7 +12393,7 @@ function dHeat(h){const card=mk("div","dcard dwide");card.appendChild(mk("div","
   s+='<text x="'+(last?W-R:L+cw*i+cw/2).toFixed(1)+'" y="'+(H-6)+'" text-anchor="'+(last?"end":"middle")+'" font-size="12" fill="#8f8cb8">'+esc(sl[i])+'</text>'}
  const box=mk("div");box.innerHTML=s+'</svg>';card.appendChild(box);
  const lg=mk("div","dleg");[["idle",0],["30%",30],["70%",70],["100%",100]].forEach(([l,v])=>{const x=mk("span"),sw=mk("i");sw.style.background=dHeatColor(v||0.5);
-  if(!v)sw.style.background="#1d1b3a";x.appendChild(sw);x.appendChild(document.createTextNode(l));lg.appendChild(x)});card.appendChild(lg);
+  if(!v)sw.style.background=dHeatColor(0);x.appendChild(sw);x.appendChild(document.createTextNode(l));lg.appendChild(x)});card.appendChild(lg);
  return card}
 // ---- Cloudflare traffic dashboard: inline SVG charts (palette validated for the dark chart surface) ----
 const DC=["#3987e5","#d95926","#199e70","#c98500","#d55181","#008300"],DOTHER="#8f8cb8";
@@ -12410,17 +12668,94 @@ function exportHtml(){if(!last||last.error||!last.data){alert("Run a check first
  (f?'<h2>Findings</h2>'+table(f)+'<h2>Inventory</h2>'+table(d.inventory)+
  '<h2>Notes</h2>'+(d.notes||[]).map(n=>"<p>"+esc(n)+"</p>").join(""):sectionsHtml())+'</body></html>';
  dlText(fname("html"),"text/html",html)}
+// Live update: the server picks up edits to netops_console.py; tell the user, and offer a reload when the page itself changed
+let hotV=null,hotT=0;
+function hotBar(cls,html){let b=$("#hotbar");if(!b){b=mk("div");b.id="hotbar";document.body.appendChild(b)}b.className=cls;b.innerHTML=html;b.hidden=false;
+ const x=mk("button",null,"✕");x.onclick=()=>{b.hidden=true};b.appendChild(x);return b}
+async function hotCheck(){let v;try{v=await api("/api/version")}catch(e){return}if(!v||v.gen==null)return;
+ if(!hotV){hotV=v;return}
+ if(v.error&&v.error!==hotV.error)hotBar("bad","Update <b>not applied</b> ("+esc(v.time)+"), the console keeps running the previous code: "+esc(v.error));
+ else if(v.gen!==hotV.gen){
+  if(v.page!==hotV.page){const b=hotBar("new","Console updated at "+esc(v.time)+". The page changed: reload to see it (connected devices stay connected). ");
+   const r=mk("button","primary","Reload page");r.onclick=()=>location.reload();b.insertBefore(r,b.lastChild)}
+  else{hotBar("ok","Console updated at "+esc(v.time)+" (server side), already active.");clearTimeout(hotT);hotT=setTimeout(()=>{const b=$("#hotbar");if(b&&b.className==="ok")b.hidden=true},6000)}}
+ hotV=Object.assign({},v,{page:v.page!==hotV.page&&v.gen!==hotV.gen?hotV.page:v.page})}
+setInterval(hotCheck,4000);hotCheck();
 api("/api/catalog").then(c=>catalog=c);loadProfiles();vaultLoad();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true)}catch(e){}
 </script></body></html>
 """
+
+
+# ---- Live update: edits to this file are picked up while the console runs (no restart, nothing to re-enter) ----
+# The new code is first run in a fresh namespace; only if it loads cleanly does the server switch to it. The objects
+# below are the console's live state and are handed over unchanged, so connected devices, SSH terminals, the unlocked
+# saved logins, AI settings, caches and the URL token survive an update. A file with errors is not applied: the page
+# shows the error and the old code keeps running. The watcher itself and main() only change on a real restart.
+LIVE_STATE = ("TOKEN", "SESSIONS", "AUDIT", "LOCK", "TERMS", "TERM_LOCK", "VAULT", "VAULT_LOCK", "F5_HOST_CACHE",
+              "PAN_VRS", "CAPTURE_BUSY", "CF_EDGE", "WHOIS_BOOT", "LLM_CFG", "HOT")
+HOT = {"gen": 0, "page": "", "error": "", "time": ""}
+
+
+def hot_page_id(page):
+    return hashlib.sha256(page.encode("utf-8")).hexdigest()[:12]
+
+
+def hot_reload(srv, cur):
+    """Load this file again and switch the running server to it. Returns the namespace now in use."""
+    path = os.path.abspath(__file__)
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        code = compile(src, path, "exec")
+        ns = {"__name__": "__main__", "__file__": path, "__builtins__": __builtins__, "_HOT_RELOADING": True}
+        exec(code, ns)
+        if not isinstance(ns.get("Handler"), type) or "PAGE" not in ns:
+            raise RuntimeError("the new file has no Handler / PAGE")
+    except Exception as e:   # noqa: BLE001 - any error in the edited file: keep the old code running
+        line = getattr(e, "lineno", None)
+        cur["HOT"]["error"] = "%s%s: %s" % (type(e).__name__, " (line %s)" % line if line else "", e)
+        cur["HOT"]["time"] = time.strftime("%H:%M:%S")
+        print("[live update] NOT applied, old code keeps running: " + cur["HOT"]["error"])
+        return cur
+    for k in LIVE_STATE:
+        if k in cur:
+            ns[k] = cur[k]
+    ns.pop("_HOT_RELOADING", None)
+    hot = ns["HOT"]
+    hot.update(gen=hot["gen"] + 1, page=hot_page_id(ns["PAGE"]), error="", time=time.strftime("%H:%M:%S"))
+    srv.RequestHandlerClass = ns["Handler"]
+    print("[live update] applied update #%d at %s" % (hot["gen"], hot["time"]))
+    return ns
+
+
+def hot_watch(srv):
+    path, cur = os.path.abspath(__file__), globals()
+    last = os.path.getmtime(path)
+    while True:
+        time.sleep(1.5)
+        try:
+            m = os.path.getmtime(path)
+            if m == last:
+                continue
+            time.sleep(0.8)   # let the editor finish writing
+            if os.path.getmtime(path) != m:
+                continue
+            last = m
+        except OSError:
+            continue
+        cur = hot_reload(srv, cur)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--no-live-update", action="store_true", help="do not pick up edits to this file while running")
     a = ap.parse_args()
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+    HOT["page"] = hot_page_id(PAGE)
+    if not a.no_live_update:
+        threading.Thread(target=hot_watch, args=(srv,), daemon=True).start()
     srv.allowed_hosts = {"127.0.0.1:%d" % a.port, "localhost:%d" % a.port}
     url = "http://127.0.0.1:%d/?t=%s" % (a.port, TOKEN)
     print("ITSec Ops (read-only). Open:\n  " + url + "\nCtrl+C to stop; credentials are cleared on exit.")
@@ -12432,5 +12767,5 @@ def main():
         pass
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not globals().get("_HOT_RELOADING"):
     main()

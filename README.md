@@ -26,7 +26,9 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
      destination / bi-directional static NAT rule. Policy verdict for the address it receives, then the translation
   4. Load balancer: the F5 whose virtual server is the translated address (or that serves the hostname): enabled,
      pool members up / down, and the source address it uses (automap: the self IP in the member's subnet or towards
-     the route's gateway; SNAT pool: its first member)
+     the route's gateway; SNAT pool: its first member). With a client IP (not behind a proxy), the F5's live
+     connections (`show sys connection cs-client-addr`) show the pool member the client is really on, and the next
+     firewall is tested with that exact F5 source -> member pair
   5. Firewall between the F5 (or the edge NAT) and the servers, e.g. a DC firewall: policy verdict for the address
      pair it sees
   A flow without a destination NAT (two internal addresses) starts at the firewall the client's subnet is connected to.
@@ -41,6 +43,8 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
   green / red / amber, animated flow up to where it stops, and next to each device the source → destination it sees;
   then one row per device and check, and the first block found ("STOPS AT ..."). FortiOS policy lookup on a VIP's
   external address and the PAN-OS route lookup reply are not yet verified on real units
+- F5 live connections by client IP (LTM > "Live connections by client IP"): client, virtual server, F5 source
+  (self IP / SNAT) and pool member for each connection, read-only (`tmsh show sys connection` through the REST API)
 - F5 ASM/WAF request-log search (incl. by any HTTP header: value, IP, True-Client-IP, hostname, URL, time, support ID, POST body), top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
 - FortiGate lookups: Virtual IPs (name / external / mapped IP filter), static routes (IP, gateway, interface filter)
 - PAN-OS lookups: destination / static NAT rules (the Virtual IP equivalent), configured static routes, session list
@@ -155,11 +159,22 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
     log by its `CF-Ray` header, so one lookup shows whether Cloudflare or the F5 blocked it
   - The raw box accepts `/client/v4/...` GET paths or GraphQL queries (mutations are refused)
 
+- **Look**
+  - Light theme by default, dark theme one click away (◐ in the header; the choice is remembered in the browser)
+  - Optional organisation logo in the header: put `brand_logo.svg` or `brand_logo.png` (max 1 MB) next to the script.
+    Both names are git-ignored, so the logo is never published with the tool.
+
 ## Run
 ```
 python3 netops_console.py
 ```
 Open the URL printed in the terminal.
+
+**Live update:** while the console runs it watches `netops_console.py`. When the file changes, the new code is loaded
+and checked first, then the running server switches to it. Connected devices, open SSH terminals, unlocked saved
+logins, AI settings and the URL stay as they are, so nothing has to be re-entered. If the page itself changed, a bar
+offers "Reload page"; if the edited file has an error, the bar shows it and the previous code keeps running.
+Changes to the update watcher or to startup options (`main()`) still need a restart. Turn it off with `--no-live-update`.
 
 ## Security model
 - Binds to `127.0.0.1` only; random per-launch token plus Host-header check (CSRF / DNS-rebinding protection).
