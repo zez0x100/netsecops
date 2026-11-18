@@ -159,6 +159,16 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
     log by its `CF-Ray` header, so one lookup shows whether Cloudflare or the F5 blocked it
   - The raw box accepts `/client/v4/...` GET paths or GraphQL queries (mutations are refused)
 
+- **Device monitor (pop-up alerts)**
+  - While devices are connected and the console page is open, they are checked every 30 s (15 s to 5 min, or off),
+    read-only; the 🔔 in the header shows how many things are down
+  - F5: pool members, a pool left with no available member (with the VIPs using it), virtual servers, nodes, failover
+    state (Active / Standby). Palo Alto: HA state and peer link, interfaces, IPsec tunnels. FortiGate: HA primary and
+    cluster members, interfaces, IPsec tunnels
+  - Each change pops up a message (device, object, old and new state) with a sound and a Windows notification, and is
+    written to the audit log. Interfaces and tunnels that are already down when monitoring starts (unused ports, idle
+    tunnels) only alert after they have been up once
+
 - **Packet capture analysis (AI assistant)**
   - 📎 in the assistant (or drag a file onto it): `.pcap` / `.pcapng` up to 64 MB, read by the console itself
     (standard library only, no Wireshark needed; Ethernet, VLAN, Linux cooked, raw IP, loopback; first 500,000 packets)

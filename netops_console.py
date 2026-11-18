@@ -10711,10 +10711,17 @@ def llm_retry_msgs(messages):
     return out
 
 
+LLM_RETRY_TOKENS = 12000   # room for the second try: a reasoning model may need thousands of tokens before it answers
+
+
 def llm_empty_note(usage):
     fin = usage.get("_finish") or "unknown"
     ct, pt = usage.get("completion_tokens"), usage.get("prompt_tokens")
-    if fin == "length" or usage.get("_reasoning"):
+    if ct and usage.get("_max") and ct >= usage["_max"] * 0.98:
+        why = ("The model used its whole output allowance (%d tokens) on reasoning that the server does not send back "
+               "(Qwen3 'thinking'), so no answer was left. Ask a narrower question, or ask the model server admin to "
+               "turn thinking off for this model (enable_thinking: false) or raise its output token limit." % ct)
+    elif fin == "length" or usage.get("_reasoning"):
         why = "It used its whole output allowance on reasoning before writing the answer."
     elif ct == 0:
         why = ("The server says the model generated 0 tokens: the request most likely did not reach the model as sent "
@@ -10753,7 +10760,18 @@ def llm_chat(messages, tools=None, max_tokens=None):
         body["max_tokens"] = max_tokens
     if tools:
         body["tools"], body["tool_choice"] = tools, "auto"
+    # Qwen3 thinks before it answers, and some servers drop the thinking from the reply, so a long think can leave no
+    # answer at all. Switch thinking off the way vLLM-style servers understand; if the server rejects the extra field,
+    # send without it from then on (remembered per model address and model).
+    who = (LLM_CFG["url"], LLM_CFG["model"])
+    extra = "qwen3" in str(LLM_CFG["model"]).lower() and LLM_CFG.get("_no_extra") != who
+    if extra:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     st, d = llm_http("POST", "/chat/completions", body, timeout=LLM_WAIT)
+    if extra and st in (400, 422):
+        LLM_CFG["_no_extra"] = who
+        body.pop("chat_template_kwargs", None)
+        st, d = llm_http("POST", "/chat/completions", body, timeout=LLM_WAIT)
     if st >= 300 or not isinstance(d, dict) or not d.get("choices"):
         err = (d or {}).get("error") if isinstance(d, dict) else d
         if tools and st in (400, 422, 500):
@@ -10764,7 +10782,7 @@ def llm_chat(messages, tools=None, max_tokens=None):
     msg = ch.get("message") or {}
     return msg, dict(d.get("usage") or {}, _est=est, _finish=ch.get("finish_reason") or "",
                      _reasoning=bool(msg.get("reasoning_content") or msg.get("reasoning")),
-                     _raw=json.dumps(ch, default=str, ensure_ascii=False)[:6000])
+                     _raw=json.dumps(ch, default=str, ensure_ascii=False)[:6000], _max=max_tokens or 0)
 
 
 # Agent tools: only the console's own read-only lookups, on every connected device (tool names start with the vendor:
@@ -11103,7 +11121,7 @@ def do_llm_chat(b):
         msg, usage = llm_chat(msgs)
         answer = llm_text(msg)
         if not answer:   # e.g. a reasoning model spent its output on thinking: once more, with room and no thinking
-            msg, usage = llm_chat(llm_retry_msgs(msgs), max_tokens=4096)
+            msg, usage = llm_chat(llm_retry_msgs(msgs), max_tokens=LLM_RETRY_TOKENS)
             answer = llm_text(msg) or llm_fallback(msg, usage)
     else:
         if not alldev:
@@ -11132,7 +11150,7 @@ def do_llm_chat(b):
             if not calls:
                 answer = llm_text(msg)
                 if not answer:   # same as above: one more try for the final answer, without tools
-                    msg, usage = llm_chat(llm_retry_msgs(msgs), max_tokens=4096)
+                    msg, usage = llm_chat(llm_retry_msgs(msgs), max_tokens=LLM_RETRY_TOKENS)
                     answer = llm_text(msg) or llm_fallback(msg, usage)
                 break
             msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
@@ -11170,6 +11188,7 @@ def do_llm_chat(b):
     usage.pop("_finish", None)
     usage.pop("_reasoning", None)
     raw_reply = usage.pop("_raw", "")
+    usage.pop("_max", None)
     if pt and est and pt < est * 0.5 and not usage.get("num_ctx"):
         warn = ("The model server read only about %d of the roughly %d tokens sent: its context window is too small, so "
                 "the answer may not be based on the output. Raise the model's context length (LM Studio: Context "
@@ -11306,6 +11325,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, profiles)
             except (OSError, ValueError, json.JSONDecodeError) as e:
                 return self._send(500, {"error": "could not load saved profiles: %s" % e})
+        if u.path == "/api/monitor":
+            return self._send(200, do_monitor_get(u.query))
         if u.path == "/api/devices":   # the sessions this console holds, so a reloaded page shows them again
             return self._send(200, devices_public())
         if u.path == "/api/version":
@@ -11353,7 +11374,7 @@ class Handler(BaseHTTPRequestHandler):
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
                   "/api/fglogs": do_fg_logs, "/api/adminaudit": do_admin_audit, "/api/f5sync": do_f5_sync, "/api/pancapture": do_pan_capture,
                   "/api/backup": do_backup, "/api/cf": do_cf, "/api/acc": do_acc,
-                  "/api/llm/config": llm_wrap(do_llm_config), "/api/llm/models": llm_wrap(do_llm_models),
+                  "/api/monitor": do_monitor_set, "/api/llm/config": llm_wrap(do_llm_config), "/api/llm/models": llm_wrap(do_llm_models),
                   "/api/llm/chat": llm_wrap(do_llm_chat)}
         fn = routes.get(self.path)
         if not fn:
@@ -11563,7 +11584,24 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .fchip:hover{border-color:var(--coral)}
 #pretty .dtop .dvv{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
 #hotbar{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:80;display:flex;gap:10px;align-items:center;max-width:min(860px,calc(100vw - 32px));padding:10px 12px 10px 16px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--text);box-shadow:0 8px 28px #0006;font-size:13.5px}
-#hotbar[hidden]{display:none}#hotbar.new{border-color:var(--mint)}#hotbar.bad{border-color:var(--bad);color:var(--bad)}#hotbar.ok{border-color:var(--ok)}
+#hotbar[hidden]{display:none}
+/* ---- Device monitor: bell, panel, pop-ups ---- */
+#monbtn{position:relative}#monbtn:not([hidden])+.themebtn{margin-left:8px}#monbtn.alert{border-color:var(--bad);box-shadow:0 0 0 3px #e5484d33}
+#monbadge{position:absolute;top:-6px;right:-6px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#d92d20;color:#fff;font-size:11px;font-weight:700;line-height:18px}
+#monpanel{position:fixed;top:64px;right:16px;z-index:70;width:min(460px,calc(100vw - 32px));max-height:calc(100vh - 90px);overflow:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;box-shadow:0 16px 40px #0005;padding:12px 14px}
+#monpanel[hidden]{display:none}#monpanel h3{margin:0 0 8px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--mint)}
+#monpanel .mrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}#monpanel .mrow select{width:auto}
+#monpanel .mrow label{margin:0;display:flex;gap:6px;align-items:center;font-size:13px;color:var(--text)}#monpanel .mrow input{width:auto}
+#monpanel .msec{margin:10px 0 4px;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+#monpanel .mline{font-size:12.5px;padding:4px 0;border-bottom:1px dashed var(--line)}#monpanel .mline:last-child{border-bottom:0}
+#monpanel .mline.offline,#monpanel .mline.pooldown,#monpanel .mline.error,#monpanel .mline.ha{color:var(--bad)}#monpanel .mline.recovered{color:var(--ok)}#monpanel .mline.admin{color:#b26b00}
+#montoasts{position:fixed;left:16px;bottom:16px;z-index:75;display:flex;flex-direction:column;gap:8px;width:min(440px,calc(100vw - 32px));pointer-events:none}
+.mtoast{pointer-events:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-left:5px solid var(--bad);border-radius:10px;box-shadow:0 10px 30px #0006;padding:10px 12px;font-size:13px;animation:mtin .25s ease-out}
+.mtoast.recovered{border-left-color:var(--ok)}.mtoast.admin,.mtoast.error{border-left-color:#d08700}
+.mtoast .mth{display:flex;align-items:center;gap:8px;font-weight:700;margin-bottom:3px}.mtoast .mth span{flex:1}
+.mtoast .mth button{padding:0 8px;font-size:13px;box-shadow:none}.mtoast .mtv{color:var(--dim);font-size:12px;margin-top:3px}
+@keyframes mtin{from{transform:translateY(12px);opacity:0}}
+#hotbar.new{border-color:var(--mint)}#hotbar.bad{border-color:var(--bad);color:var(--bad)}#hotbar.ok{border-color:var(--ok)}
 #hotbar button{flex:none;padding:4px 10px}
 header .brand{height:34px;width:auto;flex:none}header .bsep{width:1px;height:30px;background:var(--line);flex:none}
 .themebtn{margin-left:auto;flex:none;width:34px;height:34px;padding:0;border-radius:50%;font-size:16px;line-height:1}
@@ -11581,9 +11619,15 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 [data-theme=light] label{color:#2b3644;font-weight:600}
 [data-theme=light] input,[data-theme=light] select{background:#fff;border-color:#cfd7e3}
 [data-theme=light] input:focus,[data-theme=light] select:focus{border-color:var(--mint);box-shadow:0 0 0 3px #0b6fd022}
-[data-theme=light] button{background:#fff;border-color:#cfd7e3;font-weight:600;color:#1c2733}
+[data-theme=light] button{background:#0b6fd0;border-color:#0b6fd0;font-weight:600;color:#fff}
 [data-theme=light] .dev{font-weight:600}[data-theme=light] .dev .muted,[data-theme=light] .dev small{font-weight:400}
-[data-theme=light] button:hover{border-color:var(--mint);color:var(--mint);box-shadow:none}
+[data-theme=light] button:hover{background:#095db0;border-color:#095db0;color:#fff;box-shadow:none}
+[data-theme=light] button:disabled{background:#8db9e6;border-color:#8db9e6;cursor:default}
+/* small controls stay light: close buttons, round header buttons, dashboard tabs (the selected one is blue) */
+[data-theme=light] .themebtn,[data-theme=light] .dev button,[data-theme=light] .mtoast button,[data-theme=light] #hotbar button:not(.primary),
+[data-theme=light] #pretty .dtabs button{background:#fff;border-color:#cfd7e3;color:#1c2733}
+[data-theme=light] .themebtn:hover,[data-theme=light] .dev button:hover,[data-theme=light] .mtoast button:hover,
+[data-theme=light] #hotbar button:not(.primary):hover,[data-theme=light] #pretty .dtabs button:hover{background:#eef5fd;border-color:var(--mint);color:var(--mint)}
 [data-theme=light] button.primary{background:#0b6fd0;color:#fff;border:0}
 [data-theme=light] button.primary:hover{background:#095db0;color:#fff}
 [data-theme=light] .dev.sel{border-color:var(--mint);background:#eef5fd;box-shadow:none}
@@ -11614,7 +11658,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 [data-theme=light] #pretty .chip{background:#eef2f7}[data-theme=light] #pretty .sev-medium{color:#975a00}
 [data-theme=light] #pretty .dtile.bad{border-color:var(--bad);box-shadow:none}
 [data-theme=light] #pretty svg .hv:hover{fill:#0b6fd012}
-[data-theme=light] #pretty .dtabs button.on{border-color:var(--mint);box-shadow:none;color:var(--mint)}
+[data-theme=light] #pretty .dtabs button.on{background:#0b6fd0;border-color:#0b6fd0;box-shadow:none;color:#fff}
 [data-theme=light] svg [fill="#8f8cb8"]{fill:#5f6b7a}[data-theme=light] svg [stroke="#2a2850"]{stroke:#e1e6ee}
 [data-theme=light] svg [fill="#14132a"]{fill:#fff}
 [data-theme=light] svg stop[stop-color="#2EE6C5"]{stop-color:#0b6fd0}[data-theme=light] svg stop[stop-color="#7C6CFF"]{stop-color:#6c3fc4}
@@ -11638,7 +11682,8 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 </style>
 <script>try{document.documentElement.dataset.theme=localStorage.getItem("theme")||"light"}catch(e){document.documentElement.dataset.theme="light"}</script>
 </head><body>
-<header><img class="brand" src="/brand-logo?t=__TOKEN__" alt="" onload="this.nextElementSibling.hidden=false" onerror="this.remove()"><span class="bsep" hidden></span><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><button class="themebtn" onclick="themeToggle()" title="Switch light / dark theme" aria-label="Switch light / dark theme">◐</button></header>
+<header><img class="brand" src="/brand-logo?t=__TOKEN__" alt="" onload="this.nextElementSibling.hidden=false" onerror="this.remove()"><span class="bsep" hidden></span><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><button class="themebtn" id="monbtn" onclick="monPanel()" title="Device monitor" aria-label="Device monitor" hidden>🔔<span id="monbadge" hidden></span></button><button class="themebtn" onclick="themeToggle()" title="Switch light / dark theme" aria-label="Switch light / dark theme">◐</button></header>
+<div id="monpanel" hidden></div><div id="montoasts" aria-live="assertive"></div>
 <div class="wrap">
 <div>
   <div class="card"><h3>Saved device profiles</h3>
@@ -12752,6 +12797,59 @@ function exportHtml(){if(!last||last.error||!last.data){alert("Run a check first
  (f?'<h2>Findings</h2>'+table(f)+'<h2>Inventory</h2>'+table(d.inventory)+
  '<h2>Notes</h2>'+(d.notes||[]).map(n=>"<p>"+esc(n)+"</p>").join(""):sectionsHtml())+'</body></html>';
  dlText(fname("html"),"text/html",html)}
+// ---- Device monitor: poll /api/monitor, pop up changes, Windows notification + sound ----
+let monSeq=-1,monLast=null,monOpen=false;
+const MON_TITLE={offline:"DOWN",pooldown:"F5 pool has NO available members",recovered:"Back up",
+ admin:"Taken out of service",baseline:"Already down when monitoring started",ha:"HA state changed",error:"Monitor"};
+function monTitle(e){return e.kind==="offline"||e.kind==="recovered"||e.kind==="admin"?(e.cat||"")+" "+MON_TITLE[e.kind]+" \u00b7 "+e.device:(MON_TITLE[e.kind]||"Monitor")+(e.device?" \u00b7 "+e.device:"")}
+function monPref(k,d){try{const v=localStorage.getItem("mon_"+k);return v==null?d:v==="1"}catch(e){return d}}
+function monSetPref(k,v){try{localStorage.setItem("mon_"+k,v?"1":"0")}catch(e){}}
+function monBeep(bad){if(!monPref("sound",true))return;try{const c=new(window.AudioContext||window.webkitAudioContext)();
+ (bad?[880,660,880]:[660,990]).forEach((f,i)=>{const o=c.createOscillator(),g=c.createGain(),t=c.currentTime+i*.18;o.frequency.value=f;o.connect(g);g.connect(c.destination);
+  g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.2,t+.02);g.gain.exponentialRampToValueAtTime(.0001,t+.16);o.start(t);o.stop(t+.17)})}catch(e){}}
+function monToast(e){const bad=e.kind==="offline"||e.kind==="pooldown"||e.kind==="baseline"||e.kind==="ha";
+ const t=mk("div","mtoast "+e.kind),h=mk("div","mth");h.appendChild(mk("span",null,(bad?"\u26a0 ":e.kind==="recovered"?"\u2713 ":"\u2022 ")+monTitle(e)));
+ h.appendChild(mk("small","muted",e.t));const x=mk("button",null,"\u2715");x.onclick=()=>t.remove();h.appendChild(x);t.appendChild(h);
+ t.appendChild(mk("div",null,e.text));if(e.vips&&e.vips.length)t.appendChild(mk("div","mtv","VIP: "+e.vips.join(", ")));
+ const box=$("#montoasts");box.appendChild(t);while(box.children.length>6)box.firstChild.remove();
+ if(!bad)setTimeout(()=>t.remove(),e.kind==="recovered"?20000:60000);
+ if(monPref("notify",true)&&window.Notification&&Notification.permission==="granted"){
+  try{new Notification(monTitle(e),{body:e.text+(e.vips&&e.vips.length?"\nVIP: "+e.vips.join(", "):""),tag:"mon"+e.seq,requireInteraction:bad})}catch(err){}}
+ if(e.kind!=="error")monBeep(bad)}
+async function monPoll(){if(!devices.some(d=>["f5","paloalto","fortigate"].includes(d.vendor))){$("#monbtn").hidden=true;$("#monpanel").hidden=true;monOpen=false;return}
+ $("#monbtn").hidden=false;let r;try{r=await api("/api/monitor"+(monSeq>=0?"?since="+monSeq:""))}catch(e){return}if(!r||!r.ok)return;
+ if(monSeq>=0)r.events.forEach(monToast);monSeq=r.seq;
+ if(!monLast)monLast={events:[]};monLast.on=r.on;monLast.interval=r.interval;monLast.status=r.status;
+ monLast.events=monLast.events.concat(r.events).slice(-40);
+ const off=r.status.reduce((n,s)=>n+(s.offline||0),0),b=$("#monbadge");
+ b.hidden=!off;b.textContent=off;$("#monbtn").classList.toggle("alert",off>0);
+ $("#monbtn").title="Device monitor: "+(r.on?"on, every "+r.interval+" s":"off")+(off?" \u00b7 "+off+" down":"");
+ if(monOpen)monRender()}
+function monRender(){const p=$("#monpanel"),m=monLast||{status:[],events:[]};p.innerHTML="";p.appendChild(mk("h3",null,"Device monitor"));
+ const r1=mk("div","mrow"),lb=mk("label"),cb=mk("input");cb.type="checkbox";cb.checked=!!m.on;cb.onchange=()=>monSet({on:cb.checked});
+ lb.appendChild(cb);lb.appendChild(document.createTextNode("Watch devices"));r1.appendChild(lb);
+ const iv=mk("select");[15,30,60,120,300].forEach(v=>{const o=mk("option",null,"every "+(v<60?v+" s":v/60+" min"));o.value=v;if(v===m.interval)o.selected=true;iv.appendChild(o)});
+ iv.onchange=()=>monSet({interval:+iv.value});r1.appendChild(iv);const now=mk("button",null,"Check now");now.onclick=()=>monSet({now:true});r1.appendChild(now);p.appendChild(r1);
+ const r2=mk("div","mrow");[["sound","Sound"],["notify","Windows notification"]].forEach(([k,t])=>{const l=mk("label"),c=mk("input");c.type="checkbox";c.checked=monPref(k,true);
+  c.onchange=()=>{monSetPref(k,c.checked);if(k==="notify"&&c.checked)monAskNotify()};l.appendChild(c);l.appendChild(document.createTextNode(t));r2.appendChild(l)});
+ if(window.Notification&&Notification.permission!=="granted"){const a=mk("button",null,Notification.permission==="denied"?"Notifications blocked in the browser":"Allow Windows notifications");
+  a.disabled=Notification.permission==="denied";a.onclick=monAskNotify;r2.appendChild(a)}
+ p.appendChild(r2);
+ p.appendChild(mk("div","msec","Devices"));(m.status||[]).forEach(s=>p.appendChild(mk("div","mline"+(s.error?" error":""),
+  s.device+": "+(s.error?"cannot read ("+s.error+")":Object.entries(s.counts||{}).map(([k,v])=>v+" "+k.toLowerCase()+(v===1?"":"s")).join(", ")+
+   (s.ha?" \u00b7 HA "+s.ha:"")+" \u00b7 "+(s.offline||0)+" down")+(s.time?" \u00b7 checked "+s.time:"")+
+   ((s.warnings||[]).length?" \u00b7 not readable: "+s.warnings.join("; "):""))));
+ if(!(m.status||[]).length)p.appendChild(mk("div","mline muted",m.on?"First check running\u2026":"Monitoring is off."));
+ const down=[].concat(...(m.status||[]).map(s=>(s.down||[]).map(x=>Object.assign({device:s.device},x))));
+ if(down.length){p.appendChild(mk("div","msec","Out of service now ("+down.length+")"));down.slice(0,60).forEach(x=>p.appendChild(mk("div","mline "+(x.cls==="bad"?"offline":"admin"),
+  x.cat+" "+x.label+" \u00b7 "+x.state+" \u00b7 "+x.device+(x.vips&&x.vips.length?" \u00b7 VIP "+x.vips.join(", "):""))))}
+ p.appendChild(mk("div","msec","Recent changes"));const ev=(m.events||[]).slice().reverse();
+ if(!ev.length)p.appendChild(mk("div","mline muted","No changes yet."));ev.slice(0,25).forEach(e=>p.appendChild(mk("div","mline "+e.kind,e.t+" \u00b7 "+e.text)))}
+function monPanel(){monOpen=$("#monpanel").hidden;$("#monpanel").hidden=!monOpen;if(monOpen){monRender();if(window.Notification&&Notification.permission==="default"&&monPref("notify",true))monAskNotify()}}
+async function monSet(b){const r=await api("/api/monitor",b);if(!r.ok){alert(r.error);return}monPoll();setTimeout(monPoll,2500)}
+function monAskNotify(){if(window.Notification&&Notification.permission==="default")Notification.requestPermission().then(()=>{if(monOpen)monRender()})}
+document.addEventListener("click",e=>{if(monOpen&&!e.target.closest("#monpanel")&&!e.target.closest("#monbtn")){monOpen=false;$("#monpanel").hidden=true}});
+setInterval(monPoll,5000);setTimeout(monPoll,1500);
 // Live update: the server picks up edits to netops_console.py; tell the user, and offer a reload when the page itself changed
 let hotV=null,hotT=0;
 function hotBar(cls,html){let b=$("#hotbar");if(!b){b=mk("div");b.id="hotbar";document.body.appendChild(b)}b.className=cls;b.innerHTML=html;b.hidden=false;
@@ -12773,6 +12871,332 @@ async function devicesRestore(){let l;try{l=await api("/api/devices")}catch(e){r
 api("/api/catalog").then(c=>{catalog=c;devicesRestore()});loadProfiles();vaultLoad();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true)}catch(e){}
 </script></body></html>
 """
+
+
+# ---- Device monitor: the page pops up a message when something goes down (read-only polling) --------------------
+# F5: pool members, virtual servers, nodes, failover state. Palo Alto / FortiGate: HA, interfaces, IPsec tunnels.
+# The page asks /api/monitor every few seconds; when a check is due, one background pass reads the pool list of every
+# connected F5 (one GET each: member monitor state is part of the pool configuration) and compares it with the previous
+# pass. Changes become events that the page shows as pop-ups and Windows notifications.
+MON = {"on": True, "interval": 30, "seq": 0, "events": collections.deque(maxlen=300), "state": {}, "vips": {},
+       "status": {}, "busy": False, "next": 0.0, "lock": threading.Lock()}
+MON_INTERVALS = (15, 30, 60, 120, 300)
+
+
+def mon_member_state(m):
+    st, ses = str(m.get("state") or ""), str(m.get("session") or "")
+    if st == "user-down":
+        return "forced offline"
+    if st == "down":
+        return "offline"
+    if ses == "user-disabled":
+        return "disabled"
+    if st == "up":
+        return "up"
+    return "no monitor" if st == "unchecked" else (st or "unknown")
+
+
+def mon_event(kind, sess, text, **kw):
+    with MON["lock"]:
+        MON["seq"] += 1
+        e = dict(kw, seq=MON["seq"], kind=kind, t=time.strftime("%H:%M:%S"), ts=time.time(),
+                 device=sess.get("name") or sess.get("host"), text=text)
+        MON["events"].append(e)
+    if kind in ("offline", "pooldown", "recovered", "admin", "ha"):
+        audit(sess, "monitor: " + text[:200])
+
+
+def mon_item(cat, label, state, cls, **extra):
+    """One watched object. cls: 'good', 'bad' (down: alert), 'admin' (taken out of service on purpose), 'ha' (any change
+    alerts), 'info' (shown, never alerts)."""
+    return dict(extra, cat=cat, label=label, state=state, cls=cls)
+
+
+# Kinds of object that are reported as already down when monitoring starts. Interfaces and tunnels are not: unused
+# ports and idle on-demand tunnels are down all the time, so they only alert after they have been seen up once.
+MON_BASELINE = ("Pool member", "Virtual server", "Node")
+
+
+def mon_f5(sid, sess, prev):
+    items, errs = {}, []
+    ok, d = f5_get(sess, "/mgmt/tm/ltm/pool?expandSubcollections=true")
+    if not ok:
+        raise ValueError("pool list not readable: %s" % str(d)[:160])
+    vip = MON["vips"].get(sid)
+    if not vip or time.time() - vip[0] > 300:   # which virtual servers use each pool (refreshed every 5 minutes)
+        okv, dv = f5_get(sess, "/mgmt/tm/ltm/virtual")
+        m = {}
+        for v in (dv.get("items", []) if okv else []):
+            if v.get("pool"):
+                dest = (v.get("destination") or "").rsplit("/", 1)[-1]
+                m.setdefault(v["pool"], []).append("%s (%s:%s)" % (v.get("fullPath"), f5_dest_ip(v.get("destination")),
+                                                                   f5_member_port(dest)))
+        vip = MON["vips"][sid] = (time.time(), m)
+    for p in d.get("items", []):
+        pool = p.get("fullPath") or p.get("name") or ""
+        for mb in (p.get("membersReference") or {}).get("items", []):
+            st = mon_member_state(mb)
+            ip = "%s:%s" % (strip_rd(mb.get("address")), f5_member_port(mb.get("name")))
+            items["pm|%s|%s" % (pool, mb.get("name"))] = mon_item(
+                "Pool member", "%s in %s" % (ip, pool), st,
+                "bad" if st == "offline" else "admin" if st in ("forced offline", "disabled") else "good",
+                pool=pool, vips=vip[1].get(pool, []))
+    try:
+        okv, dv = f5_get(sess, "/mgmt/tm/ltm/virtual/stats")
+        if not okv:
+            raise ValueError("HTTP error")
+        for name, st in f5_stat_status(dv).items():
+            items["vs|" + name] = mon_item("Virtual server", name, st,
+                                           "bad" if st == "offline" else "admin" if "disabled" in st else "good")
+    except Exception as e:  # noqa: BLE001 - one part failing must not stop the rest
+        errs.append("virtual servers: %s" % getattr(e, "reason", e))
+    try:
+        okn, dn = f5_get(sess, "/mgmt/tm/ltm/node")
+        if not okn:
+            raise ValueError("HTTP error")
+        for nd in dn.get("items", []):
+            st = mon_member_state(nd)
+            items["node|" + str(nd.get("fullPath"))] = mon_item(
+                "Node", "%s (%s)" % (nd.get("fullPath"), strip_rd(nd.get("address"))), st,
+                "bad" if st == "offline" else "admin" if st in ("forced offline", "disabled") else "good")
+    except Exception as e:  # noqa: BLE001 - one part failing must not stop the rest
+        errs.append("nodes: %s" % getattr(e, "reason", e))
+    ha = f5_ha_state(sess)
+    if ha:
+        items["ha"] = mon_item("HA state", "failover state", ha, "ha")
+    return items, errs
+
+
+def mon_pan(sid, sess, prev):
+    items, errs = {}, []
+
+    def entries(x):
+        if isinstance(x, dict):
+            if x.get("entry") is not None:
+                return [i for i in as_list(x["entry"]) if isinstance(i, dict)]
+            for v in x.values():
+                r = entries(v)
+                if r:
+                    return r
+        return []
+    try:
+        st, ok, d = pan_op(sess, "<show><high-availability><state/></high-availability></show>")
+        res = d.get("result") if ok and isinstance(d, dict) else None
+        if isinstance(res, dict) and str(res.get("enabled", "")).lower() == "yes":
+            grp = res.get("group") or {}
+            loc, peer = grp.get("local-info") or {}, grp.get("peer-info") or {}
+            if loc.get("state"):
+                items["ha"] = mon_item("HA state", "this firewall", str(loc["state"]), "ha")
+            if peer.get("conn-status"):
+                cs = str(peer["conn-status"]).lower()
+                items["hapeer"] = mon_item("HA peer", "link to %s" % (peer.get("mgmt-ip") or "the peer"), cs,
+                                           "good" if cs == "up" else "bad")
+            if peer.get("state"):
+                items["hapeerst"] = mon_item("HA state", "peer", str(peer["state"]), "ha")
+        elif not ok:
+            errs.append("HA state not readable (HTTP %s)" % st)
+    except Exception as e:  # noqa: BLE001 - one part failing must not stop the rest
+        errs.append("HA: %s" % getattr(e, "reason", e))
+    try:
+        st, ok, d = pan_op(sess, "<show><interface>all</interface></show>")
+        res = d.get("result") if ok and isinstance(d, dict) else None
+        for e in entries((res or {}).get("hw")) if isinstance(res, dict) else []:
+            s = str(e.get("state") or "").lower()
+            if e.get("name") and s:
+                items["if|" + e["name"]] = mon_item("Interface", e["name"], s, "good" if s == "up" else "bad")
+        if not ok:
+            errs.append("interfaces not readable (HTTP %s)" % st)
+    except Exception as e:  # noqa: BLE001 - one part failing must not stop the rest
+        errs.append("interfaces: %s" % getattr(e, "reason", e))
+    try:
+        st, ok, d = pan_op(sess, "<show><vpn><flow/></vpn></show>")
+        res = d.get("result") if ok and isinstance(d, dict) else None
+        for e in entries(res) if isinstance(res, dict) else []:
+            name, s, mon = e.get("name"), str(e.get("state") or "").lower(), str(e.get("mon") or "").lower()
+            if not name or not s:
+                continue
+            up = s == "active" and mon != "down"
+            items["vpn|" + name] = mon_item("IPsec tunnel", name, s + (" / monitor " + mon if mon not in ("", "off") else ""),
+                                            "good" if up else "bad")
+    except Exception as e:  # noqa: BLE001 - one part failing must not stop the rest
+        errs.append("IPsec tunnels: %s" % getattr(e, "reason", e))
+    return items, errs
+
+
+def mon_fg(sid, sess, prev):
+    items, errs = {}, []
+
+    def get(path):
+        st, ok, d = rest_get(sess, path)
+        if not ok or not isinstance(d, dict):
+            raise ValueError("HTTP %s" % st)
+        return d.get("results")
+    try:
+        peers = [p for p in as_list(get("/api/v2/monitor/system/ha-peer")) if isinstance(p, dict)]
+        cluster = len(peers) > 1 or any(k.startswith("hapeer|") for k in (prev or {}))
+        if cluster:   # a cluster: alert when a member leaves it, or the primary changes
+            for p in peers:
+                k = "hapeer|" + str(p.get("serial_no") or p.get("hostname"))
+                items[k] = mon_item("HA member", "%s (%s)" % (p.get("hostname") or "?", p.get("serial_no") or "?"),
+                                    "in cluster", "good")
+                if any(p.get(f) is True for f in ("primary", "is_primary", "is_manage_master", "is_root_primary")):
+                    items["ha"] = mon_item("HA state", "primary unit", str(p.get("hostname") or p.get("serial_no")), "ha")
+        for k, it in (prev or {}).items():   # a member that was in the cluster and is gone now
+            if k.startswith("hapeer|") and k not in items and cluster:
+                items[k] = dict(it, state="missing from the cluster", cls="bad")
+    except Exception as e:  # noqa: BLE001 - one part failing must not stop the rest
+        errs.append("HA: %s" % getattr(e, "reason", e))
+    try:
+        res = get("/api/v2/monitor/system/interface")
+        for i in (res.values() if isinstance(res, dict) else as_list(res)):
+            if isinstance(i, dict) and i.get("name") and isinstance(i.get("link"), bool):
+                items["if|" + i["name"]] = mon_item("Interface", i["name"], "up" if i["link"] else "down",
+                                                    "good" if i["link"] else "bad")
+    except Exception as e:  # noqa: BLE001 - one part failing must not stop the rest
+        errs.append("interfaces: %s" % getattr(e, "reason", e))
+    try:
+        for t in as_list(get("/api/v2/monitor/vpn/ipsec")):
+            if not isinstance(t, dict) or not t.get("name"):
+                continue
+            px = [p for p in as_list(t.get("proxyid")) if isinstance(p, dict)]
+            if not px:   # dial-up template without clients: nothing to watch
+                continue
+            up = sum(1 for p in px if str(p.get("status")).lower() == "up")
+            items["vpn|" + t["name"]] = mon_item("IPsec tunnel", t["name"], "up" if up else "down",
+                                                 "good" if up else "bad",
+                                                 detail="%d of %d phase-2 selector(s) up" % (up, len(px)))
+    except Exception as e:  # noqa: BLE001 - one part failing must not stop the rest
+        errs.append("IPsec tunnels: %s" % getattr(e, "reason", e))
+    return items, errs
+
+
+MON_WATCH = {"f5": mon_f5, "paloalto": mon_pan, "fortigate": mon_fg}
+
+
+def mon_poll(sid, sess):
+    name = sess.get("name") or sess.get("host")
+    prev = MON["state"].get(sid)
+    if prev is not None and not all(isinstance(v, dict) and "cls" in v for v in prev.values()):
+        prev = None   # kept by a live update from an older version of the monitor: start again from this pass
+        MON.setdefault("quiet", {}).pop(sid, None)
+    cur, errs = MON_WATCH[sess["vendor"]](sid, sess, prev)
+    quiet = MON.setdefault("quiet", {}).setdefault(sid, set())
+    if prev is None:
+        quiet.update(k for k, it in cur.items() if it["cls"] == "bad" and it["cat"] not in MON_BASELINE)
+        base = [it for it in cur.values() if it["cls"] == "bad" and it["cat"] in MON_BASELINE]
+        if base:
+            mon_event("baseline", sess, "%d object(s) on %s are down now: %s" % (
+                len(base), name, ", ".join("%s %s" % (it["cat"].lower(), it["label"]) for it in base[:6]) +
+                (" …" if len(base) > 6 else "")), members=base[:50])
+    else:
+        for k, it in cur.items():
+            was = prev.get(k)
+            if k in quiet:
+                if it["cls"] != "bad":
+                    quiet.discard(k)   # seen up: from now on it alerts like everything else
+                continue
+            if not was or was["state"] == it["state"]:
+                continue
+            what = dict(it, was=was["state"], now=it["state"])
+            if it["cls"] == "ha":
+                mon_event("ha", sess, "%s on %s changed: %s -> %s" % (it["label"].capitalize(), name, was["state"],
+                                                                     it["state"]), **what)
+            elif it["cls"] == "bad" and was["cls"] != "bad":
+                mon_event("offline", sess, "%s %s went %s on %s (was %s)" % (
+                    it["cat"], it["label"], "OFFLINE" if it["cat"] in MON_BASELINE else
+                    "DOWN" if it["state"] == "down" else "DOWN (%s)" % it["state"],
+                    name, was["state"]), **what)
+            elif it["cls"] == "admin":   # disabled / forced offline by an admin (also a change between the two)
+                mon_event("admin", sess, "%s %s was set to %s on %s (was %s)" % (it["cat"], it["label"], it["state"],
+                                                                                name, was["state"]), **what)
+            elif was["cls"] in ("bad", "admin"):   # back from offline, or enabled again by an admin
+                mon_event("recovered", sess, "%s %s is back in service (%s) on %s (was %s)" % (
+                    it["cat"], it["label"], it["state"], name, was["state"]), **what)
+        pools, prev_pools = {}, {}
+        for src, dst in ((cur, pools), (prev, prev_pools)):
+            for it in src.values():
+                if it["cat"] == "Pool member":
+                    dst.setdefault(it["pool"], []).append(it["state"])
+        for pool, sts in pools.items():
+            if "up" not in sts and "no monitor" not in sts and any(s in ("up", "no monitor") for s in prev_pools.get(pool, [])):
+                vips = next((it.get("vips") for it in cur.values() if it.get("pool") == pool), [])
+                mon_event("pooldown", sess, "Pool %s on %s has NO available members" % (pool, name), pool=pool, vips=vips)
+            elif any(s in ("up", "no monitor") for s in sts) and prev_pools.get(pool) and                     not any(s in ("up", "no monitor") for s in prev_pools[pool]):
+                vips = next((it.get("vips") for it in cur.values() if it.get("pool") == pool), [])
+                mon_event("recovered", sess, "Pool %s on %s has available members again" % (pool, name), pool=pool,
+                          vips=vips, cat="Pool")
+    for k in list(quiet):
+        if k not in cur:
+            quiet.discard(k)
+    MON["state"][sid] = cur
+    counts = collections.Counter(it["cat"] for it in cur.values() if it["cls"] != "ha")
+    down = [dict(it) for k, it in cur.items() if it["cls"] in ("bad", "admin") and k not in quiet]
+    ha = "; ".join("%s: %s" % (it["label"], it["state"]) for it in cur.values() if it["cls"] == "ha")
+    MON["status"][sid] = {"device": name, "vendor": sess["vendor"], "time": time.strftime("%H:%M:%S"), "error": "",
+                          "warnings": errs, "counts": dict(counts), "ha": ha, "down": down[:150],
+                          "offline": sum(1 for it in down if it["cls"] == "bad")}
+
+
+def mon_cycle(items):
+    try:
+        for sid, sess in items:
+            try:
+                mon_poll(sid, sess)
+            except Exception as e:  # noqa: BLE001 - one device's failure must not stop the others or print a traceback
+                err = str(getattr(e, "reason", e))[:200]
+                if not isinstance(e, (ValueError, urllib.error.URLError, OSError)):
+                    err = "%s: %s" % (type(e).__name__, err)
+                st = MON["status"].setdefault(sid, {"device": sess.get("name") or sess.get("host"), "down": []})
+                if st.get("error") != err:
+                    mon_event("error", sess, "Monitor cannot read %s: %s" % (st["device"], err))
+                st.update(error=err, time=time.strftime("%H:%M:%S"))
+    finally:
+        MON["busy"] = False
+
+
+def mon_tick():
+    """Start a background pass when one is due (called by the page's polling, so no thread runs without a page)."""
+    with LOCK:
+        f5 = [(sid, s) for sid, s in SESSIONS.items() if s.get("vendor") in MON_WATCH]
+    for gone in [k for k in MON["status"] if k not in dict(f5)]:
+        MON["status"].pop(gone, None)
+        MON["state"].pop(gone, None)
+        MON["vips"].pop(gone, None)
+        MON.setdefault("quiet", {}).pop(gone, None)
+    with MON["lock"]:
+        if not MON["on"] or not f5 or MON["busy"] or time.time() < MON["next"]:
+            return
+        MON["busy"], MON["next"] = True, time.time() + MON["interval"]
+    threading.Thread(target=mon_cycle, args=(f5,), daemon=True).start()
+
+
+def do_monitor_get(query):
+    mon_tick()
+    try:
+        since = int(urllib.parse.parse_qs(query).get("since", ["-1"])[0])
+    except ValueError:
+        since = -1
+    with MON["lock"]:
+        ev = [e for e in MON["events"] if e["seq"] > since] if since >= 0 else list(MON["events"])[-30:]
+        seq = MON["seq"]
+    return {"ok": True, "on": MON["on"], "interval": MON["interval"], "seq": seq, "events": ev, "busy": MON["busy"],
+            "status": list(MON["status"].values())}
+
+
+def do_monitor_set(b):
+    if "on" in b:
+        MON["on"] = bool(b.get("on"))
+    if "interval" in b:
+        try:
+            iv = int(b.get("interval"))
+        except (TypeError, ValueError):
+            iv = 0
+        if iv not in MON_INTERVALS:
+            return {"ok": False, "error": "interval must be one of %s seconds" % ", ".join(map(str, MON_INTERVALS))}
+        MON["interval"] = iv
+    if b.get("now") or "interval" in b or b.get("on"):
+        MON["next"] = 0.0
+    return {"ok": True, "on": MON["on"], "interval": MON["interval"]}
 
 
 # ---- Packet capture analysis: a .pcap / .pcapng uploaded in the AI assistant is read here (standard library only) ----
@@ -13322,7 +13746,7 @@ def do_pcap_upload(raw, fname):
 # saved logins, AI settings, caches and the URL token survive an update. A file with errors is not applied: the page
 # shows the error and the old code keeps running. The watcher itself and main() only change on a real restart.
 LIVE_STATE = ("TOKEN", "SESSIONS", "AUDIT", "LOCK", "TERMS", "TERM_LOCK", "VAULT", "VAULT_LOCK", "F5_HOST_CACHE",
-              "PAN_VRS", "CAPTURE_BUSY", "CF_EDGE", "WHOIS_BOOT", "LLM_CFG", "HOT")
+              "PAN_VRS", "CAPTURE_BUSY", "CF_EDGE", "WHOIS_BOOT", "LLM_CFG", "HOT", "MON")
 HOT = {"gen": 0, "page": "", "error": "", "time": ""}
 
 
