@@ -44,6 +44,8 @@ import codecs
 import collections
 import concurrent.futures
 import datetime
+import functools
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -103,6 +105,9 @@ CATALOG = {
          "total and max connections, bits in/out)", "handler": "f5_vs_top",
          "params": [P("by", "Sort by: current, total, max, bits or packets", "current", "current", required=False),
                     P("top", "How many (1-500)", "20", "20", required=False)]},
+        {"id": "irules", "group": "LTM", "label": "iRules and the virtual servers they are assigned to (unused iRules "
+         "flagged)", "handler": "f5_irules",
+         "params": [P("name", "iRule name (or part of it, optional)", "my_irule", required=False)]},
         {"id": "vsall", "group": "LTM", "label": "All virtual servers: names, IPs, pools and up/down status (no connection "
          "counts)", "path": "/mgmt/tm/ltm/virtual/stats"},
         {"id": "vsone", "group": "LTM", "label": "One virtual server stats", "path": "/mgmt/tm/ltm/virtual/{vs}/stats",
@@ -1581,6 +1586,30 @@ def f5_host_cond(c, host):
 
 
 F5_HOST_CACHE = {}   # (session id, hostname) -> (time, result): the flow trace asks each F5 more than once
+
+
+F5_OBJ_RE = re.compile(r"^/[A-Za-z0-9_.\-]{1,64}(/[A-Za-z0-9_.\-]{1,64}){1,2}$")   # /Partition[/folder.app]/name
+
+
+def do_f5_irule(b):
+    """Read-only: the code of one iRule (GET /mgmt/tm/ltm/rule/~Partition~name) for the pop-up in the iRules list."""
+    sess = SESSIONS.get(b.get("id"))
+    if not sess or sess.get("vendor") != "f5":
+        return {"ok": False, "error": "the F5 this list came from is no longer connected"}
+    name = str(b.get("name") or "").strip()
+    if not F5_OBJ_RE.match(name):
+        return {"ok": False, "error": "not a valid iRule name: %s" % name[:100]}
+    path = "/mgmt/tm/ltm/rule/%s?$select=fullPath,apiAnonymous" % name.replace("/", "~")
+    try:
+        st, ok, d = rest_get(sess, path)
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "could not reach the F5: %s" % getattr(e, "reason", e)}
+    audit(sess, "show iRule code %s" % name)
+    if not ok or not isinstance(d, dict):
+        msg = d.get("message") if isinstance(d, dict) else str(d)[:200]
+        return {"ok": False, "error": "the F5 did not return the iRule (HTTP %s%s)" % (st, ": " + str(msg) if msg else "")}
+    return {"ok": True, "name": d.get("fullPath") or name, "code": str(d.get("apiAnonymous") or ""),
+            "device": sess.get("name") or sess.get("host")}
 
 
 def do_f5_host(b):
@@ -3690,6 +3719,56 @@ def f5_vs_top(sess, v):
             "verdict": {"label": "TOP %d OF %d VIRTUAL SERVERS BY %s" % (len(rows), total, what.upper()), "kind": "info"}}
 
 
+def f5_irules(sess, v):
+    """Every iRule (all partitions) with the virtual servers it is attached to, in the order the VS runs them."""
+    t0 = time.time()
+    want = str(v.get("name") or "").strip().lower()
+    ok, d = f5_get(sess, "/mgmt/tm/ltm/rule?$select=name,partition,fullPath")
+    if not ok:
+        raise ValueError("could not read the iRules (%s)" % str(d)[:200])
+    rules = [r for r in d.get("items") or [] if isinstance(r, dict)]
+    ok, d = f5_get(sess, "/mgmt/tm/ltm/virtual?$select=name,partition,fullPath,destination,rules,disabled")
+    if not ok:
+        raise ValueError("could not read the virtual servers (%s)" % str(d)[:200])
+    used = collections.defaultdict(list)   # iRule full path -> ["vs (10.1.1.10:443) #1", ...]
+    vs_count = 0
+    for vs in d.get("items") or []:
+        if not isinstance(vs, dict):
+            continue
+        vs_count += 1
+        dest = re.sub(r"%\d+", "", str(vs.get("destination") or "").rsplit("/", 1)[-1])
+        label = "%s (%s)%s" % (vs.get("fullPath") or vs.get("name"), dest, " disabled" if vs.get("disabled") else "")
+        attached = [str(x) for x in vs.get("rules") or []]
+        for i, rp in enumerate(attached, 1):
+            used[rp].append(label + (" #%d of %d" % (i, len(attached)) if len(attached) > 1 else ""))
+    rows, hidden_sys = [], 0
+    for r in sorted(rules, key=lambda x: str(x.get("fullPath") or x.get("name")).lower()):
+        fp = str(r.get("fullPath") or "/%s/%s" % (r.get("partition", "Common"), r.get("name")))
+        if want and want not in fp.lower():
+            continue
+        vss = used.pop(fp, [])
+        if str(r.get("name", "")).startswith("_sys_") and not vss and not want:
+            hidden_sys += 1   # F5 built-in iRules nobody uses
+            continue
+        rows.append({"irule": fp, "virtual_servers": vss, "vs_count": len(vss), "status": "assigned" if vss else "UNUSED"})
+    for fp, vss in used.items():   # referenced but not in the list (e.g. no read access to its partition)
+        if not want or want in fp.lower():
+            rows.append({"irule": fp, "virtual_servers": vss, "vs_count": len(vss), "status": "assigned (iRule not readable)"})
+    rows.sort(key=lambda x: (x["vs_count"] == 0, x["irule"].lower()))
+    unused = [x["irule"] for x in rows if not x["vs_count"]]
+    summary = ["%d iRule(s)%s, %d assigned to at least one of %d virtual server(s), %d not assigned to any." % (
+        len(rows), " matching '%s'" % want if want else "", len(rows) - len(unused), vs_count, len(unused))]
+    if hidden_sys:
+        summary.append("%d unused F5 built-in iRule(s) (_sys_*) are not listed." % hidden_sys)
+    summary.append("'#2 of 3' = the iRule's position in that virtual server's iRule list (they run in that order). "
+                   "Only virtual server assignments are checked: an UNUSED iRule may still be called from another iRule.")
+    kind = "info" if rows else "warn"
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
+            "request": "GET /mgmt/tm/ltm/rule + /mgmt/tm/ltm/virtual", "data": {"irules": rows}, "summary": summary,
+            "verdict": {"label": ("%d IRULE(S), %d UNUSED" % (len(rows), len(unused))) if rows else
+                        "NO IRULE FOUND" + (" MATCHING '%s'" % want.upper() if want else ""), "kind": kind}}
+
+
 PAN_REPORT_PERIODS = collections.OrderedDict([("last-15-minutes", 900), ("last-hour", 3600), ("last-6-hrs", 21600),
                                              ("last-12-hrs", 43200), ("last-24-hrs", 86400), ("last-7-days", 604800),
                                              ("last-30-days", 2592000)])
@@ -3858,7 +3937,8 @@ def f5_conns(sess, v):
 PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_routes, "pan_sessions": pan_sessions,
                 "pan_resources": pan_resources, "fg_resources": fg_resources,
                 "f5_perf": f5_perf, "f5_vs_top": f5_vs_top, "pan_app_traffic": pan_app_traffic,
-                "pan_snat": pan_snat, "fg_snat": fg_snat, "f5_snat": f5_snat_lookup, "f5_conns": f5_conns}
+                "pan_snat": pan_snat, "fg_snat": fg_snat, "f5_snat": f5_snat_lookup, "f5_conns": f5_conns,
+                "f5_irules": f5_irules}
 
 
 def do_ipcheck(b):
@@ -8786,13 +8866,9 @@ def cf_m_ray(sess, b, t0):
     notes = [cf_scope(sess, zones), "Time range: " + span + searched] + f5_notes
     if not events and not reqs:
         notes.append("Security events exist only for requests a security feature acted on or logged, and sampled "
-                     "request data does not hold every request; only the last 24 hours are searched. 'Trace Ray ID: "
-                     "Cloudflare → F5' also searches the F5 log, which keeps every logged request.")
+                     "request data does not hold every request; only the last 24 hours are searched.")
         if len(sess.get("zones") or []) > len(zones) > 1:
             notes.append("Only the first %d zones were searched." % len(zones))
-    if f5_rows is None:
-        notes.append("Tip: 'Trace Ray ID: Cloudflare → F5' also finds this request in the ASM log of the connected F5 "
-                     "(Cloudflare sends the Ray ID to the origin in the CF-Ray header).")
     return cf_result(t0, "GraphQL firewallEventsAdaptive + httpRequestsAdaptive (rayName %s)" % ray, label, kind,
                      notes + cf_gql_notes(zones, res, dropped),
                      {"security_events": events, "request": reqs, "f5_asm_requests": f5_rows or []})
@@ -11327,6 +11403,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, {"error": "could not load saved profiles: %s" % e})
         if u.path == "/api/monitor":
             return self._send(200, do_monitor_get(u.query))
+        if u.path == "/api/dash":
+            return self._send(200, do_dash_get(u.query))
+        if u.path == "/api/adv":
+            return self._send(200, do_adv_get(u.query))
         if u.path == "/api/devices":   # the sessions this console holds, so a reloaded page shows them again
             return self._send(200, devices_public())
         if u.path == "/api/version":
@@ -11368,13 +11448,13 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/api/connect": do_connect, "/api/run": do_run, "/api/ssh": do_ssh, "/api/term/open": do_term_open, "/api/term/read": do_term_read,
                   "/api/term/write": do_term_write, "/api/term/resize": do_term_resize, "/api/term/close": do_term_close,
                   "/api/raw": do_raw, "/api/disconnect": do_disconnect, "/api/vault": do_vault,
-                  "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/natmap": do_nat_map, "/api/vipmap": do_vip_map, "/api/f5host": do_f5_host, "/api/f5logs": do_f5_logs,
+                  "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/natmap": do_nat_map, "/api/vipmap": do_vip_map, "/api/f5host": do_f5_host, "/api/f5irule": do_f5_irule, "/api/f5logs": do_f5_logs,
                   "/api/f5capture": do_f5_capture, "/api/f5file": do_f5_file, "/api/policy": do_policy_search, "/api/profile/save": do_profile_save,
                   "/api/profile/delete": do_profile_delete, 
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
                   "/api/fglogs": do_fg_logs, "/api/adminaudit": do_admin_audit, "/api/f5sync": do_f5_sync, "/api/pancapture": do_pan_capture,
                   "/api/backup": do_backup, "/api/cf": do_cf, "/api/acc": do_acc,
-                  "/api/monitor": do_monitor_set, "/api/llm/config": llm_wrap(do_llm_config), "/api/llm/models": llm_wrap(do_llm_models),
+                  "/api/monitor": do_monitor_set, "/api/dash": do_dash_set, "/api/adv": do_adv_set, "/api/llm/config": llm_wrap(do_llm_config), "/api/llm/models": llm_wrap(do_llm_models),
                   "/api/llm/chat": llm_wrap(do_llm_chat)}
         fn = routes.get(self.path)
         if not fn:
@@ -11424,6 +11504,15 @@ header small{color:var(--dim)}
 .wrap{display:grid;grid-template-columns:320px 1fr;gap:18px;padding:18px 24px}
 .wrap>.outcard{grid-column:1/-1;min-width:0;margin-bottom:0}  /* Output spans the full width below both columns */
 @media(max-width:900px){.wrap{grid-template-columns:1fr}}
+/* collapsible panes: the devices pane shrinks to a strip; with the checks pane hidden the output moves up beside it */
+.panebar{display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+.panebar span{flex:1}.panebar button{padding:2px 10px;font-size:12px;letter-spacing:0;text-transform:none;box-shadow:none}
+.wrap.lcol{grid-template-columns:40px minmax(0,1fr)}.wrap.lcol>#lpane>:not(.panebar){display:none}
+.wrap.lcol>#lpane .panebar{flex-direction:column-reverse;position:sticky;top:12px;margin:0}.wrap.lcol>#lpane .panebar span{flex:none;writing-mode:vertical-rl}
+.wrap.rcol{grid-template-rows:auto 1fr}.wrap.rcol>#rpane>:not(.panebar){display:none}.wrap.rcol>#lpane{grid-row:1/3}
+.wrap.rcol>.outcard{grid-column:2;grid-row:2;align-self:start}
+@media(max-width:900px){.wrap.lcol{grid-template-columns:1fr}.wrap.lcol>#lpane .panebar{flex-direction:row}
+ .wrap.lcol>#lpane .panebar span{flex:1;writing-mode:horizontal-tb}.wrap.rcol>#lpane{grid-row:auto}.wrap.rcol>.outcard{grid-column:1;grid-row:auto}}
 /* Decorative emblem in the empty space below the sidebar; stays in view while the right column scrolls. */
 .bglogo{position:sticky;top:24px;margin:28px 12px 0;opacity:.6;pointer-events:none;user-select:none}
 .bglogo svg{width:100%;height:auto;display:block;font-family:'Segoe UI',system-ui,Roboto,sans-serif}
@@ -11518,6 +11607,10 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .dtabs{display:flex;gap:6px;flex-wrap:wrap}#pretty .dtabs button.on{border-color:var(--violet);box-shadow:0 0 12px #7C6CFF33;color:var(--mint)}
 #aicard{position:fixed;right:20px;bottom:84px;z-index:60;width:min(420px,calc(100vw - 32px));height:min(640px,calc(100vh - 110px));margin:0;padding:0;display:flex;flex-direction:column;background:#fff;color:#1d1d1f;border:0;border-radius:14px;overflow:hidden;box-shadow:0 16px 48px #000a}
 #aicard[hidden]{display:none}
+#aicard.full{left:16px;right:16px;top:16px;bottom:16px;width:auto;height:auto;z-index:90}
+#aicard.full .aihead{cursor:default}#aicard .aititle{cursor:default;user-select:none}
+#aicard.full .aimsg{max-width:min(85%,1100px)}
+#aicard.full ~ #aifab,body:has(#aicard.full:not([hidden])) #aifab{display:none}
 #aicard .aihead{display:flex;align-items:center;gap:12px;padding:12px 14px;background:#2b2b2e;color:#fff;flex:0 0 auto}
 #aicard .aihead .aititle{flex:1;min-width:0}#aicard .aihead b{display:block;font-size:15px;font-weight:600}
 #aicard .aihead small{display:block;font-size:12px;color:#b8b8c0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -11585,8 +11678,70 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .dtop .dvv{text-align:right;color:var(--dim);font-variant-numeric:tabular-nums}
 #hotbar{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:80;display:flex;gap:10px;align-items:center;max-width:min(860px,calc(100vw - 32px));padding:10px 12px 10px 16px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--text);box-shadow:0 8px 28px #0006;font-size:13.5px}
 #hotbar[hidden]{display:none}
+/* iRule code pop-up (F5 iRules list: click a name) */
+#pretty a.irlink{color:var(--mint);text-decoration:underline;cursor:pointer;font-weight:600}
+#irpop{position:fixed;inset:0;z-index:95;background:#0008;display:flex;align-items:center;justify-content:center;padding:16px}
+#irpop[hidden]{display:none}
+#irpop .irbox{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px #0007;width:min(1000px,100%);max-height:calc(100vh - 32px);display:flex;flex-direction:column}
+#irpop .irhead{display:flex;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line)}
+#irpop .irhead h3{margin:0;font-size:15px;flex:1;min-width:0;overflow-wrap:anywhere}#irpop .irhead span{color:var(--dim);font-size:12.5px;font-weight:400}
+#irpop .irhead button{flex:none;padding:5px 12px}
+#irpop .ircode{margin:0;overflow:auto;padding:10px 0;font:12.5px/1.55 ui-monospace,Menlo,Consolas,monospace;background:var(--panel2);border-radius:0 0 12px 12px;counter-reset:ln;flex:1}
+#irpop .ircode div{white-space:pre;padding:0 14px 0 0}#irpop .ircode div::before{counter-increment:ln;content:counter(ln);display:inline-block;width:44px;margin-right:12px;text-align:right;color:var(--dim);opacity:.7;user-select:none}
+#irpop .irmsg{padding:18px 14px;color:var(--dim)}
+/* vendor advisories headline: one chip per vendor + version, details panel below it */
+:root{--warn:#f0b429}:root[data-theme=light]{--warn:#9a6200}
+#advbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 24px;border-bottom:1px solid var(--line);background:var(--panel);font-size:13px}
+#advbar[hidden],#advpanel[hidden]{display:none}
+#advbar .ahd{font-weight:700;color:var(--dim);white-space:nowrap;margin-right:2px}
+.adim{color:var(--dim)}.aok{color:var(--ok);font-weight:600}.ago{font-weight:700;color:var(--mint);white-space:nowrap}
+.achip{display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px;padding:5px 10px;border:1px solid var(--line);border-left:4px solid var(--ok);border-radius:8px;cursor:pointer;background:var(--panel2);max-width:100%;user-select:none}
+.achip:hover,.achip.sel{border-color:var(--mint)}.achip.a-crit{border-left-color:var(--bad)}.achip.a-high{border-left-color:var(--warn)}.achip.a-err{border-left-color:var(--dim)}
+.apill{font-size:11.5px;padding:0 7px;border-radius:9px;font-weight:600;white-space:nowrap;border:1px solid transparent}
+.apill.a-c{color:var(--bad);border-color:var(--bad)}.apill.a-h{color:var(--warn);border-color:var(--warn)}.apill.a-k{background:var(--bad);color:#fff}.apill.a-m{color:var(--dim);border-color:var(--line)}
+#advpanel{margin:0;padding:12px 24px 14px;border-bottom:1px solid var(--line);background:var(--panel2);max-height:62vh;overflow:auto;font-size:13px}
+#advpanel .ahead{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}#advpanel .ahead h3{margin:0;font-size:15px;flex:1;min-width:200px}
+#advpanel select{width:auto}#advpanel .abox{border:1px solid var(--line);border-left:4px solid var(--mint);border-radius:8px;padding:8px 12px;margin:0 0 10px;background:var(--panel)}
+#advpanel .abox.eol{border-left-color:var(--bad)}#advpanel table{border-collapse:collapse;width:100%;font-size:12.5px;background:var(--panel)}
+#advpanel th{text-align:left;color:var(--dim);font-weight:600;border-bottom:1px solid var(--line);padding:5px 8px;white-space:nowrap;position:sticky;top:-12px;background:var(--panel)}
+#advpanel td{border-bottom:1px solid var(--line);padding:5px 8px;vertical-align:top}#advpanel td.nw{white-space:nowrap}
+#advpanel a{color:var(--mint)}#advpanel .afoot{margin-top:10px;color:var(--dim);font-size:12px;line-height:1.5}
+/* ---- Operations dashboard ---- */
+#dash{position:fixed;inset:0;z-index:55;background:var(--bg);color:var(--text);overflow:auto;padding-bottom:24px}#dash[hidden]{display:none}
+#dash .dbar{position:sticky;top:0;z-index:2;display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
+#dash .dbar h2{margin:0;font-size:17px;flex:1 1 220px}#dash .dmeta{color:var(--dim);font-size:12.5px}
+#dash .dlbl{display:flex;gap:6px;align-items:center;margin:0;font-size:13px;color:var(--text)}#dash .dlbl select{width:auto}
+#dash .dclose{margin-left:0}
+#dash .dsum{display:flex;flex-wrap:wrap;gap:10px;padding:16px 20px 0}
+#dash .dsum div{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 16px;min-width:130px}
+#dash .dsum b{display:block;font-size:24px;font-variant-numeric:tabular-nums}#dash .dsum span{font-size:12px;color:var(--dim)}
+#dash .dsum .k-bad b{color:var(--bad)}#dash .dsum .k-warn b{color:#d08700}
+#dash .dsec{margin:18px 20px 0;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--mint)}
+#dash .dgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(380px,100%),1fr));gap:14px;padding:10px 20px 0}
+#dash .dempty{padding:30px 20px;color:var(--dim)}
+.dcard{background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--ok);border-radius:14px;padding:12px 14px;min-width:0}
+.dcard.k-warn{border-top-color:#d08700}.dcard.k-bad{border-top-color:var(--bad)}
+.dcard .dh{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.dcard .dh b{font-size:15px}
+.dcard .dv{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--mint)}.dcard .dhost{font-size:12px;color:var(--dim)}
+.dcard .dt{margin-left:auto;font-size:11.5px;color:var(--dim)}
+.dcard h4{margin:12px 0 6px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+.dcard .dline{font-size:12.5px;margin:3px 0}.dcard .dline.k-bad{color:var(--bad)}.dcard .dline.k-warn{color:#b26b00}.dcard .dline.k-dim{color:var(--dim)}
+.dharow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px}
+.dpill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11.5px;border:1px solid var(--line);color:var(--dim)}
+.dpill.k-good{color:var(--ok);border-color:var(--ok)}.dpill.k-warn{color:#b26b00;border-color:#d08700}.dpill.k-bad{color:#fff;background:var(--bad);border-color:var(--bad)}
+.dmeter{display:grid;grid-template-columns:minmax(0,38%) 1fr 54px 64px;gap:8px;align-items:center;font-size:12.5px;margin:5px 0}
+.dmeter .l{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dmeter .v{text-align:right;font-variant-numeric:tabular-nums}
+.dmeter .bar{height:8px;border-radius:5px;background:var(--panel2);border:1px solid var(--line);overflow:hidden}
+.dmeter .bar i{display:block;height:100%;background:var(--ok)}.dmeter.k-warn .bar i{background:#d08700}.dmeter.k-bad .bar i{background:var(--bad)}
+.dmeter.k-warn .v{color:#b26b00}.dmeter.k-bad .v{color:var(--bad);font-weight:700}
+.dspark{width:64px;height:18px;display:block}.dspark path{fill:none;stroke:var(--mint);stroke-width:1.5}
+.dnums{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12.5px;margin:6px 0 2px;color:var(--dim)}.dnums b{color:var(--text);font-variant-numeric:tabular-nums}
+.dif{display:flex;flex-wrap:wrap;gap:4px}
+.dif span{font-size:11.5px;padding:2px 7px;border-radius:6px;border:1px solid var(--line);color:var(--dim);cursor:default}
+.dif span.k-good{color:var(--ok);border-color:var(--ok)}.dif span.k-bad{color:#fff;background:var(--bad);border-color:var(--bad);font-weight:700}
+.dif span.k-admin{color:#b26b00;border-color:#d08700}.dif span.k-idle{opacity:.6;border-style:dashed}
 /* ---- Device monitor: bell, panel, pop-ups ---- */
-#monbtn{position:relative}#monbtn:not([hidden])+.themebtn{margin-left:8px}#monbtn.alert{border-color:var(--bad);box-shadow:0 0 0 3px #e5484d33}
+#monbtn{position:relative}.themebtn:not([hidden])~.themebtn{margin-left:8px}#monbtn.alert{border-color:var(--bad);box-shadow:0 0 0 3px #e5484d33}
 #monbadge{position:absolute;top:-6px;right:-6px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#d92d20;color:#fff;font-size:11px;font-weight:700;line-height:18px}
 #monpanel{position:fixed;top:64px;right:16px;z-index:70;width:min(460px,calc(100vw - 32px));max-height:calc(100vh - 90px);overflow:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;box-shadow:0 16px 40px #0005;padding:12px 14px}
 #monpanel[hidden]{display:none}#monpanel h3{margin:0 0 8px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--mint)}
@@ -11597,7 +11752,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #monpanel .mline.offline,#monpanel .mline.pooldown,#monpanel .mline.error,#monpanel .mline.ha{color:var(--bad)}#monpanel .mline.recovered{color:var(--ok)}#monpanel .mline.admin{color:#b26b00}
 #montoasts{position:fixed;left:16px;bottom:16px;z-index:75;display:flex;flex-direction:column;gap:8px;width:min(440px,calc(100vw - 32px));pointer-events:none}
 .mtoast{pointer-events:auto;background:var(--panel);color:var(--text);border:1px solid var(--line);border-left:5px solid var(--bad);border-radius:10px;box-shadow:0 10px 30px #0006;padding:10px 12px;font-size:13px;animation:mtin .25s ease-out}
-.mtoast.recovered{border-left-color:var(--ok)}.mtoast.admin,.mtoast.error{border-left-color:#d08700}
+.mtoast.recovered{border-left-color:var(--ok)}.mtoast.change{border-left-color:var(--mint)}#monpanel .mline.change{color:var(--mint)}.mtoast.admin,.mtoast.error{border-left-color:#d08700}
 .mtoast .mth{display:flex;align-items:center;gap:8px;font-weight:700;margin-bottom:3px}.mtoast .mth span{flex:1}
 .mtoast .mth button{padding:0 8px;font-size:13px;box-shadow:none}.mtoast .mtv{color:var(--dim);font-size:12px;margin-top:3px}
 @keyframes mtin{from{transform:translateY(12px);opacity:0}}
@@ -11624,9 +11779,9 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 [data-theme=light] button:hover{background:#095db0;border-color:#095db0;color:#fff;box-shadow:none}
 [data-theme=light] button:disabled{background:#8db9e6;border-color:#8db9e6;cursor:default}
 /* small controls stay light: close buttons, round header buttons, dashboard tabs (the selected one is blue) */
-[data-theme=light] .themebtn,[data-theme=light] .dev button,[data-theme=light] .mtoast button,[data-theme=light] #hotbar button:not(.primary),
+[data-theme=light] .themebtn,[data-theme=light] .panebar button,[data-theme=light] .dev button,[data-theme=light] .mtoast button,[data-theme=light] #hotbar button:not(.primary),
 [data-theme=light] #pretty .dtabs button{background:#fff;border-color:#cfd7e3;color:#1c2733}
-[data-theme=light] .themebtn:hover,[data-theme=light] .dev button:hover,[data-theme=light] .mtoast button:hover,
+[data-theme=light] .themebtn:hover,[data-theme=light] .panebar button:hover,[data-theme=light] .dev button:hover,[data-theme=light] .mtoast button:hover,
 [data-theme=light] #hotbar button:not(.primary):hover,[data-theme=light] #pretty .dtabs button:hover{background:#eef5fd;border-color:var(--mint);color:var(--mint)}
 [data-theme=light] button.primary{background:#0b6fd0;color:#fff;border:0}
 [data-theme=light] button.primary:hover{background:#095db0;color:#fff}
@@ -11659,7 +11814,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 [data-theme=light] #pretty .dtile.bad{border-color:var(--bad);box-shadow:none}
 [data-theme=light] #pretty svg .hv:hover{fill:#0b6fd012}
 [data-theme=light] #pretty .dtabs button.on{background:#0b6fd0;border-color:#0b6fd0;box-shadow:none;color:#fff}
-[data-theme=light] svg [fill="#8f8cb8"]{fill:#5f6b7a}[data-theme=light] svg [stroke="#2a2850"]{stroke:#e1e6ee}
+[data-theme=light] svg [fill="#8f8cb8"]{fill:#5f6b7a}[data-theme=light] svg [stroke="#8f8cb8"]{stroke:#5f6b7a}[data-theme=light] svg [stroke="#2a2850"]{stroke:#e1e6ee}
 [data-theme=light] svg [fill="#14132a"]{fill:#fff}
 [data-theme=light] svg stop[stop-color="#2EE6C5"]{stop-color:#0b6fd0}[data-theme=light] svg stop[stop-color="#7C6CFF"]{stop-color:#6c3fc4}
 [data-theme=light] svg stop[stop-color="#FF7A59"]{stop-color:#f26b38}[data-theme=light] svg [stroke="#2EE6C5"]{stroke:#0b6fd0}
@@ -11682,10 +11837,15 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 </style>
 <script>try{document.documentElement.dataset.theme=localStorage.getItem("theme")||"light"}catch(e){document.documentElement.dataset.theme="light"}</script>
 </head><body>
-<header><img class="brand" src="/brand-logo?t=__TOKEN__" alt="" onload="this.nextElementSibling.hidden=false" onerror="this.remove()"><span class="bsep" hidden></span><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><button class="themebtn" id="monbtn" onclick="monPanel()" title="Device monitor" aria-label="Device monitor" hidden>🔔<span id="monbadge" hidden></span></button><button class="themebtn" onclick="themeToggle()" title="Switch light / dark theme" aria-label="Switch light / dark theme">◐</button></header>
+<header><img class="brand" src="/brand-logo?t=__TOKEN__" alt="" onload="this.nextElementSibling.hidden=false" onerror="this.remove()"><span class="bsep" hidden></span><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><button class="themebtn" id="dashbtn" onclick="dashToggle()" title="Operations dashboard: resources, interfaces and HA of all firewalls and F5s" aria-label="Operations dashboard" hidden>▦</button><button class="themebtn" id="monbtn" onclick="monPanel()" title="Device monitor" aria-label="Device monitor" hidden>🔔<span id="monbadge" hidden></span></button><button class="themebtn" onclick="themeToggle()" title="Switch light / dark theme" aria-label="Switch light / dark theme">◐</button></header>
+<div id="advbar" hidden></div><div id="advpanel" hidden></div>
+<div id="dash" hidden><div class="dbar"><h2>▦ Operations dashboard</h2><span class="dmeta" id="dash_meta"></span>
+<label class="dlbl">Refresh every <select id="dash_iv" onchange="dashSet({interval:+this.value})"><option value="300">5 min</option><option value="600">10 min</option><option value="1200">20 min</option><option value="1800">30 min</option><option value="3600">60 min</option></select></label>
+<button onclick="dashSet({now:1})">Refresh now</button><button class="themebtn dclose" onclick="dashToggle(false)" title="Close (Esc)" aria-label="Close">✕</button></div><div id="dashbody"></div></div>
 <div id="monpanel" hidden></div><div id="montoasts" aria-live="assertive"></div>
-<div class="wrap">
-<div>
+<div class="wrap" id="wrap">
+<div id="lpane">
+  <div class="panebar"><span>Devices &amp; connect</span><button id="lpane_btn" onclick="paneToggle('l')" title="Collapse this pane" aria-label="Collapse the devices pane">«</button></div>
   <div class="card"><h3>Saved device profiles</h3>
     <select id="profiles"><option value="">Loading profiles…</option></select>
     <div class="row" style="margin-top:8px"><button onclick="useProfile()">Use</button>
@@ -11723,18 +11883,21 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
     <g fill="none" stroke="#2a2850" stroke-width="1.2"><circle cx="140" cy="150" r="60"/><circle cx="140" cy="150" r="95" stroke-dasharray="3 5"/><circle cx="140" cy="150" r="130"/></g>
     <path class="sweep" d="M140 150 L270 150 A130 130 0 0 0 239.6 66.4 Z" fill="url(#bgl-sw)"/>
     <g stroke="#7C6CFF" stroke-opacity=".45" stroke-width="1.2" stroke-dasharray="2 4"><path d="M88 120 50 98M192 120 230 98M192 180 230 202M88 180 50 202"/></g>
-    <g font-size="9" font-weight="600" text-anchor="middle" fill="#8f8cb8" letter-spacing=".08em">
-      <circle cx="38" cy="91" r="16" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.5"/><text x="38" y="94.5">F5</text>
-      <circle cx="242" cy="91" r="16" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.5"/><text x="242" y="94.5">PAN</text>
-      <circle cx="242" cy="209" r="16" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.5"/><text x="242" y="212.5">FGT</text>
-      <circle cx="38" cy="209" r="16" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.5"/><text x="38" y="212.5">CF</text></g>
+    <g fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.5"><circle cx="38" cy="91" r="16"/><circle cx="242" cy="91" r="16"/>
+      <circle cx="242" cy="209" r="16"/><circle cx="38" cy="209" r="16"/></g>
+    <g fill="none" stroke="#8f8cb8" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+      <path transform="translate(38 92)" d="M-6 4.5h12a3.5 3.5 0 0 0 .3-7 5 5 0 0 0-9.6-1.2A3.4 3.4 0 0 0-6 4.5z"/>
+      <g transform="translate(242 91)"><rect x="-7" y="-6" width="14" height="12" rx="1"/><path d="M-7-2h14M-7 2h14M0-6v4M-3.5-2v4M3.5-2v4M0 2v4"/></g>
+      <g transform="translate(242 209)"><rect x="-7" y="-6.5" width="14" height="5.5" rx="1"/><rect x="-7" y="1" width="14" height="5.5" rx="1"/><path d="M3.5-3.75h.01M3.5 3.75h.01" stroke-width="2"/></g>
+      <g transform="translate(38 209)"><rect x="-6" y="-5.5" width="12" height="8" rx="1"/><path d="M-8.5 5h17"/></g></g>
     <g transform="translate(82.4 92.4) scale(3.2)"><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.4" stroke-linejoin="round"/>
     <path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2" stroke-linecap="round"/></g>
     <text x="140" y="318" text-anchor="middle" font-size="22" font-weight="700" fill="url(#bgl-g)">ITSec Ops</text>
     <text x="140" y="340" text-anchor="middle" font-size="10" fill="#8f8cb8" letter-spacing=".25em">OBSERVE · TRACE · VERIFY</text>
   </svg></div>
 </div>
-<div>
+<div id="rpane">
+  <div class="panebar"><span>Checks &amp; tools</span><button id="rpane_btn" onclick="paneToggle('r')" title="Collapse this pane: the output moves up" aria-label="Collapse the checks pane">Hide ▴</button></div>
   <div id="sshtool"></div><div id="terms"></div><div id="flowtrace"></div><div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
   <div id="iplookup"></div><div id="f5tools"></div>
   <div class="card" id="main"><h3>Checks</h3><div class="muted">Connect a device to begin.</div></div>
@@ -11757,6 +11920,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
       <div class="aititle"><b>ITSec Assistant</b><small id="ai_sub">local LLM · no model set</small></div>
       <button onclick="aiCfg()" title="Model settings" aria-label="Model settings">⚙</button>
       <button onclick="aiClear()" title="New conversation" aria-label="New conversation">↻</button>
+      <button id="ai_full" onclick="aiFull()" title="Full screen" aria-label="Full screen">⤢</button>
       <button onclick="aiToggle(false)" title="Close (Esc)" aria-label="Close">✕</button></div>
     <div class="aibody">
     <details id="ai_cfg"><summary>Model settings</summary>
@@ -11859,7 +12023,6 @@ function dev(){return devices.find(d=>d.id===cur)}
 function renderAll(){renderDevs();renderChecks();renderSsh();renderCf();renderAcc();renderAppsec();renderIp();renderF5();const d=dev();
  $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:""}
 function renderFlow(){const box=$("#flowtrace");if(!devices.length){box.innerHTML="";return}
- const vs=[...new Set(devices.map(d=>d.vendor))].map(v=>({cloudflare:"Cloudflare",f5:"F5",paloalto:"Palo Alto",fortigate:"FortiGate"})[v]||v).join(" · ");
  if(!$("#ft_dst")){box.innerHTML='<div class="card"><h3>Flow trace · one flow on every connected device</h3><div class="row3">'+
   fld("ft_src","Source / client IP","203.0.113.5")+fld("ft_dst","Destination IP or hostname","shop.example.com or 10.5.1.20")+
   fld("ft_port","Destination port (optional)","443")+
@@ -11867,7 +12030,6 @@ function renderFlow(){const box=$("#flowtrace");if(!devices.length){box.innerHTM
   '<div><label>Events / logs time range</label><select id="ft_within"><option>last 15 minutes</option><option>last hour</option><option>last 6 hours</option><option>last 12 hours</option><option selected>last 24 hours</option></select></div></div>'+
   '<div class="chk"><input type="checkbox" id="ft_logs"><span>Also search logs (F5 WAF log, Palo Alto / FortiGate traffic logs). Slower: up to a few minutes.</span></div>'+
   '<div class="row" style="margin-top:10px"><button class="primary" onclick="flowTrace()">Trace flow</button></div>'+
-  '<p class="muted" style="margin:8px 0 0" id="ft_note"></p>'+
   '<details style="margin-top:10px" ontoggle="if(this.open)natLoad()"><summary class="muted" style="cursor:pointer">Upstream NAT (optional): public → private IP in front of the firewall</summary>'+
   '<textarea id="nat_text" rows="5" spellcheck="false" style="width:100%;margin-top:8px;font-family:Consolas,monospace" placeholder="203.0.113.10 10.20.1.15   # shop"></textarea>'+
   '<div class="row" style="margin-top:6px;gap:10px;align-items:center"><button onclick="natSave()">Save list</button><span id="nat_msg" class="muted"></span></div>'+
@@ -11880,7 +12042,7 @@ function renderFlow(){const box=$("#flowtrace");if(!devices.length){box.innerHTM
   '<p class="muted" style="margin:6px 0 0">Paste the rows straight from a spreadsheet: name, FortiGate VIP, F5 VIP (optionally :port). A header row and extra columns are ignored. '+
   'The name can be a hostname or a label: its words are matched against the hostname you trace (VIP, F5, FG and similar words are ignored). '+
   'Tells the trace which FortiGate VIP belongs to a hostname; each row is checked against the live FortiGate and F5. Saved in vip_map.txt next to the console, kept out of git.</p></details></div>'}
- $("#ft_note").textContent="Finds the path through the "+devices.length+" connected device(s) ("+vs+") from their own configuration: the firewall that translates the address (FortiGate VIP or Palo Alto NAT), the F5 with the virtual server, any firewall between it and the servers, and Cloudflare for its hostnames. Only the devices the flow crosses are shown, each tested with the addresses it sees. Read-only."}
+}
 async function natLoad(){const r=await api("/api/natmap",{});if(r.ok){$("#nat_text").value=r.text;$("#nat_msg").textContent=r.count+" pair(s)"}}
 async function natSave(){const m=$("#nat_msg"),r=await api("/api/natmap",{set:true,text:$("#nat_text").value});
  m.className=r.ok?"ok":"bad";m.textContent=r.ok?"saved · "+r.count+" pair(s)":"error: "+r.error;if(r.ok)$("#nat_text").value=r.text}
@@ -11907,8 +12069,6 @@ function renderSsh(){const box=$("#sshtool");if(!box)return;box.innerHTML="";con
   '<div><label>&nbsp;</label><div class="row" style="gap:8px;flex-wrap:wrap"><button class="primary" onclick="termOpen()">Open SSH in this page</button>'+
   '<button onclick="sshOpen()">Open in a separate window</button></div></div></div>'+
   '<div class="chk"><input type="checkbox" id="ssh_legacy"><span>Allow older algorithms for this connection (old devices that answer &quot;Unable to negotiate&quot;: SHA-1 key exchange, ssh-rsa, AES-CBC; the hmac-sha1 MAC is always allowed)</span></div>'+
-  '<p class="muted" style="margin:8px 0 0">Connects to '+esc(d.host)+' with this PC\'s <code>ssh</code>. In the page, click the terminal to type; keystrokes (the password too) pass through the console '+
-  'to ssh and are never stored, logged or shown to the AI. The session is a normal CLI session: it is not read-only.</p>'+
   '<p id="ssh_msg" class="muted" style="margin:6px 0 0"></p></div>'}
 // ---- In-page SSH terminal: a small VT emulator fed by the console's pseudo-console relay ----
 const VTPAL=["#1e1e2a","#e05561","#7ccf7a","#e6c07b","#61afef","#c678dd","#56b6c2","#d6d6e6",
@@ -12046,7 +12206,8 @@ function renderChecks(){const m=$("#main");m.innerHTML="<h3>Checks</h3>";const d
    const b=document.createElement("button");b.textContent="Run";
    b.onclick=()=>run(c,ins);r.appendChild(b);m.appendChild(r)})})}
 async function run(c,ins){const p={};for(const k in ins)p[k]=ins[k].value;
- setBusy(c.label);const r=await api("/api/run",{id:cur,check:c.id,params:p,ack:!!($("#f5ack")&&$("#f5ack").checked)});show(r,c.label)}
+ const id=cur;setBusy(c.label);const r=await api("/api/run",{id,check:c.id,params:p,ack:!!($("#f5ack")&&$("#f5ack").checked)});
+ if(r&&typeof r==="object")r._dev=id;show(r,c.label)}
 async function runRaw(){const q=$("#raw").value;if(!q)return;setBusy("raw query");
  const r=await api("/api/raw",{id:cur,query:q});show(r,"raw")}
 function setBusy(l){$("#ometa").textContent="running "+l+"…";$("#pretty").textContent="";$("#verdict").innerHTML=""}
@@ -12136,6 +12297,8 @@ function secNode(s){const w=mk("div","rsec");
   s.cols.forEach(c=>h.appendChild(mk("th",null,hum(c))));t.appendChild(h);
   s.data.forEach(r=>{const tr=mk("tr");s.cols.forEach(c=>{const td=mk("td");
    if(c==="severity"&&r[c])td.appendChild(mk("span","sev-"+String(r[c]).toLowerCase(),String(r[c]).toUpperCase()));
+   else if(c==="irule"&&r[c]&&last&&last._dev&&!/not readable/.test(r.status||"")){const a=mk("a","irlink",String(r[c]));a.href="#";a.title="Show the iRule code";
+    a.onclick=e=>{e.preventDefault();irulePop(last._dev,String(r[c]))};td.appendChild(a)}
    else td.appendChild(cellNode(r[c]));tr.appendChild(td)});t.appendChild(tr)});
   box.appendChild(t);w.appendChild(box)}
  else if(s.t==="list"){const u=mk("ul","sum");s.items.forEach(i=>u.appendChild(mk("li",null,i)));w.appendChild(u)}
@@ -12403,7 +12566,7 @@ function renderCf(){const box=$("#cftools");box.innerHTML="";const d=dev();if(!d
   fld("cf_ip","Client or origin IP","198.51.100.9")+fld("cf_host","Hostname","app.example.com")+fld("cf_ray","Ray ID","8d3c1a2b3c4d5e6f-FRA")+
   fld("cf_days","Cert warning (days)","30","30")+fld("cf_win","Trace window ± seconds","120","120")+'</div><div class="row" style="margin-top:8px;flex-wrap:wrap">'+
   '<button class="primary" onclick="cfIp()">Investigate IP</button><button class="primary" onclick="cfHost()">Investigate hostname</button>'+
-  '<button class="primary" onclick="cfRay()">Look up Ray ID</button><button class="primary" onclick="cfTrace()">Trace Ray ID: Cloudflare → F5</button></div>'+
+  '<button class="primary" onclick="cfRay()">Look up Ray ID</button></div>'+
   '<p class="muted" style="margin:8px 0 0">IP: security events, traffic, IP Access Rules, IP lists, rules and DNS records that involve it. Hostname: DNS, proxy status, certificates, settings, rules, Workers, page rules, load balancers, errors. Ray ID: what Cloudflare did with that one request (plus the F5 ASM entry via the CF-Ray header).</p></div>';
  h+='<div class="card"><h3>URL response time · edge vs origin</h3><div class="row3">'+
   fld("cf_u_url","URL","https://app.example.com/api/login")+sel("cf_u_match","Path match",["exact","starts with","contains"],"exact")+
@@ -12445,7 +12608,7 @@ function cfWhois(){cfRun("whois","WHOIS",{ip:g("cf_w_ip"),host:g("cf_w_host"),da
 function cfTraceBy(m,label,extra){const f5=devices.find(x=>x.vendor==="f5");
  setBusy(label+(f5?": Cloudflare → F5 "+f5.name+" (can take a few minutes)":": Cloudflare only (no F5 connected)"));
  api("/api/cf",Object.assign({id:cur,mode:m,f5:f5?f5.id:"",window:g("cf_win")},extra)).then(r=>show(r,label))}
-function cfTrace(){cfTraceBy("trace","Ray ID trace",{ray:g("cf_ray")})}function cfEvF(){return {ip:g("cf_e_ip"),host:g("cf_e_host"),path:g("cf_e_path"),ray:g("cf_e_ray"),action:g("cf_e_act"),source:g("cf_e_src"),
+function cfEvF(){return {ip:g("cf_e_ip"),host:g("cf_e_host"),path:g("cf_e_path"),ray:g("cf_e_ray"),action:g("cf_e_act"),source:g("cf_e_src"),
  rule:g("cf_e_rule"),country:g("cf_e_cc"),asn:g("cf_e_asn"),ua:g("cf_e_ua"),method:g("cf_e_m")}}
 function cfEvents(){cfRun("events","Cloudflare security events",Object.assign(cfEvF(),{top:g("cf_e_n")}))}
 function cfEventTop(){cfRun("event_top","Cloudflare top security events",Object.assign(cfEvF(),{by:g("cf_e_by"),top:g("cf_e_top")}))}
@@ -12651,10 +12814,15 @@ function aiAdd(kind,text,r){const box=$("#ai_log"),d=mk("div","aimsg "+kind);
    const pre=mk("pre",null,r.raw);pre.style.display="none";pre.style.maxHeight="300px";pre.style.overflow="auto";
    lk.onclick=()=>{pre.style.display=pre.style.display?"":"none"};d.appendChild(lk);d.appendChild(pre)}}
  else d.textContent=text;box.appendChild(aiRow(kind,d));aiScroll()}
+// Full-screen AI window: the ⤢ button or a double-click on the title bar; remembered in this browser
+function aiFull(force){const c=$("#aicard"),on=force==null?!c.classList.contains("full"):!!force;c.classList.toggle("full",on);
+ const b=$("#ai_full");b.textContent=on?"⤡":"⤢";b.title=on?"Restore size":"Full screen";b.setAttribute("aria-label",b.title);
+ try{localStorage.setItem("ai_full",on?"1":"")}catch(e){}if(!c.hidden)setTimeout(aiScroll,0)}
+document.addEventListener("dblclick",e=>{if(e.target.closest&&e.target.closest("#aicard .aihead")&&!e.target.closest("button"))aiFull()});
 function aiScroll(){const sc=$("#aicard .aibody");sc.scrollTop=sc.scrollHeight}
 function aiToggle(force){const c=$("#aicard"),open=force==null?c.hidden:!!force;c.hidden=!open;$("#aifab").classList.toggle("on",open);
  try{localStorage.setItem("ai_open",open?"1":"")}catch(e){}if(open)setTimeout(()=>$("#ai_q").focus(),0)}
-document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#aicard").hidden)aiToggle(false)});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#aicard").hidden){aiToggle(false);e._ai=1}});
 function aiClear(){aiHist=[];$("#ai_log").innerHTML="";aiWelcome()}
 async function aiAsk(mode,qx,sx){const q=qx||g("ai_q").trim();
  if(mode!=="explain"&&!q)return aiAdd("err","Type a question first.");
@@ -12800,7 +12968,7 @@ function exportHtml(){if(!last||last.error||!last.data){alert("Run a check first
 // ---- Device monitor: poll /api/monitor, pop up changes, Windows notification + sound ----
 let monSeq=-1,monLast=null,monOpen=false;
 const MON_TITLE={offline:"DOWN",pooldown:"F5 pool has NO available members",recovered:"Back up",
- admin:"Taken out of service",baseline:"Already down when monitoring started",ha:"HA state changed",error:"Monitor"};
+ admin:"Taken out of service",baseline:"Already down when monitoring started",ha:"HA state changed",change:"Configuration changed",error:"Monitor"};
 function monTitle(e){return e.kind==="offline"||e.kind==="recovered"||e.kind==="admin"?(e.cat||"")+" "+MON_TITLE[e.kind]+" \u00b7 "+e.device:(MON_TITLE[e.kind]||"Monitor")+(e.device?" \u00b7 "+e.device:"")}
 function monPref(k,d){try{const v=localStorage.getItem("mon_"+k);return v==null?d:v==="1"}catch(e){return d}}
 function monSetPref(k,v){try{localStorage.setItem("mon_"+k,v?"1":"0")}catch(e){}}
@@ -12808,18 +12976,18 @@ function monBeep(bad){if(!monPref("sound",true))return;try{const c=new(window.Au
  (bad?[880,660,880]:[660,990]).forEach((f,i)=>{const o=c.createOscillator(),g=c.createGain(),t=c.currentTime+i*.18;o.frequency.value=f;o.connect(g);g.connect(c.destination);
   g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.2,t+.02);g.gain.exponentialRampToValueAtTime(.0001,t+.16);o.start(t);o.stop(t+.17)})}catch(e){}}
 function monToast(e){const bad=e.kind==="offline"||e.kind==="pooldown"||e.kind==="baseline"||e.kind==="ha";
- const t=mk("div","mtoast "+e.kind),h=mk("div","mth");h.appendChild(mk("span",null,(bad?"\u26a0 ":e.kind==="recovered"?"\u2713 ":"\u2022 ")+monTitle(e)));
+ const t=mk("div","mtoast "+e.kind),h=mk("div","mth");h.appendChild(mk("span",null,(bad?"\u26a0 ":e.kind==="recovered"?"\u2713 ":e.kind==="change"?"\u270e ":"\u2022 ")+monTitle(e)));
  h.appendChild(mk("small","muted",e.t));const x=mk("button",null,"\u2715");x.onclick=()=>t.remove();h.appendChild(x);t.appendChild(h);
- t.appendChild(mk("div",null,e.text));if(e.vips&&e.vips.length)t.appendChild(mk("div","mtv","VIP: "+e.vips.join(", ")));
+ t.appendChild(mk("div",null,e.text));if(e.detail)t.appendChild(mk("div","mtv",e.detail));if(e.vips&&e.vips.length)t.appendChild(mk("div","mtv","VIP: "+e.vips.join(", ")));
  const box=$("#montoasts");box.appendChild(t);while(box.children.length>6)box.firstChild.remove();
- if(!bad)setTimeout(()=>t.remove(),e.kind==="recovered"?20000:60000);
+ if(!bad)setTimeout(()=>t.remove(),e.kind==="recovered"?20000:e.kind==="change"?120000:60000);
  if(monPref("notify",true)&&window.Notification&&Notification.permission==="granted"){
   try{new Notification(monTitle(e),{body:e.text+(e.vips&&e.vips.length?"\nVIP: "+e.vips.join(", "):""),tag:"mon"+e.seq,requireInteraction:bad})}catch(err){}}
  if(e.kind!=="error")monBeep(bad)}
-async function monPoll(){if(!devices.some(d=>["f5","paloalto","fortigate"].includes(d.vendor))){$("#monbtn").hidden=true;$("#monpanel").hidden=true;monOpen=false;return}
+async function monPoll(){dashBtn();if(!devices.some(d=>["f5","paloalto","fortigate"].includes(d.vendor))){$("#monbtn").hidden=true;$("#monpanel").hidden=true;monOpen=false;return}
  $("#monbtn").hidden=false;let r;try{r=await api("/api/monitor"+(monSeq>=0?"?since="+monSeq:""))}catch(e){return}if(!r||!r.ok)return;
  if(monSeq>=0)r.events.forEach(monToast);monSeq=r.seq;
- if(!monLast)monLast={events:[]};monLast.on=r.on;monLast.interval=r.interval;monLast.status=r.status;
+ if(!monLast)monLast={events:[]};monLast.on=r.on;monLast.interval=r.interval;monLast.changes=r.changes;monLast.status=r.status;
  monLast.events=monLast.events.concat(r.events).slice(-40);
  const off=r.status.reduce((n,s)=>n+(s.offline||0),0),b=$("#monbadge");
  b.hidden=!off;b.textContent=off;$("#monbtn").classList.toggle("alert",off>0);
@@ -12834,7 +13002,8 @@ function monRender(){const p=$("#monpanel"),m=monLast||{status:[],events:[]};p.i
   c.onchange=()=>{monSetPref(k,c.checked);if(k==="notify"&&c.checked)monAskNotify()};l.appendChild(c);l.appendChild(document.createTextNode(t));r2.appendChild(l)});
  if(window.Notification&&Notification.permission!=="granted"){const a=mk("button",null,Notification.permission==="denied"?"Notifications blocked in the browser":"Allow Windows notifications");
   a.disabled=Notification.permission==="denied";a.onclick=monAskNotify;r2.appendChild(a)}
- p.appendChild(r2);
+ p.appendChild(r2);const r3=mk("div","mrow"),l3=mk("label"),c3=mk("input");c3.type="checkbox";c3.checked=m.changes!==false;c3.onchange=()=>monSet({changes:c3.checked});
+ l3.appendChild(c3);l3.appendChild(document.createTextNode("Pop up configuration changes (checked every minute)"));r3.appendChild(l3);p.appendChild(r3);
  p.appendChild(mk("div","msec","Devices"));(m.status||[]).forEach(s=>p.appendChild(mk("div","mline"+(s.error?" error":""),
   s.device+": "+(s.error?"cannot read ("+s.error+")":Object.entries(s.counts||{}).map(([k,v])=>v+" "+k.toLowerCase()+(v===1?"":"s")).join(", ")+
    (s.ha?" \u00b7 HA "+s.ha:"")+" \u00b7 "+(s.offline||0)+" down")+(s.time?" \u00b7 checked "+s.time:"")+
@@ -12868,7 +13037,127 @@ async function devicesRestore(){let l;try{l=await api("/api/devices")}catch(e){r
  l.forEach(x=>{if(!devices.some(d=>d.id===x.id))devices.push(x)});
  let pick=null;try{pick=sessionStorage.getItem("cur")}catch(e){}
  if(!cur)cur=devices.some(d=>d.id===pick)?pick:devices[0].id;renderAll()}
-api("/api/catalog").then(c=>{catalog=c;devicesRestore()});loadProfiles();vaultLoad();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true)}catch(e){}
+// ---- collapsible panes (remembered in this browser) ----
+function paneToggle(w,force){const cls=w+"col",wr=$("#wrap"),on=force==null?!wr.classList.contains(cls):!!force;wr.classList.toggle(cls,on);
+ const b=$("#"+w+"pane_btn");if(w==="l"){b.textContent=on?"\u00bb":"\u00ab";b.title=on?"Expand the devices pane":"Collapse this pane"}
+ else{b.textContent=on?"Show \u25be":"Hide \u25b4";b.title=on?"Show the checks and tools again":"Collapse this pane: the output moves up"}
+ b.setAttribute("aria-label",b.title);try{localStorage.setItem("pane_"+w,on?"1":"")}catch(e){}}
+try{if(localStorage.getItem("pane_l"))paneToggle("l",true);if(localStorage.getItem("pane_r"))paneToggle("r",true)}catch(e){}
+// ---- Operations dashboard: resources, interfaces and HA of every firewall and F5 (the console refreshes it) ----
+let dashOpen=false,dashData=null,dashAt=0;const DASH_V={paloalto:"Palo Alto",fortigate:"FortiGate",f5:"F5 BIG-IP"};
+function dashBtn(){const show=devices.some(d=>["f5","paloalto","fortigate"].includes(d.vendor));$("#dashbtn").hidden=!show;if(!show&&dashOpen)dashToggle(false)}
+function dashToggle(on){dashOpen=on==null?!dashOpen:!!on;$("#dash").hidden=!dashOpen;document.documentElement.style.overflow=dashOpen?"hidden":"";
+ try{localStorage.setItem("dash_open",dashOpen?"1":"")}catch(e){}if(dashOpen)dashLoad()}
+async function dashLoad(){let r;try{r=await api("/api/dash")}catch(e){return}if(!r||!r.ok)return;dashData=r;dashAt=Date.now();dashRender();dashClock();
+ if(r.busy&&dashOpen)setTimeout(dashLoad,3000)}
+async function dashSet(b){const r=await api("/api/dash",b);if(!r.ok){alert(r.error);return}dashLoad()}
+function dashSpark(vals){const v=(vals||[]).map(x=>x==null?null:+x);if(v.filter(x=>x!=null).length<2)return null;
+ const W=64,H=18,n=v.length,ns="http://www.w3.org/2000/svg",s=document.createElementNS(ns,"svg");s.setAttribute("viewBox","0 0 "+W+" "+H);s.setAttribute("class","dspark");
+ let d="";v.forEach((x,i)=>{if(x==null)return;d+=(d?"L":"M")+(i*W/(n-1)).toFixed(1)+" "+(H-1-Math.min(100,Math.max(0,x))*(H-2)/100).toFixed(1)});
+ const p=document.createElementNS(ns,"path");p.setAttribute("d",d);s.appendChild(p);const t=document.createElementNS(ns,"title");
+ t.textContent="Last "+n+" refreshes: "+v.map(x=>x==null?"-":x+"%").join(", ");s.appendChild(t);return s}
+function dashFmt(t){return t.fmt==="pct"?(+t.value).toFixed(1)+"%":(+t.value).toLocaleString()}
+function dashKind(d){let k=0;const up=x=>{k=Math.max(k,x)};if(d.res)up(d.res.kind==="bad"?2:d.res.kind==="info"?1:0);
+ if((d.ifaces||[]).some(i=>i.cls==="bad"))up(2);if(d.ha)up(d.ha.cls==="bad"?2:d.ha.cls==="warn"?1:0);if((d.errors||[]).length)up(1);return["","warn","bad"][k]}
+function dashCard(d){const c=mk("div","dcard k-"+dashKind(d)),h=mk("div","dh");h.appendChild(mk("b",null,d.device));h.appendChild(mk("span","dv",DASH_V[d.vendor]||d.vendor));
+ h.appendChild(mk("span","dhost",d.host||""));h.appendChild(mk("span","dt",d.time?"read "+d.time+(d.ms!=null?" \u00b7 "+(d.ms/1000).toFixed(1)+" s":""):""));c.appendChild(h);
+ c.appendChild(mk("h4",null,"High availability"));const ha=d.ha;
+ if(ha){const r=mk("div","dharow");r.appendChild(mk("span","dpill k-"+ha.cls,ha.mode));if(ha.state)r.appendChild(mk("b",null,ha.state));
+  if(ha.sync)r.appendChild(mk("span","dpill k-"+(/out of sync|disconnect|pending|change|awaiting/i.test(ha.sync)?"warn":/in sync|synchroni|complete/i.test(ha.sync)?"good":""),"sync: "+ha.sync));
+  if(ha.changed)r.appendChild(mk("span","dpill k-bad","changed since last refresh ("+ha.changed+")"));c.appendChild(r);(ha.lines||[]).forEach(l=>c.appendChild(mk("div","dline",l)))}
+ else c.appendChild(mk("div","dline k-dim","not read"));
+ c.appendChild(mk("h4",null,"Resources"));const tl=(d.res&&d.res.tiles)||[];
+ tl.filter(t=>t.fmt==="pct").forEach(t=>{const m=mk("div","dmeter k-"+(t.kind||""));m.title=t.label+(t.sub?": "+t.sub:"");m.appendChild(mk("span","l",t.label));
+  const b=mk("span","bar"),i=mk("i");i.style.width=Math.min(100,Math.max(0,t.value))+"%";b.appendChild(i);m.appendChild(b);m.appendChild(mk("span","v",dashFmt(t)));
+  m.appendChild(dashSpark(t.spark)||mk("span"));c.appendChild(m)});
+ const nums=tl.filter(t=>t.fmt!=="pct");if(nums.length){const r=mk("div","dnums");nums.forEach(t=>{const x=mk("span");x.title=t.sub||"";
+  x.appendChild(document.createTextNode(t.label+" "));x.appendChild(mk("b",null,dashFmt(t)));r.appendChild(x)});c.appendChild(r)}
+ if(!d.res)c.appendChild(mk("div","dline k-dim","not read"));
+ ((d.res&&d.res.findings)||[]).forEach(f=>c.appendChild(mk("div","dline k-"+(f.severity==="high"?"bad":"warn"),(f.severity==="high"?"\u25b2 ":"\u25b3 ")+f.issue)));
+ const ifs=d.ifaces;if(ifs){const n=k=>ifs.filter(i=>i.cls===k).length,bad=ifs.filter(i=>i.cls==="bad");
+  c.appendChild(mk("h4",null,"Interfaces \u00b7 "+n("good")+" up"+(bad.length?" \u00b7 "+bad.length+" DOWN":"")+(n("idle")?" \u00b7 "+n("idle")+" not connected":"")+(n("admin")?" \u00b7 "+n("admin")+" disabled":"")));
+  const w=mk("div","dif");bad.concat(ifs.filter(i=>i.cls!=="bad")).forEach(i=>{const x=mk("span","k-"+i.cls,i.name);
+   x.title=i.name+": "+i.state+(i.speed?" \u00b7 "+i.speed:"")+(i.errors?" \u00b7 "+i.errors.toLocaleString()+" errors/drops":"")+(i.cls==="idle"?" (never seen up: treated as unused)":"");w.appendChild(x)});c.appendChild(w)}
+ else{c.appendChild(mk("h4",null,"Interfaces"));c.appendChild(mk("div","dline k-dim","not read"))}
+ (d.errors||[]).forEach(e=>c.appendChild(mk("div","dline k-warn","Could not read "+e)));return c}
+function dashRender(){if(!dashData||!dashOpen)return;const r=dashData,devs=r.devices||[],body=$("#dashbody");body.textContent="";$("#dash_iv").value=String(r.interval);
+ const sum=mk("div","dsum"),tile=(v,l,k)=>{const x=mk("div",k?"k-"+k:"");x.appendChild(mk("b",null,String(v)));x.appendChild(mk("span",null,l));sum.appendChild(x)};
+ const kinds=devs.map(dashKind),ifd=devs.reduce((n,d)=>n+(d.ifaces||[]).filter(i=>i.cls==="bad").length,0),hab=devs.filter(d=>d.ha&&(d.ha.cls==="bad"||d.ha.cls==="warn")).length;
+ tile(devs.length,"devices");tile(kinds.filter(k=>k==="bad").length,"critical",kinds.includes("bad")?"bad":"");tile(kinds.filter(k=>k==="warn").length,"warning",kinds.includes("warn")?"warn":"");
+ tile(ifd,"interfaces down",ifd?"bad":"");tile(hab,"HA problems",hab?"bad":"");body.appendChild(sum);
+ if(!devs.length){body.appendChild(mk("div","dempty",r.busy?"Reading the devices for the first time\u2026 this can take a minute.":"No data yet."));return}
+ [["Firewalls",devs.filter(d=>d.vendor!=="f5")],["Load balancers (F5)",devs.filter(d=>d.vendor==="f5")]].forEach(([t,list])=>{if(!list.length)return;
+  body.appendChild(mk("h3","dsec",t));const g=mk("div","dgrid");list.forEach(d=>g.appendChild(dashCard(d)));body.appendChild(g)})}
+function dashClock(){if(!dashOpen||!dashData)return;const r=dashData,m=$("#dash_meta");
+ if(r.busy){m.textContent="Refreshing now\u2026"+(r.last?" (last: "+r.last+")":"");return}
+ const left=r.next_in==null?null:Math.max(0,r.next_in-Math.round((Date.now()-dashAt)/1000));
+ m.textContent=(r.last?"Last refresh "+r.last+" (took "+r.took+" s)":"Not refreshed yet")+(left==null?"":" \u00b7 next in "+Math.floor(left/60)+":"+String(left%60).padStart(2,"0"))}
+setInterval(dashClock,1000);setInterval(()=>{if(dashOpen)dashLoad()},15000);
+/* vendor advisories headline */
+let advData=null,advSel=-1,advT=null;const ADV_V=["f5","paloalto","fortigate"];
+async function advPoll(){clearTimeout(advT);
+ if(!devices.some(d=>ADV_V.includes(d.vendor))){$("#advbar").hidden=true;$("#advpanel").hidden=true;advSel=-1;advT=setTimeout(advPoll,5000);return}
+ let r=null;try{r=await api("/api/adv")}catch(e){}
+ if(r&&r.ok){advData=r;advRender()}advT=setTimeout(advPoll,r&&r.busy?3000:15000)}
+function advCls(g){const c=g.counts||{};return g.error?"a-err":(c.critical||g.exploited||g.eol)?"a-crit":(c.high||c.unrated)?"a-high":""}
+function advPills(g){const c=g.counts||{};let s="";
+ if(c.critical)s+='<span class="apill a-c">'+c.critical+' critical</span>';if(c.high)s+='<span class="apill a-h">'+c.high+' high</span>';
+ if(c.medium)s+='<span class="apill a-m">'+c.medium+' medium</span>';if(c.unrated)s+='<span class="apill a-m">'+c.unrated+' not rated</span>';
+ if(g.exploited)s+='<span class="apill a-k" title="Listed by CISA as exploited in the wild, or marked as actively exploited in the CVE record">'+g.exploited+' exploited</span>';return s}
+function advRender(){const r=advData,b=$("#advbar");b.hidden=false;const res=r.results||[],nerr=Object.keys(r.errors||{}).length;
+ let h='<span class="ahd">\u{1F6E1} Vendor advisories</span>';
+ res.forEach((g,i)=>{const d=g.devices||[],dv=d.length>2?d.slice(0,2).join(", ")+" +"+(d.length-2):d.join(", ");
+  let s='<b>'+esc(g.label)+'</b><span class="adim">'+esc(dv)+' · '+esc(g.version||"?")+'</span>';
+  if(g.error)s+='<span class="adim">'+esc(g.error)+'</span>';
+  else if(!(g.items||[]).length)s+='<span class="aok">✓ no '+esc(r.min)+'+ issues</span>';
+  else{s+=advPills(g);s+=g.advice&&g.advice.target?'<span class="ago" title="'+esc(g.advice.text)+'">→ '+esc(g.advice.target)+'</span>':'<span class="adim">see details</span>'}
+  if(g.eol)s+='<span class="apill a-k" title="'+esc(g.eol)+'">end of life?</span>';
+  h+='<span class="achip '+advCls(g)+(advSel===i?' sel':'')+'" role="button" tabindex="0" data-i="'+i+'" title="Click for the list">'+s+'</span>'});
+ if(!res.length)h+='<span class="adim">'+esc(r.busy?(r.stage||"Checking…"):nerr?"":"Waiting for the first check…")+'</span>';
+ else if(r.busy)h+='<span class="adim">⟳ '+esc(r.stage||"updating")+'</span>';
+ if(nerr)h+='<span class="achip a-err" role="button" tabindex="0" data-i="-2" title="'+esc(Object.values(r.errors).join("\n"))+'">⚠ '+(nerr===1?"1 list":nerr+" lists")+' not updated</span>';
+ b.innerHTML=h;if(advSel!==-1)advPanel()}
+function advOpen(i){advSel=advSel===i?-1:i;advRender();if(advSel===-1)$("#advpanel").hidden=true}
+document.addEventListener("click",e=>{const c=e.target.closest&&e.target.closest("#advbar .achip");if(c)advOpen(+c.dataset.i)});
+document.addEventListener("keydown",e=>{const c=e.target.closest&&e.target.closest("#advbar .achip");if(c&&e.key==="Enter")advOpen(+c.dataset.i)});
+function advPanel(){const r=advData,p=$("#advpanel"),g=advSel>=0?(r.results||[])[advSel]:null;if(advSel>=0&&!g){advSel=-1;p.hidden=true;return}p.hidden=false;
+ let h='<div class="ahead"><h3>'+(g?esc(g.label)+' '+esc(g.version||"")+' <span class="adim" style="font-weight:400">· '+esc((g.devices||[]).join(", "))+(g.model?' · '+esc(g.model):'')+(g.mods&&g.mods.length?' · modules: '+esc(g.mods.join(", ")):'')+'</span>':'Advisory lists')+'</h3>'+
+  '<label class="adim">Show <select onchange="advSet({min:this.value})">'+["critical","high","medium"].map(m=>'<option value="'+m+'"'+(r.min===m?' selected':'')+'>'+m+(m==="critical"?" only":" and above")+'</option>').join("")+'</select></label>'+
+  '<button onclick="advSet({refresh:1})"'+(r.busy?' disabled':'')+'>'+(r.busy?'Checking…':'Refresh now')+'</button><button class="themebtn" onclick="advOpen(advSel)" title="Close" aria-label="Close">✕</button></div>';
+ if(g){
+  if(g.eol)h+='<div class="abox eol">⚠ '+esc(g.eol)+'</div>';
+  if(g.error)h+='<div class="abox">'+esc(g.error)+'</div>';
+  else if(!(g.items||[]).length)h+='<div class="abox"><span class="aok">✓ No published '+esc(r.min)+'-or-higher advisory (or exploited issue) affects '+esc(g.version)+'.</span></div>';
+  else{h+='<div class="abox"><b>Advice:</b> '+esc(g.advice?g.advice.text:"")+'<br><span class="adim">This is the lowest release the published advisories show as fixed, not a vendor recommendation. Check </span><a href="'+esc(g.help.url)+'" target="_blank" rel="noopener noreferrer">'+esc(g.help.text)+'</a><span class="adim"> before you pick the release, and read each advisory: some only apply when a feature is in use (GlobalProtect, management interface reachable, APM…).</span></div>';
+   h+='<table><thead><tr><th>Severity</th><th>Advisory</th><th>Issue</th><th>Fixed in (your train)</th><th>Exploited</th><th>Published</th></tr></thead><tbody>';
+   g.items.forEach(x=>{h+='<tr><td class="nw"><span class="apill '+(x.sev==="critical"?"a-c":x.sev==="high"?"a-h":"a-m")+'">'+esc(x.sev)+(x.score!=null?' '+esc(x.score):'')+'</span></td><td class="nw"><a href="'+esc(x.url)+'" target="_blank" rel="noopener noreferrer">'+esc(x.id)+'</a></td><td>'+esc(x.title)+(x.note?' <span class="adim">('+esc(x.note)+')</span>':'')+'</td><td class="nw">'+esc(x.fix||"no fix listed")+'</td><td>'+(x.kev?'<span class="apill a-k">yes</span>':'')+'</td><td class="nw">'+esc(x.date)+'</td></tr>'});
+   h+='</tbody></table>'}}
+ const src=r.sources||{},nm={pan:"Palo Alto advisories","nvd:f5":"NVD BIG-IP list","nvd:fortigate":"NVD FortiOS list",kev:"CISA exploited list"};
+ h+='<div class="afoot">Lists: '+Object.keys(nm).map(k=>esc(nm[k])+' '+(src[k]?esc(src[k]):'<i>not downloaded</i>')).join(" · ")+(r.next_in!=null?' · next download in '+Math.round(r.next_in/360)/10+' h':'')+'<br>';
+ Object.entries(r.errors||{}).forEach(([k,v])=>{h+='<span style="color:var(--bad)">⚠ '+esc(k)+': '+esc(v)+'</span><br>'});
+ h+='Only whole public lists are downloaded (Palo Alto, NVD, CVE.org, CISA); device versions are matched here and never sent out.</div>';
+ p.innerHTML=h}
+async function advSet(b){const r=await api("/api/adv",b);if(!r.ok){alert(r.error);return}setTimeout(advPoll,400)}
+setTimeout(advPoll,2500);
+/* iRule code pop-up */
+let irCode="";
+function irClose(){$("#irpop").hidden=true}
+async function irulePop(id,name){let p=$("#irpop");
+ if(!p){p=mk("div");p.id="irpop";p.setAttribute("role","dialog");p.setAttribute("aria-modal","true");document.body.appendChild(p);
+  p.addEventListener("click",e=>{if(e.target===p)irClose()})}
+ irCode="";p.innerHTML='<div class="irbox"><div class="irhead"><h3></h3><button id="ircopy" disabled>Copy</button><button class="themebtn" onclick="irClose()" title="Close (Esc)" aria-label="Close">✕</button></div><div class="irmsg">Reading the iRule…</div></div>';
+ p.querySelector("h3").textContent=name;p.hidden=false;
+ let r;try{r=await api("/api/f5irule",{id,name})}catch(e){r={ok:false,error:String(e)}}
+ if(p.hidden||p.querySelector("h3").textContent!==name)return;   // closed, or another iRule opened meanwhile
+ const box=p.querySelector(".irbox"),msg=box.querySelector(".irmsg");
+ if(!r||!r.ok){msg.textContent="⚠ "+((r&&r.error)||"could not read the iRule");return}
+ irCode=r.code;const ls=r.code.replace(/\r/g,"").replace(/\n+$/,"").split("\n");const h=p.querySelector("h3");h.textContent=r.name+" ";h.appendChild(mk("span",null,"· "+r.device+" · "+ls.length+" lines"));
+ const c=mk("div","ircode");if(!r.code.trim())c.appendChild(mk("div",null,"(empty iRule)"));else ls.forEach(l=>c.appendChild(mk("div",null,l||" ")));
+ msg.replaceWith(c);const b=$("#ircopy");b.disabled=false;
+ b.onclick=async()=>{try{await navigator.clipboard.writeText(irCode);b.textContent="Copied"}catch(e){const t=document.createElement("textarea");t.value=irCode;document.body.appendChild(t);t.select();document.execCommand("copy");t.remove();b.textContent="Copied"}setTimeout(()=>b.textContent="Copy",1500)}}
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("#irpop")&&!$("#irpop").hidden){irClose();e.stopImmediatePropagation()}},true);
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&dashOpen&&!e._ai&&$("#aicard").hidden)dashToggle(false)});
+api("/api/catalog").then(c=>{catalog=c;devicesRestore()});loadProfiles();vaultLoad();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true);if(localStorage.getItem("ai_full"))aiFull(true);if(localStorage.getItem("dash_open"))setTimeout(()=>{if(devices.length)dashToggle(true)},2000)}catch(e){}
 </script></body></html>
 """
 
@@ -12902,7 +13191,7 @@ def mon_event(kind, sess, text, **kw):
         e = dict(kw, seq=MON["seq"], kind=kind, t=time.strftime("%H:%M:%S"), ts=time.time(),
                  device=sess.get("name") or sess.get("host"), text=text)
         MON["events"].append(e)
-    if kind in ("offline", "pooldown", "recovered", "admin", "ha"):
+    if kind in ("offline", "pooldown", "recovered", "admin", "ha", "change"):
         audit(sess, "monitor: " + text[:200])
 
 
@@ -13070,6 +13359,147 @@ def mon_fg(sid, sess, prev):
     return items, errs
 
 
+# ---- Configuration change alerts (part of the device monitor) ---------------------------------------------------
+# Palo Alto: new entries in the config log (who, what, before / after) and uncommitted changes appearing.
+# FortiGate: configuration entries in the system event log (who, path, object, attribute).
+# F5: the REST API does not say who changed what, so each object's configuration generation is compared between
+# checks (added / modified / deleted); the Admin audit check shows who.
+# The first check of a device only records what is there; changes after it pop up.
+MON_CHG_EVERY = 60   # seconds between change checks of one device (each check is several reads)
+MON_CHG_BURST = 10   # more changes than this in one check become one summary pop-up
+F5_CHG_KINDS = (("Virtual server", "ltm/virtual"), ("Pool", "ltm/pool"), ("Node", "ltm/node"), ("iRule", "ltm/rule"),
+                ("Policy", "ltm/policy"), ("SNAT", "ltm/snat"), ("SNAT pool", "ltm/snatpool"),
+                ("Data group", "ltm/data-group/internal"), ("HTTP monitor", "ltm/monitor/http"),
+                ("HTTPS monitor", "ltm/monitor/https"), ("TCP monitor", "ltm/monitor/tcp"),
+                ("Client SSL profile", "ltm/profile/client-ssl"), ("Server SSL profile", "ltm/profile/server-ssl"),
+                ("HTTP profile", "ltm/profile/http"), ("Self IP", "net/self"), ("VLAN", "net/vlan"),
+                ("Route", "net/route"), ("Local user", "auth/user"), ("Certificate", "sys/file/ssl-cert"))
+F5_MEMBER_CFG = ("address", "ratio", "priorityGroup", "connectionLimit", "monitor", "description", "dynamicRatio",
+                 "rateLimit")
+
+
+def chg_seen(st, key):
+    """True when key was seen before; remembers the latest 3000 keys."""
+    seen = st.setdefault("seen", collections.OrderedDict())
+    if key in seen:
+        return True
+    seen[key] = 1
+    while len(seen) > 3000:
+        seen.popitem(last=False)
+    return False
+
+
+def chg_f5(sess, st):
+    snap = {}
+    for label, path in F5_CHG_KINDS:
+        try:
+            ok, d = f5_get(sess, "/mgmt/tm/%s?$select=fullPath,name,generation" % path)
+        except (ValueError, urllib.error.URLError, OSError):
+            continue
+        if ok and isinstance(d, dict):
+            snap[label] = {str(i.get("fullPath") or i.get("name")): str(i.get("generation"))
+                           for i in d.get("items", []) if isinstance(i, dict)}
+    try:   # pool members: their configuration only (monitor up / down is not a change; disable / force offline is)
+        ok, d = f5_get(sess, "/mgmt/tm/ltm/pool?expandSubcollections=true")
+    except (ValueError, urllib.error.URLError, OSError):
+        ok = False
+    if ok and isinstance(d, dict):
+        mem = snap["Pool member"] = {}
+        for p in d.get("items", []):
+            for m in (p.get("membersReference") or {}).get("items", []) if isinstance(p, dict) else []:
+                if isinstance(m, dict):
+                    mem["%s in %s" % (m.get("name"), p.get("fullPath"))] = json.dumps(
+                        [m.get(k) for k in F5_MEMBER_CFG] + [m.get("session") == "user-disabled",
+                                                              m.get("state") == "user-down"], default=str)
+    if not snap:
+        raise ValueError("no configuration list readable")
+    old, found = st.get("snap"), []
+    st["snap"] = snap
+    for kind, objs in snap.items() if old else []:
+        was = old.get(kind)
+        if was is None:   # not readable last time: nothing to compare
+            continue
+        for name, g in objs.items():
+            if name not in was:
+                found.append(("", "added", "%s %s" % (kind, name), ""))
+            elif was[name] != g:
+                found.append(("", "modified", "%s %s" % (kind, name),
+                              "disabled / forced offline / enabled, or ratio, priority, limits, monitor changed"
+                              if kind == "Pool member" else ""))
+        found += [("", "deleted", "%s %s" % (kind, name), "") for name in was if name not in objs]
+    return found
+
+
+def chg_pan(sess, st):
+    found = []
+    rows = pan_log_rows(sess, "config", "(receive_time in last-hour)", 100)
+    for e in sorted(rows, key=lambda e: str(first(e, "receive_time", "time_generated"))):
+        key = str(e.get("seqno") or json.dumps(e, sort_keys=True, default=str)[:400])
+        if chg_seen(st, key):
+            continue
+        chg = e.get("after-change-detail") or e.get("before-change-detail") or ""
+        found.append((str(e.get("admin") or ""), str(e.get("cmd") or "changed"), pan_obj(e.get("path")) or "configuration",
+                      re.sub(r"\s+", " ", str(chg))[:300]))
+    try:   # someone is editing: the candidate configuration has changes that are not committed yet
+        s_, ok, d = pan_op(sess, "<check><pending-changes></pending-changes></check>")
+        pend = str(acc_scalar((d or {}).get("result")) if ok and isinstance(d, dict) else "").strip().lower()
+        if pend in ("yes", "no"):
+            if pend == "yes" and st.get("pending") == "no":
+                found.append(("", "has uncommitted changes", "Candidate configuration",
+                              "a commit is still needed; the config log shows who and what after the commit"))
+            st["pending"] = pend
+    except (ValueError, urllib.error.URLError, OSError, ET.ParseError):
+        pass
+    return found
+
+
+def chg_fg(sess, st):
+    res = None
+    for src in ([st["src"]] if st.get("src") else ["disk", "memory"]):
+        s_, ok, d = rest_get(sess, "/api/v2/log/%s/event/system?rows=200" % src)
+        res = d.get("results") if ok and isinstance(d, dict) else None
+        if isinstance(res, list):
+            st["src"] = src
+            break
+    if not isinstance(res, list):
+        raise ValueError("system event log not readable (needs Log & Report read access)")
+    found = []
+    evs = [acc_flat(x) for x in res if isinstance(x, dict)]
+    for e in sorted((e for e in evs if e.get("cfgpath")), key=lambda e: fg_event_epoch(e) or 0):
+        key = "|".join(str(e.get(k) or "") for k in ("eventtime", "date", "time", "logid", "cfgpath", "cfgobj", "cfgattr"))
+        if chg_seen(st, key):
+            continue
+        obj = " ".join(str(x) for x in (e.get("cfgpath"), e.get("cfgobj")) if x)
+        if e.get("vd") and str(e.get("vd")) != "root":
+            obj += " (VDOM %s)" % e["vd"]
+        found.append((str(e.get("user") or ""), str(e.get("action") or "changed").lower(), obj,
+                      str(e.get("cfgattr") or e.get("msg") or "")[:300]))
+    return found
+
+
+CHG_READ = {"f5": chg_f5, "paloalto": chg_pan, "fortigate": chg_fg}
+
+
+def mon_changes(sid, sess, name):
+    if not MON.get("changes", True) or sess["vendor"] not in CHG_READ:
+        return
+    st = MON.setdefault("chg", {}).setdefault(sid, {})
+    if time.time() - st.get("t", 0) < max(MON_CHG_EVERY, MON["interval"]) - 2:
+        return
+    st["t"] = time.time()
+    found = CHG_READ[sess["vendor"]](sess, st)
+    if not st.get("base"):   # first check: only remember what is there
+        st["base"] = True
+        return
+    text = lambda f: "%s %s %s" % f[:3] if f[0] else "%s %s" % (f[2], f[1])   # 'admin1 edit X' / 'Pool X modified'
+    if len(found) > MON_CHG_BURST:
+        mon_event("change", sess, "%d configuration changes on %s: %s …" % (
+            len(found), name, "; ".join(text(f) for f in found[:MON_CHG_BURST])), count=len(found))
+        return
+    for f in found:
+        mon_event("change", sess, "%s on %s" % (text(f), name), user=f[0], action=f[1], obj=f[2], detail=f[3])
+
+
 MON_WATCH = {"f5": mon_f5, "paloalto": mon_pan, "fortigate": mon_fg}
 
 
@@ -13080,6 +13510,14 @@ def mon_poll(sid, sess):
         prev = None   # kept by a live update from an older version of the monitor: start again from this pass
         MON.setdefault("quiet", {}).pop(sid, None)
     cur, errs = MON_WATCH[sess["vendor"]](sid, sess, prev)
+    cst = MON.setdefault("chg", {}).setdefault(sid, {})
+    try:
+        mon_changes(sid, sess, name)
+        cst.pop("err", None)
+    except Exception as e:  # noqa: BLE001 - change alerts must not stop the up / down monitor
+        cst["err"] = "config changes: %s" % str(getattr(e, "reason", e))[:160]
+    if cst.get("err") and MON.get("changes", True):
+        errs = list(errs) + [cst["err"]]
     quiet = MON.setdefault("quiet", {}).setdefault(sid, set())
     if prev is None:
         quiet.update(k for k, it in cur.items() if it["cls"] == "bad" and it["cat"] not in MON_BASELINE)
@@ -13163,6 +13601,7 @@ def mon_tick():
         MON["state"].pop(gone, None)
         MON["vips"].pop(gone, None)
         MON.setdefault("quiet", {}).pop(gone, None)
+        MON.setdefault("chg", {}).pop(gone, None)
     with MON["lock"]:
         if not MON["on"] or not f5 or MON["busy"] or time.time() < MON["next"]:
             return
@@ -13172,6 +13611,7 @@ def mon_tick():
 
 def do_monitor_get(query):
     mon_tick()
+    dash_tick()
     try:
         since = int(urllib.parse.parse_qs(query).get("since", ["-1"])[0])
     except ValueError:
@@ -13180,12 +13620,16 @@ def do_monitor_get(query):
         ev = [e for e in MON["events"] if e["seq"] > since] if since >= 0 else list(MON["events"])[-30:]
         seq = MON["seq"]
     return {"ok": True, "on": MON["on"], "interval": MON["interval"], "seq": seq, "events": ev, "busy": MON["busy"],
+            "changes": MON.get("changes", True),
             "status": list(MON["status"].values())}
 
 
 def do_monitor_set(b):
     if "on" in b:
         MON["on"] = bool(b.get("on"))
+    if "changes" in b:
+        MON["changes"] = bool(b.get("changes"))
+        MON["chg"] = {}   # start again from a fresh baseline
     if "interval" in b:
         try:
             iv = int(b.get("interval"))
@@ -13196,7 +13640,237 @@ def do_monitor_set(b):
         MON["interval"] = iv
     if b.get("now") or "interval" in b or b.get("on"):
         MON["next"] = 0.0
-    return {"ok": True, "on": MON["on"], "interval": MON["interval"]}
+    return {"ok": True, "on": MON["on"], "interval": MON["interval"], "changes": MON.get("changes", True)}
+
+
+# ---- Operations dashboard: resources, interfaces and HA of every connected firewall and F5 on one page -------------
+# One background pass reads every connected F5 / Palo Alto / FortiGate (read-only, devices in parallel) every
+# DASH["interval"] seconds (20 minutes by default). Like the monitor, passes are started by the page's polling, so
+# nothing is read while no console page is open. The page shows the result of the latest pass.
+DASH = {"on": True, "interval": 1200, "busy": False, "next": 0.0, "last": "", "took": 0, "devices": {}, "hist": {},
+        "seen": {}, "prev_ha": {}, "lock": threading.Lock()}
+DASH_INTERVALS = (300, 600, 1200, 1800, 3600)
+DASH_VENDORS = ("f5", "paloalto", "fortigate")
+DASH_HIST = 72   # passes kept for the sparklines (24 hours at 20 minutes)
+
+
+def dash_resources(sess):
+    """CPU / memory / sessions / disk tiles and the top findings, from the vendor's resource-utilization reader."""
+    fn = {"f5": f5_perf, "paloalto": pan_resources, "fortigate": fg_resources}[sess["vendor"]]
+    r = fn(sess, {"range": "1h"})
+    if not r.get("ok"):
+        raise ValueError(r.get("error") or "no answer")
+    tiles = [{"label": t["label"], "value": t["value"], "fmt": t.get("fmt", "pct"), "sub": t.get("sub", ""),
+              "kind": t.get("kind", "")} for t in r.get("tiles", []) if t.get("value") is not None]
+    finds = [{"severity": f["severity"], "issue": f["issue"]} for f in (r.get("data") or {}).get("findings", [])
+             if f.get("severity") in ("high", "medium")][:4]
+    return {"tiles": tiles, "findings": finds, "kind": (r.get("verdict") or {}).get("kind", "ok")}
+
+
+def dash_ifaces(sess):
+    """Physical interfaces -> [{name, state, speed, errors}] (state: up, down, disabled)."""
+    out, v = [], sess["vendor"]
+    if v == "f5":
+        ok, d = f5_get(sess, "/mgmt/tm/net/interface/stats")
+        if not ok:
+            raise ValueError("HTTP error on /mgmt/tm/net/interface/stats")
+        for r in f5_stat_rows(d):
+            if not r.get("tmName"):
+                continue
+            st = str(r.get("status") or "unknown").lower()
+            out.append({"name": str(r["tmName"]), "state": "disabled" if st == "disabled" else "up" if st == "up" else st,
+                        "speed": str(r.get("mediaActive") or ""),
+                        "errors": int((ru_float(r.get("counters.errorsAll")) or 0) + (ru_float(r.get("counters.dropsAll")) or 0))})
+    elif v == "paloalto":
+        st_, ok, d = pan_op(sess, "<show><interface>all</interface></show>")
+        res = d.get("result") if ok and isinstance(d, dict) else None
+        if not isinstance(res, dict):
+            raise ValueError("show interface all: HTTP %s" % st_)
+        hw = res.get("hw") or {}
+        for e in as_list(hw.get("entry") if isinstance(hw, dict) else None):
+            if not isinstance(e, dict) or not e.get("name"):
+                continue
+            s, det = str(e.get("state") or "").lower(), str(e.get("st") or "")
+            out.append({"name": e["name"], "state": "disabled" if "power-down" in det or s == "admin-down" else s or "unknown",
+                        "speed": det or "%s/%s" % (e.get("speed", ""), e.get("duplex", "")), "errors": 0})
+    else:
+        st_, ok, d = rest_get(sess, "/api/v2/monitor/system/interface")
+        if not ok or not isinstance(d, dict):
+            raise ValueError("monitor/system/interface: HTTP %s" % st_)
+        res = d.get("results")
+        for i in (res.values() if isinstance(res, dict) else as_list(res)):
+            if not isinstance(i, dict) or not i.get("name") or not isinstance(i.get("link"), bool):
+                continue
+            sp = i.get("speed")
+            out.append({"name": i["name"], "state": "up" if i["link"] else "down",
+                        "speed": ("%s Mb/s %s" % (int(ru_float(sp) or 0), i.get("duplex") or "")).strip() if sp else "",
+                        "errors": int((ru_float(i.get("rx_errors")) or 0) + (ru_float(i.get("tx_errors")) or 0))})
+    return sorted(out, key=lambda x: [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", x["name"])])
+
+
+def dash_ha_f5(sess):
+    state, lines, sync, color = f5_ha_state(sess), [], "", ""
+    ok, d = f5_get(sess, "/mgmt/tm/cm/sync-status")
+    for r in f5_stat_rows(d) if ok else []:
+        if r.get("status"):
+            sync, color = str(r["status"]), str(r.get("color") or "").lower()
+            break
+    okd, dev = f5_get(sess, "/mgmt/tm/cm/device")
+    peers = [x for x in (dev.get("items", []) if okd and isinstance(dev, dict) else []) if isinstance(x, dict)]
+    for x in sorted(peers, key=lambda x: str(x.get("selfDevice")).lower() != "true"):
+        me = str(x.get("selfDevice")).lower() == "true"
+        lines.append("%s %s: %s" % ("This unit" if me else "Peer", x.get("name"), str(x.get("failoverState") or "?").upper()))
+    alone = sync.lower() == "standalone" or len(peers) <= 1
+    cls = "na" if alone else "bad" if color == "red" or "disconnected" in sync.lower() else \
+        "good" if color == "green" or sync.lower() == "in sync" else "warn"
+    return {"mode": "standalone" if alone else "HA pair", "state": state or "?", "sync": sync, "cls": cls, "lines": lines}
+
+
+def dash_ha_pan(sess):
+    st_, ok, d = pan_op(sess, "<show><high-availability><state/></high-availability></show>")
+    res = d.get("result") if ok and isinstance(d, dict) else None
+    if not isinstance(res, dict):
+        raise ValueError("show high-availability state: HTTP %s" % st_)
+    if str(res.get("enabled", "")).lower() != "yes":
+        return {"mode": "standalone", "state": "", "sync": "", "cls": "na", "lines": ["HA is not enabled"]}
+    grp = res.get("group") or {}
+    loc, peer = grp.get("local-info") or {}, grp.get("peer-info") or {}
+    state, pst = str(loc.get("state") or "?"), str(peer.get("state") or "?")
+    conn = str(peer.get("conn-status") or "?").lower()
+    sync = str(grp.get("running-sync") or loc.get("state-sync") or "")
+    lines = ["This unit: %s (priority %s)" % (state.upper(), loc.get("priority", "?")),
+             "Peer %s: %s, link %s" % (peer.get("mgmt-ip") or "", pst.upper(), conn)]
+    cls = "bad" if conn != "up" or state.lower() in ("suspended", "non-functional") or pst.lower() in (
+        "suspended", "non-functional", "unknown") else \
+        "warn" if sync and sync.lower() not in ("synchronized", "complete") else "good"
+    return {"mode": str(grp.get("mode") or "HA"), "state": state.upper(), "sync": sync, "cls": cls, "lines": lines}
+
+
+def dash_ha_fg(sess):
+    st_, ok, d = rest_get(sess, "/api/v2/cmdb/system/ha")
+    cfg = d.get("results") if ok and isinstance(d, dict) else None
+    cfg = cfg[0] if isinstance(cfg, list) and cfg else cfg
+    mode = str((cfg or {}).get("mode") or "") if isinstance(cfg, dict) else ""
+    if mode == "standalone":
+        return {"mode": "standalone", "state": "", "sync": "", "cls": "na", "lines": ["HA is not configured"]}
+    st_, ok, d = rest_get(sess, "/api/v2/monitor/system/ha-peer")
+    peers = [p for p in as_list(d.get("results") if ok and isinstance(d, dict) else None) if isinstance(p, dict)]
+    if not peers and not mode:
+        raise ValueError("HA state not readable (HTTP %s)" % st_)
+    lines, primary = [], ""
+    for p in peers:
+        pri = any(p.get(f) in (True, 1) for f in ("primary", "is_primary", "is_manage_master", "is_root_primary"))
+        if pri:
+            primary = str(p.get("hostname") or p.get("serial_no"))
+        lines.append("%s (%s)%s, priority %s" % (p.get("hostname") or "?", p.get("serial_no") or "?",
+                                                 " PRIMARY" if pri else "", p.get("priority", "?")))
+    sync = ""
+    st_, ok, d = rest_get(sess, "/api/v2/monitor/system/ha-checksums")
+    sums = [m.get("checksum") for m in as_list(d.get("results") if ok and isinstance(d, dict) else None)
+            if isinstance(m, dict) and m.get("checksum")]
+    if len(sums) > 1:
+        sync = "in sync" if len({json.dumps(s, sort_keys=True) for s in sums}) == 1 else "OUT OF SYNC"
+    cls = "bad" if len(peers) < 2 else "warn" if sync == "OUT OF SYNC" else "good"
+    return {"mode": {"a-p": "active-passive", "a-a": "active-active"}.get(mode, mode or "cluster"),
+            "state": ("primary: " + primary) if primary else "%d member(s)" % len(peers), "sync": sync, "cls": cls,
+            "lines": lines or ["no cluster members reported"]}
+
+
+DASH_HA = {"f5": dash_ha_f5, "paloalto": dash_ha_pan, "fortigate": dash_ha_fg}
+
+
+def dash_device(sid, sess):
+    t0, errs = time.time(), []
+    out = {"id": sid, "device": sess.get("name") or sess.get("host"), "vendor": sess["vendor"], "host": sess.get("host"),
+           "res": None, "ifaces": None, "ha": None}
+    for key, fn in (("res", dash_resources), ("ifaces", dash_ifaces), ("ha", DASH_HA[sess["vendor"]])):
+        try:
+            out[key] = fn(sess)
+        except Exception as e:  # noqa: BLE001 - one unreadable section must not hide the others
+            err = str(getattr(e, "reason", e))[:200]
+            errs.append("%s: %s" % ({"res": "resources", "ifaces": "interfaces", "ha": "HA"}[key],
+                                    err if isinstance(e, (ValueError, urllib.error.URLError, OSError))
+                                    else "%s: %s" % (type(e).__name__, err)))
+    seen = DASH["seen"].setdefault(sid, set())
+    for i in out["ifaces"] or []:   # a down port alerts only after it has been seen up (unused ports stay quiet)
+        if i["state"] == "up":
+            seen.add(i["name"])
+        i["cls"] = "good" if i["state"] == "up" else "admin" if i["state"] == "disabled" else \
+            "bad" if i["name"] in seen else "idle"
+    ha = out["ha"]
+    if ha:
+        was = DASH["prev_ha"].get(sid)
+        now = (ha["state"], ha["sync"])
+        if was and was != now:
+            ha["changed"] = "was %s" % " / ".join(x for x in was if x)
+        DASH["prev_ha"][sid] = now
+    h = DASH["hist"].setdefault(sid, collections.deque(maxlen=DASH_HIST))
+    h.append({t["label"]: t["value"] for t in (out["res"] or {}).get("tiles", []) if t["fmt"] == "pct"})
+    for t in (out["res"] or {}).get("tiles", []):
+        if t["fmt"] == "pct":
+            t["spark"] = [p.get(t["label"]) for p in h]
+    out.update(errors=errs, time=time.strftime("%H:%M:%S"), ms=int((time.time() - t0) * 1000))
+    audit(sess, "dashboard refresh (resources, interfaces, HA)%s" % (": " + "; ".join(errs)[:150] if errs else ""))
+    return out
+
+
+def dash_cycle(items):
+    t0 = time.time()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max(1, min(6, len(items)))) as ex:
+            futs = {ex.submit(dash_device, sid, s): (sid, s) for sid, s in items}
+            for f in concurrent.futures.as_completed(futs):
+                sid, s = futs[f]
+                try:
+                    DASH["devices"][sid] = f.result()
+                except Exception as e:  # noqa: BLE001
+                    DASH["devices"][sid] = {"id": sid, "device": s.get("name") or s.get("host"), "vendor": s["vendor"],
+                                            "host": s.get("host"), "errors": ["%s: %s" % (type(e).__name__, e)],
+                                            "time": time.strftime("%H:%M:%S")}
+        DASH["last"], DASH["took"] = time.strftime("%Y-%m-%d %H:%M:%S"), int(time.time() - t0)
+    finally:
+        DASH["busy"] = False
+
+
+def dash_tick():
+    with LOCK:
+        items = [(sid, s) for sid, s in SESSIONS.items() if s.get("vendor") in DASH_VENDORS]
+    ids = dict(items)
+    for store in ("devices", "hist", "seen", "prev_ha"):
+        for gone in [k for k in DASH[store] if k not in ids]:
+            DASH[store].pop(gone, None)
+    with DASH["lock"]:
+        if not DASH["on"] or not items or DASH["busy"] or time.time() < DASH["next"]:
+            return
+        DASH["busy"], DASH["next"] = True, time.time() + DASH["interval"]
+    threading.Thread(target=dash_cycle, args=(items,), daemon=True).start()
+
+
+def do_dash_get(query):
+    dash_tick()
+    order = {"paloalto": 0, "fortigate": 1, "f5": 2}
+    devs = sorted(DASH["devices"].values(), key=lambda d: (order.get(d.get("vendor"), 9), str(d.get("device")).lower()))
+    return {"ok": True, "on": DASH["on"], "interval": DASH["interval"], "busy": DASH["busy"], "last": DASH["last"],
+            "took": DASH["took"], "next_in": max(0, int(DASH["next"] - time.time())) if DASH["on"] else None,
+            "devices": devs}
+
+
+def do_dash_set(b):
+    if "on" in b:
+        DASH["on"] = bool(b.get("on"))
+    if "interval" in b:
+        try:
+            iv = int(b.get("interval"))
+        except (TypeError, ValueError):
+            iv = 0
+        if iv not in DASH_INTERVALS:
+            return {"ok": False, "error": "interval must be one of %s seconds" % ", ".join(map(str, DASH_INTERVALS))}
+        DASH["interval"] = iv
+        DASH["next"] = min(DASH["next"], time.time() + iv)
+    if b.get("now") or b.get("on"):
+        DASH["next"] = 0.0
+    dash_tick()
+    return {"ok": True, "on": DASH["on"], "interval": DASH["interval"]}
 
 
 # ---- Packet capture analysis: a .pcap / .pcapng uploaded in the AI assistant is read here (standard library only) ----
@@ -13740,13 +14414,750 @@ def do_pcap_upload(raw, fname):
         return {"ok": False, "error": "could not read %s: %s" % (fname, e)}
 
 
+# ---- Vendor advisories: published CVEs that affect the software the connected devices run ------------------------
+# Public lists only, downloaded whole and matched here, so nothing about the devices (versions, models, names) is
+# sent anywhere:
+#   Palo Alto  security.paloaltonetworks.com/json  (every PAN-OS advisory with affected / fixed versions per train)
+#   F5, Forti  NVD keyword lists "BIG-IP" / "FortiOS" (every CVE id, score, NVD version ranges) + the vendor's own
+#              CVE record from CVE.org for each (exact affected ranges and fixed versions; NVD ranges are the fallback)
+#   all        CISA Known Exploited Vulnerabilities catalog (actively exploited flag)
+# The download runs every ADV["interval"] seconds while a page is open and devices are connected; the result is kept
+# in advisory_cache.json (git-ignored, public data only) so a restart does not download it again.
+ADV_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "advisory_cache.json")
+ADV = {"busy": False, "stage": "", "next": 0.0, "interval": 43200, "min": "high", "last": "", "errors": {},
+       "feeds": None, "sig": None, "results": [], "lock": threading.Lock()}
+ADV_MIN = {"critical": 9.0, "high": 7.0, "medium": 4.0}
+ADV_SINCE = "2016"   # older CVEs are not looked at (no supported release is affected by them)
+ADV_VENDORS = ("paloalto", "fortigate", "f5")
+ADV_LABEL = {"paloalto": "Palo Alto", "fortigate": "FortiGate", "f5": "F5 BIG-IP"}
+ADV_NVD_KEY = {"f5": "BIG-IP", "fortigate": "FortiOS"}
+ADV_HELP = {   # where the vendor says which release to run (the console computes the lowest release clear of the CVEs)
+    "paloalto": ("https://security.paloaltonetworks.com/", "Palo Alto security advisories + PAN-OS release guidance (preferred releases)"),
+    "fortigate": ("https://community.fortinet.com/t5/FortiGate/Technical-Tip-Recommended-Release-for-FortiOS/ta-p/227178",
+                  "Fortinet: Recommended release for FortiOS"),
+    "f5": ("https://my.f5.com/manage/s/article/K5903", "F5 K5903: BIG-IP software support policy")}
+ADV_F5_TOKENS = (   # words in an F5 product name -> provisioned module (sys provision name)
+    ("LOCAL TRAFFIC", "ltm"), ("LTM", "ltm"), ("ACCESS POLICY", "apm"), ("APM", "apm"),
+    ("APPLICATION SECURITY", "asm"), ("ASM", "asm"), ("ADVANCED WAF", "asm"), ("AWAF", "asm"), ("ADVANCED WEB", "asm"),
+    ("ADVANCED FIREWALL", "afm"), ("AFM", "afm"), ("DDOS HYBRID", "afm"), ("DDHD", "afm"),
+    ("DOMAIN NAME", "gtm"), ("GLOBAL TRAFFIC", "gtm"), ("DNS", "gtm"), ("GTM", "gtm"), ("LINK CONTROLLER", "lc"),
+    ("POLICY ENFORCEMENT", "pem"), ("PEM", "pem"), ("APPLICATION ACCELERATION", "aam"), ("WEBACCELERATOR", "aam"),
+    ("AAM", "aam"), ("ANALYTICS", "avr"), ("APPLICATION VISIBILITY", "avr"), ("AVR", "avr"), ("FRAUD", "fps"),
+    ("WEBSAFE", "fps"), ("FPS", "fps"), ("SSL ORCHESTRATOR", "sslo"), ("SSLO", "sslo"), ("CARRIER", "cgnat"),
+    ("CGNAT", "cgnat"))
+ADV_F5_SKIP = ("NEXT", "BIG-IQ", "EDGE CLIENT", "APM CLIENT", "CLIENTS", "CONTAINER", "F5OS")
+
+
+class AdvError(Exception):
+    pass
+
+
+def adv_fetch(url, timeout=90, limit=80_000_000):
+    """GET a public HTTPS JSON document directly (no proxy, HTTPS redirects only, gzip accepted) -> parsed JSON."""
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    host = urllib.parse.urlsplit(url).hostname
+    for _ in range(4):
+        if not url.startswith("https://"):
+            raise AdvError("%s redirected to a non-HTTPS address" % host)
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "Accept-Encoding": "gzip",
+                                                   "User-Agent": "read-only-netops-console"})
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                raw = r.read(limit + 1)
+                enc = (r.headers.get("Content-Encoding") or "").lower()
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+                url = urllib.parse.urljoin(url, e.headers["Location"])
+                continue
+            raise AdvError("%s answered HTTP %s" % (host, e.code))
+        except (urllib.error.URLError, OSError) as e:
+            raise AdvError("could not reach %s: %s" % (host, getattr(e, "reason", e)))
+        if len(raw) > limit:
+            raise AdvError("%s sent more than %d MB" % (host, limit // 1000000))
+        if enc == "gzip" or raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise AdvError("%s did not send JSON" % host)
+    raise AdvError("%s: too many redirects" % host)
+
+
+@functools.lru_cache(maxsize=20000)
+def adv_ver(s):
+    """'11.1.6-h3' / '17.1.1.3' / 'v7.4.3' -> (11, 1, 6, 3, 0) style tuple padded to 5, or None."""
+    m = re.match(r"\s*v?(\d+(?:\.\d+){0,4})(?:-h(\d+))?", s if isinstance(s, str) else str(s or ""))
+    if not m:
+        return None
+    t = [int(x) for x in m.group(1).split(".")]
+    if m.group(2):
+        t = (t + [0, 0, 0])[:3] + [int(m.group(2))]
+    return tuple((t + [0] * 5)[:5])
+
+
+def adv_vparts(s):
+    """How many dotted numbers a version string has (to tell '7.0' (a train) from '7.0.0')."""
+    m = re.match(r"\s*v?(\d+(?:\.\d+)*)", str(s or ""))
+    return len(m.group(1).split(".")) if m else 0
+
+
+def adv_sev(score):
+    return ("unrated" if score is None else "critical" if score >= 9 else "high" if score >= 7 else
+            "medium" if score >= 4 else "low")
+
+
+# -- download + trim (only the fields the matching needs are kept) --
+def adv_pan_download():
+    recs, seen = [], set()
+    for page in range(1, 21):
+        d = adv_fetch("https://security.paloaltonetworks.com/json/?product=PAN-OS&sort=-date&limit=100&page=%d" % page)
+        if not isinstance(d, list) or not d:
+            break
+        new = 0
+        for x in d:
+            if not isinstance(x, dict) or x.get("ID") in seen:
+                continue
+            seen.add(x.get("ID"))
+            new += 1
+            recs.append({k: x.get(k) for k in ("ID", "title", "baseSeverity", "baseScore", "version", "affected",
+                                                 "fixed", "date", "updated")})
+        if len(d) < 100 or not new:
+            break
+    if not recs:
+        raise AdvError("security.paloaltonetworks.com returned no advisories")
+    return recs
+
+
+def adv_nvd_score(metrics):
+    for k in ("cvssMetricV31", "cvssMetricV40", "cvssMetricV30", "cvssMetricV2"):
+        sc = [((m.get("cvssData") or {}).get("baseScore")) for m in (metrics or {}).get(k) or [] if isinstance(m, dict)]
+        sc = [s for s in sc if isinstance(s, (int, float))]
+        if sc:
+            return float(max(sc))
+    return None
+
+
+def adv_nvd_trim(c):
+    cpes = []
+    for cfg in c.get("configurations") or []:
+        for node in cfg.get("nodes") or []:
+            for m in node.get("cpeMatch") or []:
+                p = str(m.get("criteria") or "").split(":")
+                if m.get("vulnerable") and len(p) > 5 and p[3] in ("f5", "fortinet"):
+                    cpes.append([p[3], p[4], p[5]] + [m.get(k) for k in ("versionStartIncluding", "versionStartExcluding",
+                                                                       "versionEndIncluding", "versionEndExcluding")])
+    desc = next((x.get("value", "") for x in c.get("descriptions") or [] if x.get("lang") == "en"), "")
+    return {"id": c.get("id", ""), "published": c.get("published", ""), "mod": c.get("lastModified", ""),
+            "score": adv_nvd_score(c.get("metrics")), "desc": desc[:300], "cpes": cpes}
+
+
+def adv_nvd_download(keyword):
+    out, start = [], 0
+    while True:
+        url = ("https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=%s&noRejected&resultsPerPage=2000"
+               "&startIndex=%d" % (urllib.parse.quote(keyword), start))
+        for attempt in range(3):
+            try:
+                d = adv_fetch(url, timeout=120)
+                break
+            except AdvError as e:   # NVD rate-limits (403 / 503) without an API key: wait and try again
+                if attempt == 2 or not re.search(r"HTTP (403|429|5\d\d)|timed out", str(e)):
+                    raise
+                time.sleep(12)
+        vulns = d.get("vulnerabilities") or [] if isinstance(d, dict) else []
+        out += [adv_nvd_trim(v.get("cve") or {}) for v in vulns if isinstance(v, dict)]
+        start += len(vulns)
+        if not vulns or start >= int(d.get("totalResults") or 0) or start > 20000:
+            break
+        time.sleep(7)   # NVD: at most 5 requests in 30 s without an API key
+    return [x for x in out if x["id"] and x["published"][:4] >= ADV_SINCE]
+
+
+def adv_kev_download():
+    d = adv_fetch("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json")
+    vulns = d.get("vulnerabilities") if isinstance(d, dict) else None
+    if not isinstance(vulns, list):
+        raise AdvError("the CISA KEV catalog has an unexpected format")
+    return {v.get("cveID"): {"added": v.get("dateAdded", ""), "ransom": v.get("knownRansomwareCampaignUse") == "Known"}
+            for v in vulns if isinstance(v, dict) and v.get("cveID")}
+
+
+def adv_cna_trim(d):
+    cont = d.get("containers") or {}
+    c = cont.get("cna") or {}
+    aff = []
+    for a in c.get("affected") or []:
+        if isinstance(a, dict):
+            vs = [{k: v.get(k) for k in ("version", "lessThan", "lessThanOrEqual", "status", "changes") if v.get(k) is not None}
+                  for v in a.get("versions") or [] if isinstance(v, dict)]
+            aff.append({"vendor": a.get("vendor", ""), "product": a.get("product", ""), "versions": vs})
+    score = None
+    for m in c.get("metrics") or []:
+        for k in ("cvssV3_1", "cvssV4_0", "cvssV3_0"):
+            s = (m.get(k) or {}).get("baseScore") if isinstance(m, dict) else None
+            if isinstance(s, (int, float)) and (score is None or k == "cvssV3_1"):
+                score = float(s)
+    expl = ""
+    for a in cont.get("adp") or []:
+        for m in a.get("metrics") or []:
+            for o in (((m.get("other") or {}).get("content") or {}).get("options") or []) if isinstance(m, dict) else []:
+                if isinstance(o, dict) and o.get("Exploitation"):
+                    expl = str(o["Exploitation"])
+    return {"aff": aff, "score": score, "title": str(c.get("title") or "")[:200], "expl": expl,
+            "sol": " \n".join(str(s.get("value", "")) for s in c.get("solutions") or [] if isinstance(s, dict))[:3000],
+            "refs": [r.get("url") for r in c.get("references") or [] if isinstance(r, dict) and r.get("url")][:8]}
+
+
+def adv_cna_topup(feeds, floor):
+    """Fetch the CVE.org record of every F5 / FortiOS CVE at or above the score floor (or exploited) that is not in the
+    cache yet or changed since. The whole product list is fetched, so the requests say nothing about the devices."""
+    cna, kev = feeds.setdefault("cna", {}), feeds.get("kev") or {}
+    want = []
+    for vendor in ADV_NVD_KEY:
+        for r in (feeds.get("nvd") or {}).get(vendor) or []:
+            c = cna.get(r["id"])
+            if r["score"] is not None and r["score"] < floor and r["id"] not in kev and not (c and c.get("score") or 0) >= floor:
+                continue
+            if not c or c.get("nvdmod") != r["mod"]:
+                want.append(r)
+    errs, done = [], [0]
+
+    def one(r):
+        try:
+            rec = adv_cna_trim(adv_fetch("https://cveawg.mitre.org/api/cve/" + urllib.parse.quote(r["id"]), timeout=30))
+        except AdvError as e:
+            errs.append(str(e))
+            return
+        rec["nvdmod"] = r["mod"]
+        cna[r["id"]] = rec
+        done[0] += 1
+        ADV["stage"] = "Reading CVE records %d / %d" % (done[0], len(want))
+
+    if want:
+        ADV["stage"] = "Reading CVE records 0 / %d" % len(want)
+        with concurrent.futures.ThreadPoolExecutor(8) as ex:
+            list(ex.map(one, want))
+    if errs:
+        ADV["errors"]["cve.org"] = "%d of %d CVE records could not be read (%s); NVD ranges used for those" % (
+            len(errs), len(want), errs[0])
+    else:
+        ADV["errors"].pop("cve.org", None)
+    return len(want)
+
+
+def adv_load():
+    try:
+        with open(ADV_CACHE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def adv_save(feeds):
+    try:
+        with open(ADV_CACHE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(feeds, f, separators=(",", ":"))
+        os.replace(ADV_CACHE + ".tmp", ADV_CACHE)
+    except OSError as e:
+        ADV["errors"]["cache"] = "could not save %s: %s" % (os.path.basename(ADV_CACHE), e)
+
+
+# -- matching --
+def adv_f5_prod(name, mods, title=""):
+    """True when an F5 product name (CVE record or NVD CPE) is BIG-IP software in use on this unit. When the product
+    is plain 'BIG-IP', a module named in the record title ('BIG-IP APM vulnerability') counts instead."""
+    p = re.sub(r"[_()]+", " ", str(name or "")).upper()
+    if not p.startswith("BIG-IP") or any(x in p for x in ADV_F5_SKIP):
+        return False
+    found = {m for k, m in ADV_F5_TOKENS if re.search(r"\b%s\b" % re.escape(k), p[6:])}
+    if not found and title:
+        t = re.sub(r"[_()]+", " ", str(title)).upper()
+        found = {m for k, m in ADV_F5_TOKENS if len(k) <= 5 and re.search(r"\b%s\b" % re.escape(k), t)}
+    return not found or not mods or bool(found & set(mods))
+
+
+def adv_range_hit(v, start, lt=None, le=None, f5=False):
+    s = adv_ver(start) if start not in (None, "", "0", "*", "-") else None
+    if s and v < s:
+        return False
+    if lt:
+        e = adv_ver(lt)
+        return e is not None and v < e
+    if le:
+        e = adv_ver(le)
+        if e is None:
+            return False
+        n = adv_vparts(le)
+        return v[:n] <= e[:n] if f5 and n < 4 else v <= e   # F5 '<= 17.1.3' in NVD means the whole 17.1.3.x line
+    if s is None:
+        return start in ("*",)
+    n = adv_vparts(start)
+    return v[:n] == s[:n] if n < 3 else v == s
+
+
+def adv_cna_eval(rec, v, vendor, info):
+    """-> (state, fix): state 'affected' / 'clear' / None (the record has no usable version data)."""
+    known, hit, fixes, le_hit, other = False, False, [], False, False
+    for a in rec.get("aff") or []:
+        if any(it.get("status") == "affected" and adv_ver(it.get("version")) for it in a.get("versions") or []):
+            other = True   # the record has version data (maybe only for other products)
+        if vendor == "fortigate":
+            if "fortinet" not in str(a.get("vendor")).lower() or str(a.get("product")).strip().lower() != "fortios":
+                continue
+        elif not ("f5" in str(a.get("vendor")).lower() and adv_f5_prod(a.get("product"), info.get("mods"), rec.get("title"))):
+            continue
+        for it in a.get("versions") or []:
+            if it.get("status") != "affected" or adv_ver(it.get("version")) is None and it.get("version") != "*":
+                continue
+            if re.search(r"\d\.[xX*]|^\d+\.?[xX]", str(it.get("version"))) and not it.get("lessThan"):
+                return None, ""   # old style '16.1.x affected' (no fixed versions): NVD's ranges are better
+            known = True
+            if not adv_range_hit(v, it.get("version"), it.get("lessThan"), it.get("lessThanOrEqual")):
+                continue
+            ch = sorted((adv_ver(c.get("at")), c.get("status")) for c in it.get("changes") or []
+                        if isinstance(c, dict) and adv_ver(c.get("at")))
+            past = [st for at, st in ch if v >= at]
+            if past and past[-1] == "unaffected":
+                continue
+            hit = True
+            fixes += [str(c.get("at")) for c in it.get("changes") or [] if isinstance(c, dict)
+                      and c.get("status") == "unaffected" and adv_ver(c.get("at")) and adv_ver(c.get("at")) > v]
+            if it.get("lessThan"):
+                fixes.append(str(it["lessThan"]))
+            if it.get("lessThanOrEqual"):
+                le_hit = le_hit or str(it["lessThanOrEqual"])
+    if not known:
+        return ("clear" if other else None), ""   # versions given only for other products (e.g. 'APM Clients')
+    if not hit:
+        return "clear", ""
+    fx = sorted({f for f in fixes if adv_ver(f)} | (set(adv_sol_versions(rec)) if le_hit or not fixes else set()),
+                key=adv_ver)
+    same = [f for f in fx if adv_ver(f)[:2] == v[:2] and adv_ver(f) > v]
+    if not same and le_hit:
+        return "affected", "> " + le_hit   # no fixed release named for this train yet
+    return "affected", (same or [f for f in fx if adv_ver(f) > v] or [""])[0]
+
+
+def adv_sol_versions(rec):
+    """Versions named in a record's solution text ('Upgrade to FortiOS version 7.4.13 or above')."""
+    out = []
+    for line in str(rec.get("sol") or "").splitlines():
+        if re.search(r"Forti(?!OS)\w+", line) and "FortiOS" not in line:
+            continue   # a line about another Fortinet product
+        out += re.findall(r"\b(\d+\.\d+\.\d+(?:\.\d+)?)\b", line)
+    return out
+
+
+def adv_nvd_eval(rec, v, vendor, info):
+    known, hit, fix = False, False, ""
+    for vend, prod, ver, si, se, ei, ee in rec.get("cpes") or []:
+        if vendor == "fortigate":
+            if vend != "fortinet" or prod != "fortios":
+                continue
+        elif vend != "f5" or not adv_f5_prod(prod, info.get("mods")):
+            continue
+        if ver in ("*", "-", "") and not (si or se or ei or ee):
+            continue   # 'every version' with no range: too vague to say anything about one release
+        known = True
+        if ver not in ("*", "-", ""):
+            h = adv_range_hit(v, ver)
+        else:
+            h = ((not si or v >= adv_ver(si)) and (not se or v > adv_ver(se)) and
+                 (not ee or v < adv_ver(ee)) and (not ei or adv_range_hit(v, None, le=ei, f5=vendor == "f5")))
+        if h:
+            hit = True
+            if ee and (not fix or adv_ver(ee) < adv_ver(fix)):
+                fix = ee
+    return (("affected" if hit else "clear") if known else None), fix
+
+
+def adv_pan_qual_ok(q, info):
+    """Does an 'on <platform>' qualifier of a PAN-OS advisory apply to this unit? None = cannot tell (shown as a note)."""
+    q, model = q.strip().lower(), str(info.get("model") or "").upper()
+    pano = info.get("panorama")
+    neg = q.startswith("devices other than")
+    if "panorama" in q:
+        r = pano
+    elif q.startswith("firewall"):
+        r = not pano
+    elif "vm-series" in q:
+        r = model.startswith("PA-VM")
+    elif re.search(r"pa-\d+", q):
+        qd, md = re.search(r"pa-(\d+)", q).group(1), (re.search(r"PA-(\d+)", model) or [None, ""])[1]
+        r = bool(md) and len(md) == len(qd) and (md == qd or ("series" in q or qd.endswith("000")) and md[0] == qd[0])
+    else:
+        return None
+    return (not r) if neg else r
+
+
+def adv_pan_eval(rec, v, info):
+    """PAN-OS advisory -> (state, fix): state 'affected' / 'clear' / 'unknown' (this train is not listed)."""
+    names, affs, fixed = rec.get("version") or [], rec.get("affected") or [], rec.get("fixed") or []
+    train = "PAN-OS %d.%d" % v[:2]
+    if train not in [str(n).strip() for n in names]:
+        return "clear", ""   # trains an advisory does not list are not affected (end-of-life ones: see adv_pan_trains)
+    i = [str(n).strip() for n in names].index(train)
+    aff, fx = str(affs[i] if i < len(affs) else ""), str(fixed[i] if i < len(fixed) else "")
+    if not aff.strip():
+        return "clear", ""
+    bounds, exact, every, any_tok, note = [], [], False, False, ""
+    for tok in aff.split(","):
+        t = tok.strip().rstrip("*").strip()
+        m = re.match(r"(.*?)\s+(on|with(?:out)?)\s+(.+)$", t, re.I)
+        if m:
+            t, kind, q = m.group(1).strip(), m.group(2).lower(), m.group(3)
+            ok = adv_pan_qual_ok(q, info) if kind == "on" else None
+            if ok is False:
+                any_tok = True
+                continue
+            if ok is None:
+                note = "only %s %s" % (kind, q)
+        if not t:
+            continue
+        if t.lower() == "none":
+            any_tok = True
+            continue
+        if t.lower().startswith("all") or re.match(r"^\d+\.\d+(\.\*| all)$", t, re.I):
+            every = any_tok = True
+            continue
+        m = re.match(r"^(<=|<|>=)\s*(\d[\w.-]*)$", t)
+        if m and adv_ver(m.group(2)):
+            any_tok = True
+            bounds.append((m.group(1), m.group(2)))
+        elif re.match(r"^\d+\.\d+\.\d+(-h\d+)?$", t):
+            any_tok = True
+            exact.append(t)
+    if not any_tok:
+        return "unknown", ""
+    hit, fix = adv_pan_windows(bounds, v)
+    if any(v == adv_ver(x) for x in exact):
+        hit = True
+    if every:
+        hit, fix = True, ""
+    if not hit:
+        return "clear", ""
+    if not fix:
+        cand = sorted((f for f in re.findall(r">=\s*(\d[\w.-]*)", fx) if adv_ver(f) and adv_ver(f) > v), key=adv_ver)
+        fix = cand[0] if cand else ""
+    return "affected", fix, note
+
+
+def adv_pan_windows(bounds, v):
+    """Affected windows from a PAN-OS list such as '>= 10.2.8, < 10.2.8-h19, < 10.2.9-h19, < 10.2.14':
+    '< F' ends a window at fix F, starting at the '>= S' just before it or else at the maintenance release after the
+    previous fix (10.2.9 above); a '>= S' with no fix after it covers the rest of S's maintenance release (10.2.8-h*).
+    -> (affected, fix)."""
+    toks = sorted(((k, adv_ver(x), x) for k, x in bounds), key=lambda t: (t[1], t[0] != ">="))
+    wins, start, prev = [], None, None
+    for kind, xv, x in toks:
+        if kind == ">=":
+            if start is not None:
+                wins.append((start, None, "", False))
+            start = xv
+            continue
+        s = start if start is not None else ((prev[0], prev[1], prev[2] + 1, 0, 0) if prev else (0,) * 5)
+        wins.append((s, xv, x if kind == "<" else "", kind == "<="))
+        prev, start = xv, None
+    if start is not None:
+        wins.append((start, None, "", False))
+    for s, e, fx, incl in wins:
+        if e is None:
+            if v >= s and v[:3] == s[:3]:
+                return True, ""
+        elif s <= v and (v <= e if incl else v < e):
+            return True, fx
+    return False, ""
+
+
+def adv_records(vendor, feeds, floor):
+    """The advisories of one vendor at or above the score floor (or exploited) as uniform rows with an evaluator."""
+    kev, rows = feeds.get("kev") or {}, []
+    if vendor == "paloalto":
+        for r in feeds.get("pan") or []:
+            sev = str(r.get("baseSeverity") or "").lower()
+            if sev in ("informational", "none"):
+                continue
+            score = r.get("baseScore") if isinstance(r.get("baseScore"), (int, float)) else None
+            if (score if score is not None else 10) < floor and r.get("ID") not in kev:
+                continue
+            fixes = re.findall(r"<\s*(\d[\w.-]*)", " ".join(map(str, r.get("affected") or []))) + \
+                re.findall(r">=\s*(\d[\w.-]*)", " ".join(map(str, r.get("fixed") or [])))
+            rows.append({"id": r.get("ID"), "title": r.get("title") or "", "score": score,
+                         "sev": sev if sev in ("critical", "high", "medium", "low") else adv_sev(score),
+                         "date": str(r.get("date") or "")[:10], "url": "https://security.paloaltonetworks.com/" + str(r.get("ID")),
+                         "kev": r.get("ID") in kev, "eval": (lambda v, info, r=r: adv_pan_eval(r, v, info)), "fixes": fixes})
+        return rows
+    cna = feeds.get("cna") or {}
+    for r in (feeds.get("nvd") or {}).get(vendor) or []:
+        c = cna.get(r["id"])
+        score = c.get("score") if c and c.get("score") is not None else r["score"]
+        if (score if score is not None else 10) < floor and r["id"] not in kev and not (c and c.get("expl") == "active"):
+            continue
+
+        def ev(v, info, r=r, c=c):
+            if c:
+                st, fix = adv_cna_eval(c, v, vendor, info)
+                if st:
+                    return st, fix
+            return adv_nvd_eval(r, v, vendor, info)
+
+        refs = (c or {}).get("refs") or []
+        url = next((u for u in refs if ("fortiguard" in u if vendor == "fortigate" else "f5.com" in u)), "") or \
+            "https://nvd.nist.gov/vuln/detail/" + r["id"]
+        fixes = [x[6] for x in r.get("cpes") or [] if x[6]]
+        for a in (c or {}).get("aff") or []:
+            fixes += [it["lessThan"] for it in a.get("versions") or [] if it.get("lessThan")]
+        fixes += adv_sol_versions(c or {})
+        rows.append({"id": r["id"], "title": (c or {}).get("title") or r["desc"][:140], "score": score, "sev": adv_sev(score),
+                     "date": r["published"][:10], "url": url, "kev": r["id"] in kev or (c or {}).get("expl") == "active",
+                     "eval": ev, "fixes": fixes})
+    return rows
+
+
+def adv_pan_trains(feeds, n=15):
+    """PAN-OS trains named in the newest advisories = the trains Palo Alto still supports."""
+    recent = sorted(feeds.get("pan") or [], key=lambda r: str(r.get("date") or ""), reverse=True)[:n]
+    return {str(x).strip()[7:] for r in recent for x in r.get("version") or [] if str(x).startswith("PAN-OS ")}
+
+
+def adv_recent_trains(rows, days=400):
+    """F5 / FortiOS trains that got a fixed release in an advisory of the last ~13 months = still supported."""
+    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
+    out = set()
+    for r in rows:
+        if r["date"] >= since:
+            out |= {"%d.%d" % t[:2] for t in map(adv_ver, r["fixes"]) if t}
+    return out
+
+
+def adv_assess(vendor, version, info, rows, trains=None):
+    v = adv_ver(version)
+    if not v:
+        return {"error": "could not read the software version (%r)" % version}
+    hits, unknown = [], 0
+    for r in rows:
+        res = r["eval"](v, info)
+        if res[0] == "affected":
+            hits.append({"id": r["id"], "title": r["title"], "score": r["score"], "sev": r["sev"], "date": r["date"],
+                         "url": r["url"], "kev": r["kev"], "fix": res[1], "note": res[2] if len(res) > 2 else ""})
+        elif res[0] == "unknown":
+            unknown += 1
+    order = {"critical": 0, "high": 1, "unrated": 2, "medium": 3, "low": 4}
+    hits.sort(key=lambda h: (not h["kev"], order.get(h["sev"], 5), -(h["score"] or 0), h["id"]))
+    counts = collections.Counter(h["sev"] for h in hits)
+    out = {"items": hits, "unknown": unknown, "counts": {k: counts.get(k, 0) for k in ("critical", "high", "medium", "unrated")},
+           "exploited": sum(1 for h in hits if h["kev"]), "advice": None, "eol": ""}
+    if trains and "%d.%d" % v[:2] not in trains:
+        out["eol"] = ("%d.%d is not listed in the vendor's recent advisories: it is probably end of life, so new issues "
+                      "are no longer checked for it. Plan a move to a supported release." % v[:2])
+    if not hits:
+        return out
+    # lowest release, on the same train first, that none of the advisories above the floor affects
+    cands = {}
+    for r in rows:
+        for f in r["fixes"]:
+            t = adv_ver(f)
+            if t and t > v and (not trains or "%d.%d" % t[:2] in trains) and \
+                    (vendor != "paloalto" or re.match(r"^\d+\.\d+\.\d+(-h\d+)?$", f)):
+                cands.setdefault(t, f)
+    clear = lambda t: all(r["eval"](t, info)[0] not in ("affected", "unknown") for r in rows)   # noqa: E731
+    same = next((cands[t] for t in sorted(cands) if t[:2] == v[:2] and clear(t)), "")
+    other = "" if same else next((cands[t] for t in sorted(cands) if t[:2] > v[:2] and clear(t)), "")
+    train = "%d.%d" % v[:2]
+    if same:
+        out["advice"] = {"target": same, "same_train": True,
+                         "text": "Upgrade to %s or later (stays on %s); it clears all %d issue(s) listed." % (same, train, len(hits))}
+    elif other:
+        out["advice"] = {"target": other, "same_train": False,
+                         "text": "No %s release fixes all of these: move to %s or later." % (train, other)}
+    else:
+        out["advice"] = {"target": "", "same_train": False,
+                         "text": "No single release in the advisories clears all of these; use the fixed versions per "
+                                 "issue and the vendor's release guidance."}
+    return out
+
+
+# -- device software versions --
+def adv_device(sess):
+    """Software version, model and (F5) provisioned modules of a connected unit; cached for 6 hours."""
+    sw = sess.get("sw")
+    if isinstance(sw, dict) and time.time() - sw.get("t", 0) < 21600 and sw.get("version"):
+        return sw
+    v, info = sess["vendor"], {"version": "", "model": "", "panorama": False, "mods": None}
+    if v == "f5":
+        _, ok, d = rest_get(sess, "/mgmt/tm/sys/version")
+        row = next((r for r in f5_stat_rows(d) if "Version" in r), {}) if ok else {}
+        info["version"], info["model"] = str(row.get("Version") or ""), str(row.get("Product") or "BIG-IP")
+        try:
+            _, ok, d = rest_get(sess, "/mgmt/tm/sys/provision")
+            if ok and isinstance(d, dict) and d.get("items"):
+                info["mods"] = sorted({str(i.get("name")) for i in d["items"]
+                                       if isinstance(i, dict) and str(i.get("level") or "none") != "none"} | {"ltm"})
+        except (urllib.error.URLError, OSError):
+            pass
+    elif v == "fortigate":
+        _, ok, d = rest_get(sess, "/api/v2/monitor/system/status")
+        if ok and isinstance(d, dict):
+            r = d.get("results") or {}
+            info["version"] = str(d.get("version") or "").lstrip("vV")
+            info["model"] = " ".join(str(x) for x in (r.get("model_name"), r.get("model_number")) if x)
+    else:
+        _, ok, d = pan_op(sess, "<show><system><info/></system></show>")
+        s = (((d.get("response") or {}).get("result") or {}).get("system") or {}) if ok and isinstance(d, dict) else {}
+        info["version"], info["model"] = str(s.get("sw-version") or ""), str(s.get("model") or "")
+        info["panorama"] = bool(re.match(r"(panorama|m-\d)", info["model"], re.I))
+    info["t"] = time.time()
+    if info["version"]:
+        sess["sw"] = info
+        audit(sess, "vendor advisories: read software version %s" % info["version"])
+    return info
+
+
+def adv_items():
+    with LOCK:
+        return [(sid, s) for sid, s in SESSIONS.items() if s.get("vendor") in ADV_VENDORS]
+
+
+def adv_evaluate(items):
+    floor = ADV_MIN.get(ADV["min"], 7.0)
+    feeds = ADV["feeds"] or {}
+    if adv_cna_topup(feeds, floor):
+        adv_save(feeds)
+    ADV["stage"] = "Reading device versions"
+    infos = {}
+    with concurrent.futures.ThreadPoolExecutor(max(1, min(6, len(items)))) as ex:
+        futs = {ex.submit(adv_device, s): (sid, s) for sid, s in items}
+        for f in concurrent.futures.as_completed(futs):
+            sid, s = futs[f]
+            try:
+                infos[sid] = f.result()
+            except Exception as e:  # noqa: BLE001 - one unreadable device must not stop the others
+                infos[sid] = {"version": "", "error": "%s: %s" % (type(e).__name__, e)}
+    ADV["stage"] = "Matching advisories"
+    groups = collections.OrderedDict()
+    for sid, s in sorted(items, key=lambda x: (ADV_VENDORS.index(x[1]["vendor"]), str(x[1].get("name")).lower())):
+        info = infos.get(sid) or {}
+        key = (s["vendor"], info.get("version"), bool(info.get("panorama")), tuple(info.get("mods") or ()),
+               str(info.get("model") or "").upper()[:5] if s["vendor"] == "paloalto" else "")
+        g = groups.setdefault(key, {"vendor": s["vendor"], "label": ADV_LABEL[s["vendor"]], "version": info.get("version", ""),
+                                    "info": info, "devices": []})
+        g["devices"].append(s.get("name") or s.get("host"))
+    rows_by = {v: adv_records(v, feeds, floor) for v in ADV_VENDORS}
+    out = []
+    for g in groups.values():
+        info = g.pop("info")
+        if not g["version"]:
+            g["error"] = info.get("error") or "could not read the software version"
+        elif not (feeds.get("pan") if g["vendor"] == "paloalto" else (feeds.get("nvd") or {}).get(g["vendor"])):
+            g["error"] = "the %s advisory list is not available yet" % g["label"]
+        else:
+            g.update(adv_assess(g["vendor"], g["version"], info, rows_by[g["vendor"]],
+                                adv_pan_trains(feeds) if g["vendor"] == "paloalto" else adv_recent_trains(rows_by[g["vendor"]])))
+        g["model"], g["mods"] = info.get("model", ""), info.get("mods")
+        g["help"] = {"url": ADV_HELP[g["vendor"]][0], "text": ADV_HELP[g["vendor"]][1]}
+        out.append(g)
+    ADV["results"] = out
+
+
+def adv_refresh(items, download):
+    ADV["errors"].pop("internal", None)
+    try:
+        if ADV["feeds"] is None:
+            ADV["feeds"] = adv_load()
+        feeds = ADV["feeds"]
+        if download:
+            stamp = feeds.setdefault("time", {})
+            jobs = [("pan", "Palo Alto advisories", adv_pan_download), ("kev", "CISA exploited list", adv_kev_download)]
+            jobs += [("nvd:" + v, "NVD %s list" % k, (lambda k=k: adv_nvd_download(k))) for v, k in ADV_NVD_KEY.items()]
+            for key, label, fn in jobs:
+                ADV["stage"] = "Downloading " + label
+                try:
+                    data = fn()
+                except (AdvError, ValueError, TypeError, KeyError) as e:
+                    ADV["errors"][label] = str(e)
+                    continue
+                if key.startswith("nvd:"):
+                    feeds.setdefault("nvd", {})[key[4:]] = data
+                else:
+                    feeds[key] = data
+                stamp[key] = time.strftime("%Y-%m-%d %H:%M")
+                ADV["errors"].pop(label, None)
+            adv_save(feeds)
+            ADV["last"] = time.strftime("%Y-%m-%d %H:%M")
+            if any(k in ADV["errors"] for _, k, _ in jobs):
+                ADV["next"] = min(ADV["next"], time.time() + 1800)   # a list did not download: try again in 30 min
+            if ADV["sig"] is not None:
+                ADV["sig"] = adv_sig(items)   # new list dates: the evaluation below already uses them
+        adv_evaluate(items)
+    except Exception as e:  # noqa: BLE001 - keep the console running, show the problem in the banner
+        ADV["errors"]["internal"] = "%s: %s" % (type(e).__name__, e)
+    finally:
+        ADV["stage"], ADV["busy"] = "", False
+
+
+def adv_sig(items):
+    return (ADV["min"], tuple(sorted(sid for sid, _ in items)),
+            json.dumps((ADV["feeds"] or {}).get("time") or {}, sort_keys=True))
+
+
+def adv_tick():
+    items = adv_items()
+    with ADV["lock"]:
+        if ADV["busy"] or not items:
+            return
+        if ADV["feeds"] is None:
+            ADV["feeds"] = adv_load()
+            t = (ADV["feeds"].get("time") or {}).values()
+            try:   # a cache from the last run that is still fresh: no download before it is due
+                newest = max(time.mktime(time.strptime(x, "%Y-%m-%d %H:%M")) for x in t) if t else 0
+            except ValueError:
+                newest = 0
+            ADV["next"] = newest + ADV["interval"]
+            ADV["last"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest)) if newest else ""
+        download = time.time() >= ADV["next"]
+        sig = adv_sig(items)
+        if not download and sig == ADV["sig"]:
+            return
+        ADV["busy"], ADV["sig"] = True, sig
+        if download:
+            ADV["next"] = time.time() + ADV["interval"]
+    threading.Thread(target=adv_refresh, args=(items, download), daemon=True).start()
+
+
+def do_adv_get(query):
+    adv_tick()
+    feeds = ADV["feeds"] or {}
+    return {"ok": True, "busy": ADV["busy"], "stage": ADV["stage"], "min": ADV["min"], "last": ADV["last"],
+            "next_in": max(0, int(ADV["next"] - time.time())), "errors": dict(ADV["errors"]),
+            "sources": feeds.get("time") or {}, "results": ADV["results"]}
+
+
+def do_adv_set(b):
+    if "min" in b:
+        if b.get("min") not in ADV_MIN:
+            return {"ok": False, "error": "min must be one of: " + ", ".join(ADV_MIN)}
+        ADV["min"] = b["min"]
+    if b.get("refresh"):
+        ADV["next"] = 0.0
+        with LOCK:
+            for s in SESSIONS.values():
+                s.pop("sw", None)   # read the versions again too (a unit may have been upgraded)
+    ADV["sig"] = None
+    adv_tick()
+    return {"ok": True, "min": ADV["min"]}
+
+
 # ---- Live update: edits to this file are picked up while the console runs (no restart, nothing to re-enter) ----
 # The new code is first run in a fresh namespace; only if it loads cleanly does the server switch to it. The objects
 # below are the console's live state and are handed over unchanged, so connected devices, SSH terminals, the unlocked
 # saved logins, AI settings, caches and the URL token survive an update. A file with errors is not applied: the page
 # shows the error and the old code keeps running. The watcher itself and main() only change on a real restart.
 LIVE_STATE = ("TOKEN", "SESSIONS", "AUDIT", "LOCK", "TERMS", "TERM_LOCK", "VAULT", "VAULT_LOCK", "F5_HOST_CACHE",
-              "PAN_VRS", "CAPTURE_BUSY", "CF_EDGE", "WHOIS_BOOT", "LLM_CFG", "HOT", "MON")
+              "PAN_VRS", "CAPTURE_BUSY", "CF_EDGE", "WHOIS_BOOT", "LLM_CFG", "HOT", "MON", "DASH", "ADV")
 HOT = {"gen": 0, "page": "", "error": "", "time": ""}
 
 

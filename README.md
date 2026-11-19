@@ -81,6 +81,9 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
   per application from the firewall's summary database (dynamic report top-app-summary), so a 24-hour or 7-day
   question covers the whole period instead of a log sample
 - F5 top virtual servers: ranked by current, total or max connections, traffic or packets (Checks > LTM)
+- F5 iRules (Checks > LTM): every iRule in every partition with the virtual servers it is assigned to and its
+  position in each one's iRule list; iRules assigned to no virtual server are flagged UNUSED (optional name filter).
+  Click an iRule name to see its code in a pop-up (read-only, with Copy)
 - F5 performance dashboard (Checks, or the button on the health card), time range 30 minutes to 24 hours: tiles
   (average CPU, busiest core, memory, TMM memory, control-plane memory, swap, fullest disk), CPU and memory charts
   over time, CPU per core, top 10 processes by CPU and by memory, subsystem CPU and memory (tmm, waf, l7_dos,
@@ -168,6 +171,42 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
   - Each change pops up a message (device, object, old and new state) with a sound and a Windows notification, and is
     written to the audit log. Interfaces and tunnels that are already down when monitoring starts (unused ports, idle
     tunnels) only alert after they have been up once
+  - Configuration changes (checked every minute, can be switched off in the 🔔 panel): Palo Alto config log entries
+    (admin, command, object path, new values) and uncommitted changes appearing; FortiGate configuration events from
+    the system event log (admin, action, path, object, attribute); F5 objects added, modified or deleted (virtual
+    servers, pools and members, nodes, iRules, policies, monitors, profiles, SNAT, data groups, self IPs, VLANs,
+    routes, users, certificates), compared between checks, since the F5 REST API does not record who made a change
+
+- **Operations dashboard**
+  - ▦ in the header opens one full-screen page for every connected Palo Alto, FortiGate and F5: resource utilization,
+    interface status and HA status, one card per device (firewalls first, then load balancers)
+  - Refreshed every 20 minutes by default (5 to 60 min, or "Refresh now"), read-only, all devices in parallel, while
+    the console page is open. Each card shows when it was read; a sparkline per resource shows the latest refreshes
+  - Resources: the same readers as "Resource utilization" (CPU, memory, dataplane, sessions, packet buffers, disk),
+    with warning / high thresholds. F5 uses read-only REST only (no util/bash)
+  - Interfaces: up / DOWN / disabled; a port that has never been seen up is shown as "not connected", not as down
+  - HA: mode, this unit's state, peer state and link, config sync (F5 sync status, PAN-OS running sync, FortiGate
+    checksums); a change since the previous refresh is highlighted
+
+- **Vendor advisories (headline under the header)**
+  - One chip per vendor and software version of the connected Palo Alto, FortiGate and F5 units: number of critical /
+    high issues that affect that exact version, how many are known to be exploited, and the advised release
+    (→ version). Click a chip for the list: severity and score, advisory link, fixed release on your train, exploited
+    flag, publication date
+  - Sources (public, downloaded whole every 12 hours while the console page is open, or "Refresh now"):
+    Palo Alto's advisory feed (security.paloaltonetworks.com) for PAN-OS; for F5 and FortiOS, the NVD lists of every
+    BIG-IP / FortiOS CVE and each CVE's record from the vendor on CVE.org (affected ranges and fixed versions; NVD's
+    ranges are used when the vendor record has none); the CISA Known Exploited Vulnerabilities catalog. They are kept
+    in `advisory_cache.json` (git-ignored) so a restart does not download them again. The first download takes 2–3
+    minutes (NVD allows few requests without an API key)
+  - Matching is done in the console: the device versions are never sent anywhere. F5 issues that only concern a
+    module that is not provisioned (e.g. APM) are left out; PAN-OS issues limited to Panorama, VM-Series or a hardware
+    series are applied only to matching units
+  - Advised release = the lowest release, on the current train first, that none of the listed advisories affects. It
+    is computed from the advisories, not a vendor recommendation: check the vendor's release guidance (linked in the
+    panel) and the advisory details (some need a feature in use, such as GlobalProtect or an exposed management
+    interface). A train no longer named in recent advisories is flagged "end of life?"
+  - Shows high and above by default (switch to critical only, or medium and above); exploited issues are always shown
 
 - **Packet capture analysis (AI assistant)**
   - 📎 in the assistant (or drag a file onto it): `.pcap` / `.pcapng` up to 64 MB, read by the console itself
@@ -220,6 +259,9 @@ Changes to the update watcher or to startup options (`main()`) still need a rest
   settings show where the data goes. Before sending, passwords, keys, tokens, hashes and PEM blocks are masked and large
   output is trimmed to the context budget. The model can only call read-only lookups; active tools are never offered
   to it, and nothing it writes is run. Model settings and the optional API key live in memory only.
+- Vendor advisories: the console downloads public lists only (security.paloaltonetworks.com, services.nvd.nist.gov,
+  cveawg.mitre.org, cisa.gov) directly over HTTPS, without a proxy. Requests ask for whole product lists and every
+  CVE of a product at the chosen severity, never for a version, so nothing about the devices leaves the PC.
 - Backups and captures are written to `./captures` (git-ignored). **Never commit them**: they contain
   device configuration and secrets.
 
