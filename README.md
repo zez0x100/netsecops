@@ -1,7 +1,7 @@
 # ITSec Ops (netsecops)
 
-A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto PAN-OS** and **FortiGate**
-devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard library only, no dependencies, built with Claude Code.
+A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto PAN-OS**, **FortiGate**,
+**FortiWeb** and **FortiADC** devices, **Cloudflare** accounts and **SolarWinds Orion** monitoring, from one place. Python 3.8+, standard library only, no dependencies, built with Claude Code.
 
 ## Features
 - Health checks and curated read-only status queries per vendor
@@ -117,6 +117,16 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
     be opened in Output. Needs a model with tool calling (e.g. qwen2.5 / qwen3, llama3.1+, mistral-nemo)
   - Typing a question and pressing Enter uses "Ask & run checks" whenever a device is connected (the output on
     screen is still sent along); "Ask about current output" answers from the screen only
+  - The AI can read the operations dashboard: "✦ Ask AI" on the dashboard asks what needs attention, and follow-up
+    questions keep using a fresh snapshot (health of every card, HA, resources, interfaces down, SolarWinds' view,
+    the F5s / firewalls seen only in SolarWinds, Orion KPIs, alerts and 24-hour trends) until ✕ or a new output.
+    In "Ask & run checks" the model also has a 'dashboard' tool for overall-health questions. If the dashboard
+    never refreshed, the first question runs a refresh; each read is in the audit log
+  - iRules: "✦ Explain with AI" in the iRule code pop-up sends the iRule (read again from the F5, numbered lines) and
+    asks for its purpose, events, traffic flow, problems (bugs, security, performance) and improvements; follow-up
+    questions stay on that iRule. In "Ask & run checks" the model can read any iRule itself (f5_irule_code). Values
+    that look like secrets in the code (set api_key "...", auth / key headers inserted, Basic / Bearer values) are
+    masked before sending
   - Every answer is checked: names and IPs it states that are not in the data the model was given are listed in a
     warning (small models can invent them)
 
@@ -207,6 +217,17 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
     panel) and the advisory details (some need a feature in use, such as GlobalProtect or an exposed management
     interface). A train no longer named in recent advisories is flagged "end of life?"
   - Shows high and above by default (switch to critical only, or medium and above); exploited issues are always shown
+  - **Advisories vs configuration** (check "Vendor advisories vs this device's configuration" under Security, or the
+    "Check … against its configuration (AI)" button in the panel): for each CVE of the unit's version, the advisory
+    sentences that say when it applies, the configuration facts such conditions depend on (read-only), and a console
+    hint from keyword rules (likely applies / likely not applicable). Facts read: Palo Alto GlobalProtect portals and
+    gateways, management profiles on data interfaces, management permitted IPs, DNS proxy, IKE gateways,
+    authentication portal; FortiGate SSL-VPN, admin access / FGFM / CAPWAP per interface, admin ports, FortiCloud SSO
+    admin login, IPsec tunnels, BGP neighbors, HA mode, admins without trusted hosts; F5 provisioned modules, self IP
+    port lockdown (with the default list), Configuration utility / SSH allow lists, APM access profiles, profile types
+    used by virtual servers (HTTP/2, SSL, SIP, WebSocket, …). The button then asks the AI assistant to judge every CVE
+    as APPLIES / DOES NOT APPLY / CAN'T TELL with the deciding fact; exposure to the internet cannot be seen by the
+    console, so those come back as CAN'T TELL with what to check
 
 - **Packet capture analysis (AI assistant)**
   - 📎 in the assistant (or drag a file onto it): `.pcap` / `.pcapng` up to 64 MB, read by the console itself
@@ -219,6 +240,75 @@ devices, and **Cloudflare** accounts, from one place. Python 3.8+, standard libr
   - "Analyse this capture" asks the model about that summary; follow-up questions and "Ask & run read-only checks"
     work on it too. The model gets the summary only, never packet payloads; URL query strings and HTTP headers other
     than Host are not included. The file is kept in memory only.
+
+- **SolarWinds Orion** (vendor "SolarWinds Orion" in Connect; SWIS API on port 17774, older Orion 17778, tried
+  automatically)
+  - Overview: nodes, interfaces and active alerts by status, and what needs attention
+  - Active alerts, most severe first, with object, node, age, message and acknowledgement
+  - Nodes needing attention (not up, CPU or memory >= 90%, packet loss), all nodes, one node in detail (health, every
+    interface, its active alerts)
+  - Interface issues (down, utilization at or above a threshold, errors / discards today) and the busiest interfaces
+  - Raw box: one SWQL `SELECT` query
+  - The AI assistant can run these checks too (tools `sw_...`), e.g. "is anything down?" or "is the DMZ uplink busy?"
+  - Operations dashboard (▦): a SolarWinds panel at the top with network availability, nodes / interfaces by
+    status, active and unacknowledged alerts, 24-hour trends of average CPU, memory, response time and packet loss
+    (Orion's own history; the console's refreshes if that history is not readable), what needs attention, the
+    busiest interfaces, interfaces down, highest CPU and slowest nodes. Each firewall / F5 card also shows what
+    SolarWinds reports for that unit (matched by management IP, else by name): status, response time, loss, CPU,
+    active alerts, interfaces down, busiest interface. F5s and firewalls that Orion monitors but that are not
+    connected in the console (recognised from Orion's vendor / machine type: F5, Palo Alto, Fortinet, Cisco ASA /
+    Firepower, Check Point, Juniper SRX, SonicWall, Sophos, WatchGuard, Forcepoint, Barracuda) get their own dashed
+    card beside the connected ones, built from Orion's data alone: status, CPU, memory, interfaces, alerts. A tick
+    box hides them.
+
+- **FortiWeb** (WAF) and **FortiADC** (ADC / load balancer), REST API, read-only
+  - Connect with a read-only administrator (user / password) or an API token; optional VDOM / ADOM. FortiWeb gets
+    its REST v2 token (base64 of user, password and VDOM, built in memory); FortiADC logs in for a session token and
+    logs in again when it expires
+  - REST paths differ between firmware releases: each check tries the known paths in order, the result names the one
+    that answered, and when none does it lists what it tried. The raw box takes any GET under `/api/v2.0/`
+    (FortiWeb) or `/api/` (FortiADC) to explore a firmware; paths that name an action (reboot, backup, restore,
+    upgrade, delete, clear, execute, ...) are refused. Only GET is sent (plus the FortiADC login POST)
+  - FortiWeb: system status, license, resources, HA, interfaces, certificates; server policies joined with their
+    virtual server and VIP addresses, protected hostnames, server pool, protection profile and mode (flags policies
+    without a protection profile, in monitor mode = log only, or disabled); virtual servers, VIPs, server pools and
+    members, protected hostname groups, web protection profiles; attack log search (client IP, hostname, URL, action,
+    any text such as a signature ID; counts by action and attack type)
+  - FortiADC: system status, resources, HA, interfaces, certificates; virtual servers joined with pool, members
+    (real server address:port and status), content routing, scripts, WAF profile; virtual / real server health,
+    pools, pool members, real servers, content routing and rewriting, Lua scripts with their code, health checks,
+    WAF profiles
+  - FortiWeb analytics (the "🛡 FortiWeb analytics" card at the top of Checks & tools when a FortiWeb is selected;
+    it shows the last result and opens the full view for 24 h, the last hour or 7 days): statistics of the attack log (FortiWeb 8.0: the GUI's
+    `log/logreport.logaccess.filter?log_type=3`, paged with `filter_offset` until the range is covered, at most 10,000 entries) over 1 h, 6 h, 24 h, 3 days or 7 days, for all
+    server policies or one: attacks, blocked share, logged-only, attacking clients, hosts, ML anomalies, API
+    violations, bot events and high-threat entries; trend of attacks and of the blocked share; breakdowns by protection
+    category, action, OWASP Top 10, attack type, signature, threat level, client, country, server policy, host, URL and
+    HTTP method; sections for ML anomaly detection (by URL, type, parameter, plus the ML policies), API protection
+    (violations by endpoint and type, plus the API learning / protection policies) and bots; server policies with mode
+    and profile. Insights at the top, each with the numbers behind it: attack spike in the last hour, one client
+    dominating, mostly logged-only, attacks on monitor-mode policies, policies without a protection profile, possible
+    false positives (one signature on one URL from many clients that tripped nothing else), ML anomalies concentrated
+    on one URL, API violations concentrated on one endpoint. "✦ Ask AI" asks for an assessment of the range. The same
+    statistics are the "Security statistics and insights" check, so the AI agent can use them
+  - ML based API protection (in the API protection section of the 🛡 view; read through the GUI's own read API,
+    `/api/v2.0/machine_learning/api_learning_policy.*`, seen on FortiWeb 8.0): pick a learned domain / policy
+    (from the learning policies, `.get_policy_rules`, also shown as "Policies"; learned URLs of a domain: `.geturls?rule_id=`, shown as an endpoint inventory: model status, method, authentication, data categories, zombie and excessive-data flags, a path tree like the GUI's Tree View, and AppSec findings mapped to the OWASP API Security Top 10 2023: sensitive data without authentication (API2; sign-in / registration endpoints excluded), PUT / PATCH / DELETE without authentication (API5), excessive data exposure (API3), zombie APIs (API9), sensitive endpoints still collecting samples), then its overview (`.overview`: endpoint and model-state counts with insights such as most endpoints
+    still collecting samples or models discarded, top endpoints, response-code trends, most attacked endpoints), its learned schema (`.schemafile`, OpenAPI as YAML on FortiWeb 8.0, read with a small built-in YAML reader) as an
+    API View like the GUI's: the YAML with colours and Export on the left, the endpoints Swagger-style on the right (method
+    badges; parameters, request-body fields with types / required / oneOf, responses; the inventory flags joined by
+    url_id: authentication, model status, zombie, excessive data, data categories), filter and expand / collapse or its event log (`.eventlog`). "✦ Ask AI" includes the picked domain's schema and events and asks
+    for a review (sensitive endpoints, unexpected DELETE / PUT, endpoints without learned parameters). Also the
+    "ML based API protection" check, for the AI agent
+  - "From the FortiWeb GUI API": API discovery results and ML model status are not in the documented API; copy the
+    request path from the GUI with the browser developer tools (F12, Network) and load it there (read-only GET). The
+    rows are shown as a table with automatic charts (counts by each low-cardinality column, highest values)
+  - Both: find an IP, hostname or name anywhere in the load-balancing / WAF configuration (objects and their
+    sub-entries, with the matching fields)
+  - Values whose field names look like secrets (passwords, keys, PSKs ...) are shown as "(hidden)"
+  - The AI assistant can run these checks (tools `fwb_...`, `fad_...`), and "Explain the current output" explains a
+    FortiADC Lua script; secrets written in scripts are masked before sending
+  - Not yet: dashboard cards, monitor pop-ups, vendor advisories and the flow trace for FortiWeb / FortiADC
 
 - **Look**
   - Light theme by default, dark theme one click away (◐ in the header; the choice is remembered in the browser)
@@ -257,7 +347,9 @@ Changes to the update watcher or to startup options (`main()`) still need a rest
   every request. The model server is always reached directly (never through the system or a cloud web proxy), and a
   redirect is refused instead of followed, so neither the prompt nor the API key can be sent elsewhere. Model
   settings show where the data goes. Before sending, passwords, keys, tokens, hashes and PEM blocks are masked and large
-  output is trimmed to the context budget. The model can only call read-only lookups; active tools are never offered
+  output is trimmed to the context budget (default 60,000 characters, about 15-20k tokens: the model's context window
+  should be 32k tokens or more; each check result the agent runs gets a quarter of it, all results together at most
+  twice it). The model can only call read-only lookups; active tools are never offered
   to it, and nothing it writes is run. Model settings and the optional API key live in memory only.
 - Vendor advisories: the console downloads public lists only (security.paloaltonetworks.com, services.nvd.nist.gov,
   cveawg.mitre.org, cisa.gov) directly over HTTPS, without a proxy. Requests ask for whole product lists and every
@@ -319,6 +411,21 @@ Permission names below are as the Cloudflare dashboard shows them and may change
 
 Which analytics datasets exist, and how far back and how wide one query can be, depends on the zone plan.
 For an account-owned token, enter the Account ID when connecting.
+
+### SolarWinds Orion
+A read-only Orion account is enough (an Orion individual account, or a Windows / AD account entered as
+`DOMAIN\user`). The console only calls the SWIS `Query` endpoint, which cannot change anything; it never uses
+Invoke, Create, Update or Delete. The PC must reach the Orion server on TCP 17774 (older releases: 17778), not only on
+443. Orion normally uses its own self-signed certificate on that port, so "Skip TLS verification" is usually needed.
+Account limitations set in Orion (which nodes the account may see) apply to the console too.
+
+### FortiWeb / FortiADC
+A read-only administrator is enough: an admin profile with read access to system, network, server policy / load
+balancing, security (WAF) and log; no write access. Enable REST API access for that administrator if the firmware
+asks for it, and add this PC to its trusted hosts. An API token can be pasted instead of user / password (FortiWeb:
+sent as the Authorization header; FortiADC: as a Bearer token). The console only sends GET requests (FortiADC also
+the login POST) and refuses GET paths that name an action. REST paths and fields change between firmware releases;
+when a check finds no endpoint, use the raw box to find the right path.
 
 ## Disclaimer
 Use only on devices you are authorised to administer. Provided as-is, without warranty; review the code

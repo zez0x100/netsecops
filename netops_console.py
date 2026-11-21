@@ -89,6 +89,8 @@ def P(name, label, placeholder="", default="", required=True):
 # ----------------------------------------------------------------------------
 CATALOG = {
     "f5": [
+        {"id": "advcfg", "group": "Security", "label": "Vendor advisories vs this device's configuration (CVEs for its "
+         "version, when each applies, the matching configuration facts; then ask the AI)", "handler": "adv_config"},
         {"id": "version", "group": "Device", "label": "Software version", "path": "/mgmt/tm/sys/version"},
         {"id": "hardware", "group": "Device", "label": "Hardware / platform", "path": "/mgmt/tm/sys/hardware"},
         {"id": "license", "group": "Device", "label": "License", "path": "/mgmt/tm/sys/license"},
@@ -125,6 +127,8 @@ CATALOG = {
          "params": [P("ip", "Client IP", "203.0.113.5"), P("vip", "Virtual server IP (optional)", "10.1.1.10", required=False)]},
     ],
     "paloalto": [
+        {"id": "advcfg", "group": "Security", "label": "Vendor advisories vs this device's configuration (CVEs for its "
+         "version, when each applies, the matching configuration facts; then ask the AI)", "handler": "adv_config"},
         {"id": "sysinfo", "group": "Device", "label": "System info", "cmd": "<show><system><info/></system></show>"},
         {"id": "resutil", "group": "Device", "label": "Resource utilization (management / dataplane CPU, memory, sessions, packet buffers, disk)",
          "handler": "pan_resources",
@@ -170,6 +174,8 @@ CATALOG = {
          "params": [P("url", "URL or domain", "www.example.com/path")]},
     ],
     "fortigate": [
+        {"id": "advcfg", "group": "Security", "label": "Vendor advisories vs this device's configuration (CVEs for its "
+         "version, when each applies, the matching configuration facts; then ask the AI)", "handler": "adv_config"},
         {"id": "status", "group": "Device", "label": "System status", "path": "/api/v2/monitor/system/status"},
         {"id": "license", "group": "Device", "label": "License status", "path": "/api/v2/monitor/license/status"},
         {"id": "resutil", "group": "Resources", "label": "Resource utilization (CPU, memory / conserve mode, disk, sessions, setup rate)",
@@ -211,6 +217,131 @@ CATALOG = {
         {"id": "certs", "group": "SSL/TLS", "label": "Edge certificate packs",
          "path": "/client/v4/zones/{zone}/ssl/certificate_packs?status=all", "params": [P("zone", "Zone name or ID", "example.com")]},
         {"id": "ips", "group": "Reference", "label": "Cloudflare edge IP ranges", "path": "/client/v4/ips"},
+    ],
+    "solarwinds": [
+        {"id": "overview", "group": "Overview", "label": "Overview: nodes, interfaces and active alerts by status, "
+         "what needs attention", "handler": "sw_overview"},
+        {"id": "alerts", "group": "Alerts", "label": "Active alerts (most severe first; optional filter: node, object, "
+         "alert name or message)", "handler": "sw_alerts",
+         "params": [P("filter", "Node, object or alert name (optional)", "core-sw", required=False)]},
+        {"id": "nodeissues", "group": "Nodes", "label": "Nodes needing attention (not up, CPU or memory >= 90%, packet loss)",
+         "handler": "sw_node_issues"},
+        {"id": "nodes", "group": "Nodes", "label": "All nodes: status, CPU, memory, response time, packet loss (optional filter)",
+         "handler": "sw_nodes", "params": [P("filter", "Name, IP, vendor or model (optional)", "fw-", required=False)]},
+        {"id": "node", "group": "Nodes", "label": "One node in detail: health, every interface, its active alerts",
+         "handler": "sw_node", "params": [P("node", "Node name or IP", "core-sw-01")]},
+        {"id": "ifaces", "group": "Interfaces", "label": "Interface issues: down, utilization at or above the threshold, "
+         "errors / discards today", "handler": "sw_iface_issues",
+         "params": [P("util", "Utilization threshold %", "80", "80", required=False),
+                    P("filter", "Node or interface name (optional)", "core-sw", required=False)]},
+        {"id": "iftop", "group": "Interfaces", "label": "Busiest interfaces right now (% utilization, in or out)",
+         "handler": "sw_iface_top", "params": [P("count", "How many", "20", "20", required=False),
+                                               P("filter", "Node or interface name (optional)", "dmz", required=False)]},
+    ],
+    "fortiweb": [
+        {"id": "status", "group": "Device", "label": "System status (version, serial, HA mode, signature versions)",
+         "handler": "fx_generic", "fx": ["/api/v2.0/system/status.systemstatus", "/api/v2.0/system/status"]},
+        {"id": "license", "group": "Device", "label": "License and FortiGuard services", "handler": "fx_generic",
+         "fx": ["/api/v2.0/system/status.licinfo", "/api/v2.0/system/license", "/api/v2.0/system/status.license"]},
+        {"id": "resources", "group": "Resources", "label": "Resources (CPU, memory, disk, connections, throughput)",
+         "handler": "fx_generic", "fx": ["/api/v2.0/system/status.monitor", "/api/v2.0/system/dashboard.sysres",
+                                         "/api/v2.0/system/status.sysres"]},
+        {"id": "ha", "group": "HA", "label": "HA status / configuration", "handler": "fx_generic",
+         "fx": ["/api/v2.0/system/status.hastatus", "/api/v2.0/system/ha.status", "/api/v2.0/cmdb/system/ha"]},
+        {"id": "ifaces", "group": "Network", "label": "Interfaces", "handler": "fx_generic", "key": "interfaces",
+         "fx": ["/api/v2.0/system/network.interface", "/api/v2.0/cmdb/system/interface"],
+         "params": [P("filter", "Name or IP (optional)", "port1", required=False)]},
+        {"id": "certs", "group": "Device", "label": "Local certificates (subject, issuer, expiry)", "handler": "fx_generic",
+         "key": "certificates", "fx": ["/api/v2.0/system/certificate.local", "/api/v2.0/cmdb/system/certificate.local"],
+         "params": [P("filter", "Name or subject (optional)", "shop", required=False)]},
+        {"id": "policies", "group": "Server policies", "label": "Server policies: virtual server + IPs, protected "
+         "hostnames, server pool, protection profile, block or monitor mode (what protects each site)",
+         "handler": "fwb_policies", "params": [P("filter", "Policy, hostname group, pool, IP ... (optional)", "shop",
+                                                 required=False)]},
+        {"id": "vservers", "group": "Server policies", "label": "Virtual servers", "handler": "fx_generic",
+         "key": "virtual_servers", "fx": ["/api/v2.0/cmdb/server-policy/vserver"],
+         "params": [P("filter", "Name (optional)", "vs_shop", required=False)]},
+        {"id": "vips", "group": "Server policies", "label": "Virtual IPs", "handler": "fx_generic", "key": "virtual_ips",
+         "fx": ["/api/v2.0/cmdb/system/vip"], "params": [P("filter", "Name or IP (optional)", "203.0.113.10", required=False)]},
+        {"id": "pools", "group": "Server policies", "label": "Server pools", "handler": "fx_generic", "key": "server_pools",
+         "fx": ["/api/v2.0/cmdb/server-policy/server-pool"], "params": [P("filter", "Name (optional)", "pool_shop",
+                                                                          required=False)]},
+        {"id": "poolmem", "group": "Server policies", "label": "Members of one server pool (servers, ports, status, "
+         "health check)", "handler": "fx_generic", "key": "members",
+         "fx": ["/api/v2.0/cmdb/server-policy/server-pool/pserver-list?mkey={pool}"], "params": [P("pool", "Server pool", "pool_shop")]},
+        {"id": "hosts", "group": "Server policies", "label": "Protected hostname groups", "handler": "fx_generic",
+         "key": "hostname_groups", "fx": ["/api/v2.0/cmdb/server-policy/allow-hosts"],
+         "params": [P("filter", "Group name (optional)", "shop", required=False)]},
+        {"id": "profiles", "group": "Security", "label": "Web protection profiles (signatures, constraints, bot, "
+         "IP reputation ... per profile)", "handler": "fx_generic", "key": "profiles",
+         "fx": ["/api/v2.0/cmdb/waf/web-protection-profile.inline-protection"],
+         "params": [P("filter", "Profile name (optional)", "shop", required=False)]},
+        {"id": "attacks", "group": "Security", "label": "Attack log search (newest first; client IP, hostname, URL, "
+         "action or any text such as a signature ID)", "handler": "fwb_attacks",
+         "params": [P("ip", "Client IP (optional)", "203.0.113.5", required=False),
+                    P("host", "Hostname (optional)", "shop.example.com", required=False),
+                    P("url", "URL / path (optional)", "/login", required=False),
+                    P("action", "Action (optional), e.g. Alert_Deny", "Alert_Deny", required=False),
+                    P("text", "Any text, e.g. signature ID (optional)", "050140001", required=False),
+                    P("count", "Max rows", "100", "100", required=False)]},
+        {"id": "stats", "group": "Security", "label": "Security statistics and insights (attack log over a time range: "
+         "trend, categories, OWASP Top 10, signatures, clients, countries, ML anomaly, API protection, bots; spikes, "
+         "monitor-mode hits, possible false positives). Charts: the \"🛡 FortiWeb analytics\" card above",
+         "handler": "fwb_stats", "params": [P("range", "Time range: 1h, 6h, 24h, 3d or 7d", "24h", "24h", required=False),
+                                            P("policy", "Server policy (optional)", "pol_shop", required=False)]},
+        {"id": "mlapi", "group": "Security", "label": "ML based API protection: learned domains / URLs (view urls), the "
+         "learned schema of a domain (view schema: endpoints, methods, parameters) or its event log (view eventlog)",
+         "handler": "fwb_mlapi", "params": [P("view", "urls, rules, overview, schema or eventlog", "urls", "urls", required=False),
+                                            P("domain", "Domain (for schema / eventlog)", "api.example.com", required=False),
+                                            P("policy", "Server policy (for schema / eventlog)", "POL-API", required=False),
+                                            P("rule_id", "Rule id of the domain (for urls; from view rules)", "1",
+                                              required=False)]},
+        {"id": "find", "group": "Lookup", "label": "Find an IP, hostname or name in the configuration (policies, "
+         "virtual servers / IPs, pools and members, protected hostnames, rewrites, IP lists)", "handler": "fx_find",
+         "params": [P("term", "IP, hostname or name", "10.1.1.10")]},
+    ],
+    "fortiadc": [
+        {"id": "status", "group": "Device", "label": "System status (version, serial, HA, uptime)", "handler": "fx_generic",
+         "fx": ["/api/platform/info", "/api/system_status", "/api/system_global"]},
+        {"id": "resources", "group": "Resources", "label": "Resources (CPU, memory, disk, connections)", "handler": "fx_generic",
+         "fx": ["/api/platform/resources", "/api/system_resource", "/api/dashboard_status", "/api/platform/status"]},
+        {"id": "ha", "group": "HA", "label": "HA status / configuration", "handler": "fx_generic",
+         "fx": ["/api/system_ha_status", "/api/platform/ha_status", "/api/system_ha"]},
+        {"id": "ifaces", "group": "Network", "label": "Interfaces", "handler": "fx_generic", "key": "interfaces",
+         "fx": ["/api/system_interface"], "params": [P("filter", "Name or IP (optional)", "port1", required=False)]},
+        {"id": "certs", "group": "Device", "label": "Local certificates", "handler": "fx_generic", "key": "certificates",
+         "fx": ["/api/system_certificate_local", "/api/system_certificate_local_cert"],
+         "params": [P("filter", "Name (optional)", "shop", required=False)]},
+        {"id": "vs", "group": "Load balancing", "label": "Virtual servers: address:port, profile, pool and members "
+         "(real server address:port), content routing, scripts, WAF profile", "handler": "fad_vs",
+         "params": [P("filter", "Name, IP, pool ... (optional)", "vs_shop", required=False)]},
+        {"id": "vsstatus", "group": "Load balancing", "label": "Virtual server / real server health status",
+         "handler": "fx_generic", "key": "status",
+         "fx": ["/api/load_balance_virtual_server_status", "/api/status_virtual_server", "/api/monitor_virtual_server"],
+         "params": [P("filter", "Name (optional)", "vs_shop", required=False)]},
+        {"id": "pools", "group": "Load balancing", "label": "Pools", "handler": "fx_generic", "key": "pools",
+         "fx": ["/api/load_balance_pool"], "params": [P("filter", "Name (optional)", "pool_shop", required=False)]},
+        {"id": "poolmem", "group": "Load balancing", "label": "Members of one pool", "handler": "fx_generic", "key": "members",
+         "fx": ["/api/load_balance_pool_child_pool_member?pkey={pool}"], "params": [P("pool", "Pool", "pool_shop")]},
+        {"id": "reals", "group": "Load balancing", "label": "Real servers", "handler": "fx_generic", "key": "real_servers",
+         "fx": ["/api/load_balance_real_server"], "params": [P("filter", "Name or IP (optional)", "10.1.1.10", required=False)]},
+        {"id": "routing", "group": "Load balancing", "label": "Content routing (L7 match conditions -> pool)",
+         "handler": "fx_generic", "key": "content_routing", "fx": ["/api/load_balance_content_routing"],
+         "params": [P("filter", "Name or host (optional)", "shop", required=False)]},
+        {"id": "rewriting", "group": "Load balancing", "label": "Content rewriting", "handler": "fx_generic",
+         "key": "content_rewriting", "fx": ["/api/load_balance_content_rewriting"],
+         "params": [P("filter", "Name (optional)", "redirect", required=False)]},
+        {"id": "scripts", "group": "Load balancing", "label": "Scripts (Lua, with their code: use 'Explain the current "
+         "output' to have the AI explain them)", "handler": "fx_generic", "key": "scripts",
+         "fx": ["/api/load_balance_script", "/api/load_balance_web_sub_scripting", "/api/load_balance_scripting"],
+         "params": [P("filter", "Script name (optional)", "redirect", required=False)]},
+        {"id": "hc", "group": "Load balancing", "label": "Health checks", "handler": "fx_generic", "key": "health_checks",
+         "fx": ["/api/system_health_check"], "params": [P("filter", "Name (optional)", "http", required=False)]},
+        {"id": "wafprof", "group": "Security", "label": "WAF profiles", "handler": "fx_generic", "key": "waf_profiles",
+         "fx": ["/api/security_waf_profile"], "params": [P("filter", "Name (optional)", "shop", required=False)]},
+        {"id": "find", "group": "Lookup", "label": "Find an IP, hostname or name in the configuration (virtual servers, "
+         "real servers, pools and members, content routing / rewriting, health checks)", "handler": "fx_find",
+         "params": [P("term", "IP, hostname or name", "10.1.1.10")]},
     ],
 }
 # contains no secrets; entries marked "hidden" are not listed in the page
@@ -748,7 +879,7 @@ if not globals().get("_HOT_RELOADING"):
 # Without the passphrase, or under another Windows account / on another PC, the file cannot be decrypted.
 VAULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_logins.dat")
 VAULT = {"key": None, "logins": None}   # in memory only while unlocked
-VAULT_FIELDS = ("vendor", "name", "host", "port", "insecure", "account", "username", "password", "apikey")
+VAULT_FIELDS = ("vendor", "name", "host", "port", "insecure", "account", "vdom", "username", "password", "apikey")
 VAULT_LOCK = threading.Lock()
 
 
@@ -903,7 +1034,7 @@ def do_connect(b):
     if not HOST_RE.match(host):
         return {"ok": False, "error": "invalid host"}
     try:
-        port = 443 if vendor == "cloudflare" else int(b.get("port") or 443)
+        port = 443 if vendor == "cloudflare" else int(b.get("port") or (SW_PORTS[0] if vendor == "solarwinds" else 443))
     except (TypeError, ValueError):
         return {"ok": False, "error": "invalid port"}
     if not 1 <= port <= 65535:
@@ -949,6 +1080,42 @@ def do_connect(b):
             if not ok:
                 return {"ok": False, "error": "Cloudflare rejected the token (%s)" % cf_errtext(status, data)}
             note = cf_load(sess)
+        elif vendor in ("fortiweb", "fortiadc"):
+            vdom = str(b.get("vdom") or "").strip()
+            if vdom and not re.match(r"^[\w.-]{1,31}$", vdom):
+                return {"ok": False, "error": "invalid VDOM / ADOM name"}
+            if key:   # an API token, sent as it is (FortiADC: as a Bearer token)
+                sess["hdr"] = {"Authorization": key if vendor == "fortiweb" else "Bearer " + key, "Accept": "application/json"}
+            elif not user or not pw:
+                return {"ok": False, "error": "user name and password (a read-only administrator), or an API token, required"}
+            elif vendor == "fortiweb":   # FortiWeb REST v2: Authorization = base64 of {"username", "password", "vdom"}
+                tok = base64.b64encode(json.dumps({"username": user, "password": pw, "vdom": vdom or "root"}).encode()).decode()
+                sess["hdr"] = {"Authorization": tok, "Accept": "application/json"}
+            else:
+                sess["_cred"] = (user, pw)   # memory only: to log in again when the FortiADC token expires
+            if vdom:
+                sess["vdom"] = vdom
+            try:
+                if vendor == "fortiadc" and not key:
+                    fad_login(sess)
+                st_ = fx_status(sess)
+            except FxError as e:
+                return {"ok": False, "error": str(e)}
+            sess["fx_info"] = {k: fx_val(st_, *ks) for k, ks in (("version", ("version", "firmware_version", "fw_version",
+                                                                               "build")),
+                                                                  ("model", ("model", "platform", "hardware")),
+                                                                  ("serial", ("serial", "serial_number", "sn")))}
+            status, ok = 200, True
+        elif vendor == "solarwinds":
+            if not user or not pw:
+                return {"ok": False, "error": "SolarWinds user name and password required (a read-only Orion account is enough)"}
+            cred = base64.b64encode(("%s:%s" % (user, pw)).encode()).decode()
+            sess["hdr"] = {"Authorization": "Basic " + cred}
+            try:
+                sw_login(sess)
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+            status, ok = 200, True
         else:
             if not key:
                 if not user or not pw:
@@ -972,6 +1139,8 @@ def do_connect(b):
         SESSIONS[sid] = sess
     audit(sess, "connected")
     out = {"ok": True, "id": sid, "name": sess["name"], "vendor": vendor, "host": host, "user": sess.get("user", "")}
+    if sess.get("fx_info"):
+        out["info"] = sess["fx_info"]
     if b.get("remember"):
         try:
             vault_remember(b)
@@ -1026,6 +1195,7 @@ def do_run(b):
                     raise ValueError("missing: " + p_["label"])
                 vals[p_["name"]] = v
             vals["_ack"] = bool(b.get("ack"))   # F5 performance: util/bash only with the active-tools tick-box
+            vals["_check"] = spec["id"]
             audit(sess, spec["label"])
             return PAN_HANDLERS[spec["handler"]](sess, vals)
         if "cmd" in spec:
@@ -1200,6 +1370,20 @@ def do_raw(b):
             return {"ok": False, "error": "only these <test> commands are allowed: " +
                     ", ".join(sorted(PAN_SAFE_TESTS))}
         run = {"cmd": q}
+    elif v in ("fortiweb", "fortiadc"):
+        audit(sess, "raw: " + q[:120])
+        try:
+            return fx_raw(sess, q)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        except (urllib.error.URLError, OSError) as e:
+            return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+    elif v == "solarwinds":
+        audit(sess, "raw SWQL: " + q[:120])
+        try:
+            return sw_raw(sess, q)
+        except (urllib.error.URLError, OSError) as e:
+            return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
     elif v == "cloudflare" and q.startswith(("{", "query")):
         if re.search(r"\b(mutation|subscription)\b", q):
             return {"ok": False, "error": "only GraphQL queries are allowed"}
@@ -1610,6 +1794,22 @@ def do_f5_irule(b):
         return {"ok": False, "error": "the F5 did not return the iRule (HTTP %s%s)" % (st, ": " + str(msg) if msg else "")}
     return {"ok": True, "name": d.get("fullPath") or name, "code": str(d.get("apiAnonymous") or ""),
             "device": sess.get("name") or sess.get("host")}
+
+
+def llm_irule(sid, name):
+    """One iRule's code for the AI, with line numbers (read fresh from the F5; do_f5_irule writes the audit entry)."""
+    name = str(name or "").strip()
+    if name and not name.startswith("/"):   # the model often gives 'my_rule' or 'Common/my_rule'
+        name = "/" + name if "/" in name else "/Common/" + name
+    r = do_f5_irule({"id": sid, "name": name})
+    if not r.get("ok"):
+        raise ValueError(r.get("error") or "could not read the iRule")
+    lines = r["code"].replace("\r", "").rstrip("\n").split("\n")
+    code = "\n".join("%4d| %s" % (i + 1, l) for i, l in enumerate(lines))
+    return {"ok": True, "status": 200, "request": "iRule %s" % r["name"],
+            "summary": ["iRule %s on %s: %d line(s). Lines are numbered 'N| ': quote them as 'line N'. Values that looked "
+                        "like secrets are shown as [redacted]." % (r["name"], r["device"], len(lines))],
+            "data": {"irule": r["name"], "device": r["device"], "lines": len(lines), "code": code}}
 
 
 def do_f5_host(b):
@@ -3934,11 +4134,1705 @@ def f5_conns(sess, v):
                     " (%s)" % ha if ha else "")])
 
 
+# ---- SolarWinds Orion (SWIS REST API): read-only SWQL queries -------------------------------------------------------
+# Only the Query endpoint is ever called (it cannot change anything); Invoke / Create / Update / Delete are never used.
+# User input never goes into the SWQL text: filters are applied here, and the one lookup by name/IP uses @parameters.
+SW_QUERY = "/SolarWinds/InformationService/v3/Json/Query"
+SW_PORTS = (17774, 17778)   # 17774 = current SWIS REST port, 17778 = older Orion releases
+SW_STATUS = {0: "Unknown", 1: "Up", 2: "Down", 3: "Warning", 4: "Shutdown", 5: "Testing", 6: "Dormant", 7: "Not Present",
+             8: "Lower Layer Down", 9: "Unmanaged", 10: "Unplugged", 11: "External", 12: "Unreachable", 14: "Critical",
+             15: "Partly Available", 16: "Misconfigured", 17: "Could Be Shutdown", 19: "Unconfirmed", 22: "Active",
+             24: "Inactive", 25: "Expired", 26: "Monitoring Disabled", 27: "Disabled", 28: "Not Licensed", 29: "Other",
+             30: "Not Running"}
+SW_BAD = {2, 8, 10, 12, 14, 16}
+SW_WARN = {0, 3, 15, 17, 19}
+SW_ADMIN = {4, 9, 11, 26, 27, 28}
+SW_SEV = {2: "Critical", 3: "Serious", 1: "Warning", 4: "Notice", 0: "Informational"}
+SW_SEV_RANK = {2: 0, 3: 1, 1: 2, 4: 3, 0: 4}
+SW_NODE_Q = ("SELECT NodeID, Caption, IPAddress, Status, StatusDescription, CPULoad, PercentMemoryUsed, ResponseTime, "
+             "PercentLoss, Vendor, MachineType, IOSVersion, LastBoot FROM Orion.Nodes",
+             "SELECT NodeID, Caption, IPAddress, Status, StatusDescription, CPULoad, PercentMemoryUsed, ResponseTime, "
+             "PercentLoss FROM Orion.Nodes",
+             "SELECT NodeID, Caption, IPAddress, Status FROM Orion.Nodes")
+SW_IF_Q = ("SELECT InterfaceID, NodeID, Caption, Status, AdminStatus, InPercentUtil, OutPercentUtil, InErrorsToday, "
+           "OutErrorsToday, InDiscardsToday, OutDiscardsToday, Speed, LastChange FROM Orion.NPM.Interfaces",
+           "SELECT InterfaceID, NodeID, Caption, Status, InPercentUtil, OutPercentUtil FROM Orion.NPM.Interfaces")
+SW_ALERT_JOIN = (" FROM Orion.AlertActive aa INNER JOIN Orion.AlertObjects ao ON aa.AlertObjectID = ao.AlertObjectID "
+                 "INNER JOIN Orion.AlertConfigurations ac ON ao.AlertID = ac.AlertID ORDER BY aa.TriggeredDateTime DESC")
+SW_ALERT_Q = ("SELECT TOP 2000 aa.AlertActiveID, aa.TriggeredDateTime, aa.Acknowledged, aa.AcknowledgedBy, aa.TriggeredMessage, "
+              "ao.EntityCaption, ao.EntityType, ao.RelatedNodeId, ao.RelatedNodeCaption, ac.Name, ac.Severity" + SW_ALERT_JOIN,
+              "SELECT TOP 2000 aa.AlertActiveID, aa.TriggeredDateTime, aa.Acknowledged, ao.EntityCaption, ao.EntityType, "
+              "ac.Name, ac.Severity" + SW_ALERT_JOIN)
+
+
+class SwError(ValueError):
+    def __init__(self, status, msg):
+        ValueError.__init__(self, msg)
+        self.status = status
+
+
+def sw_query(sess, swql, params=None, timeout=60):
+    """One SWQL query -> list of row dicts. Raises SwError with SolarWinds' own message on an error answer."""
+    hdr = dict(sess["hdr"], **{"Content-Type": "application/json", "Accept": "application/json"})
+    st, raw = http(sess, "POST", SW_QUERY, hdr, json.dumps({"query": swql, "parameters": params or {}}).encode(), timeout)
+    try:
+        d = json.loads(raw.decode("utf-8-sig"))
+    except ValueError:
+        d = None
+    if 200 <= st < 300 and isinstance(d, dict) and isinstance(d.get("results"), list):
+        return [r for r in d["results"] if isinstance(r, dict)]
+    if st in (401, 403):
+        raise SwError(st, "SolarWinds refused the login (HTTP %d): check the user name and password (a Windows / AD "
+                          "account is entered as DOMAIN\\user) and that the account may log in to Orion" % st)
+    msg = (d.get("Message") or d.get("message") or "") if isinstance(d, dict) else raw[:300].decode("utf-8", "replace")
+    raise SwError(st, "SolarWinds answered HTTP %s%s" % (st, ": " + re.sub(r"\s+", " ", str(msg))[:400] if msg else ""))
+
+
+def sw_first(sess, queries, params=None):
+    """Run the first query this Orion version accepts (older releases lack some fields) -> (rows, index used)."""
+    last = None
+    for i, q in enumerate(queries):
+        try:
+            return sw_query(sess, q, params), i
+        except SwError as e:
+            if e.status in (401, 403):
+                raise
+            last = e
+    raise last
+
+
+def sw_login(sess):
+    """Test the login with a one-row query; tries the other SWIS port when the given one does not answer."""
+    ports = [sess["port"]] + ([p for p in SW_PORTS if p != sess["port"]] if sess["port"] in SW_PORTS else [])
+    err = None
+    for p in ports:
+        sess["port"] = p
+        try:
+            sw_query(sess, "SELECT TOP 1 NodeID FROM Orion.Nodes", timeout=20)
+            return
+        except (urllib.error.URLError, OSError) as e:
+            if isinstance(getattr(e, "reason", e), ssl.SSLCertVerificationError):
+                raise ValueError("the SolarWinds certificate is not trusted by this PC (Orion usually uses its own "
+                                 "self-signed certificate): tick 'Skip TLS verification' if this is your Orion server")
+            err = err or e
+    sess["port"] = ports[0]
+    raise ValueError("SolarWinds did not answer on port %s: %s. The SWIS API listens on 17774 (older Orion: 17778); "
+                     "the PC must be allowed to reach that port, not only the web console on 443"
+                     % (" or ".join(map(str, ports)), getattr(err, "reason", err)))
+
+
+def sw_int(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def sw_num(x, nd=1):
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return ""
+    return "" if f < 0 else round(f, nd) if nd else int(round(f))   # SolarWinds uses -1 / -2 for "not polled"
+
+
+def sw_state(code, desc=""):
+    """(text, class) of an Orion status: class ok / bad / warn / admin."""
+    c = sw_int(code)
+    text = str(desc or SW_STATUS.get(c, "status %s" % code))
+    return text, ("ok" if c in (1, 22) else "bad" if c in SW_BAD else "admin" if c in SW_ADMIN else "warn")
+
+
+def sw_dt(s):
+    m = re.match(r"(\d{4}-\d\d-\d\d)T(\d\d:\d\d)", str(s or ""))
+    return "%s %s" % m.groups() if m else str(s or "")
+
+
+def sw_age(s):
+    """'3 h ago' from a UTC timestamp."""
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)", str(s or ""))
+    if not m:
+        return ""
+    sec = time.time() - calendar.timegm(tuple(int(x) for x in m.groups()) + (0, 0, 0))
+    return ("%d min ago" % max(0, sec // 60) if sec < 3600 else "%.1f h ago" % (sec / 3600) if sec < 172800
+            else "%d days ago" % (sec // 86400))
+
+
+def sw_speed(bps):
+    try:
+        b = float(bps)
+    except (TypeError, ValueError):
+        return ""
+    for div, unit in ((1e9, "Gbps"), (1e6, "Mbps"), (1e3, "kbps")):
+        if b >= div:
+            return "%g %s" % (round(b / div, 1), unit)
+    return "%g bps" % b if b > 0 else ""
+
+
+def sw_nodes_read(sess):
+    rows, _ = sw_first(sess, SW_NODE_Q)
+    out = []
+    for n in rows:
+        st, cls = sw_state(n.get("Status"))
+        # "Node status is Warning, 1 interface down." -> "Warning, 1 interface down"
+        detail = re.sub(r"(?i)^node( status)? is\s*", "", str(n.get("StatusDescription") or "")).strip().rstrip(".") or st
+        cpu, mem, loss = sw_num(n.get("CPULoad"), 0), sw_num(n.get("PercentMemoryUsed"), 0), sw_num(n.get("PercentLoss"), 0)
+        why = [] if cls in ("ok", "admin") else [detail[:1].lower() + detail[1:]]
+        why += (["CPU %s%%" % cpu] if cpu != "" and cpu >= 90 else []) + (["memory %s%%" % mem] if mem != "" and mem >= 90 else []) + \
+               (["packet loss %s%%" % loss] if loss != "" and 0 < loss < 100 and cls != "bad" else [])
+        out.append({"_id": n.get("NodeID"), "_cls": cls, "node": n.get("Caption") or "", "ip": n.get("IPAddress") or "",
+                    "status": st, "issue": ", ".join(why), "cpu_%": cpu, "memory_%": mem,
+                    "response_ms": sw_num(n.get("ResponseTime"), 0), "packet_loss_%": loss, "vendor": n.get("Vendor") or "",
+                    "model": n.get("MachineType") or "", "version": n.get("IOSVersion") or "",
+                    "last_boot": sw_dt(n.get("LastBoot"))})
+    return out
+
+
+def sw_ifaces_read(sess, node_id=None):
+    qs = tuple(q + " WHERE NodeID = @n" for q in SW_IF_Q) if node_id is not None else SW_IF_Q
+    rows, _ = sw_first(sess, qs, {"n": node_id} if node_id is not None else None)
+    out = []
+    for i in rows:
+        if sw_int(i.get("AdminStatus")) == 2:
+            st, cls = "Shutdown (admin down)", "admin"
+        else:
+            st, cls = sw_state(i.get("Status"))
+        iu, ou = sw_num(i.get("InPercentUtil"), 1), sw_num(i.get("OutPercentUtil"), 1)
+        err = sum(x for x in (sw_num(i.get("InErrorsToday"), 0), sw_num(i.get("OutErrorsToday"), 0)) if x != "")
+        dis = sum(x for x in (sw_num(i.get("InDiscardsToday"), 0), sw_num(i.get("OutDiscardsToday"), 0)) if x != "")
+        out.append({"_node": i.get("NodeID"), "_cls": cls, "_util": max([x for x in (iu, ou) if x != ""] or [0]),
+                    "node": "", "interface": i.get("Caption") or "", "status": st, "in_util_%": iu, "out_util_%": ou,
+                    "errors_today": int(err), "discards_today": int(dis), "speed": sw_speed(i.get("Speed")),
+                    "last_change": sw_dt(i.get("LastChange"))})
+    return out
+
+
+def sw_alerts_read(sess):
+    rows, _ = sw_first(sess, SW_ALERT_Q)
+    out = []
+    for a in rows:
+        sev = sw_int(a.get("Severity"))
+        ack = a.get("Acknowledged") in (True, 1, "1", "true", "True")
+        out.append({"_rank": SW_SEV_RANK.get(sev, 5), "_node": a.get("RelatedNodeId"), "_t": str(a.get("TriggeredDateTime") or ""),
+                    "severity": SW_SEV.get(sev, str(sev if sev is not None else "")), "alert": a.get("Name") or "",
+                    "object": a.get("EntityCaption") or "", "node": a.get("RelatedNodeCaption") or "",
+                    "type": str(a.get("EntityType") or "").replace("Orion.", ""),
+                    "triggered_utc": sw_dt(a.get("TriggeredDateTime")), "age": sw_age(a.get("TriggeredDateTime")),
+                    "message": re.sub(r"\s+", " ", str(a.get("TriggeredMessage") or ""))[:300],
+                    "acknowledged": ("yes" + (" (%s)" % a["AcknowledgedBy"] if a.get("AcknowledgedBy") else "")) if ack else "no"})
+    out.sort(key=lambda x: x["_t"], reverse=True)
+    out.sort(key=lambda x: x["_rank"])   # stable: most severe first, newest first inside each severity
+    return out
+
+
+def sw_public(rows, drop_empty=True):
+    """Rows without the internal '_' keys (and without columns that are empty in every row)."""
+    rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
+    if drop_empty and rows:
+        keep = [k for k in rows[0] if any(r.get(k) not in ("", None) for r in rows)]
+        rows = [{k: r.get(k) for k in keep} for r in rows]
+    return rows
+
+
+def sw_match(term, row, keys):
+    return not term or any(term in str(row.get(k) or "").lower() for k in keys)
+
+
+def sw_done(t0, request, data, summary, label, kind):
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": request, "data": data,
+            "summary": summary, "verdict": {"label": label, "kind": kind}}
+
+
+def sw_alert_counts(alerts):
+    c = collections.Counter(a["severity"] for a in alerts)
+    return ", ".join("%d %s" % (c[s], s.lower()) for s in SW_SEV.values() if c.get(s))
+
+
+def sw_alerts(sess, v):
+    t0 = time.time()
+    want = str(v.get("filter") or "").strip().lower()
+    al = [a for a in sw_alerts_read(sess) if sw_match(want, a, ("alert", "object", "node", "message", "type"))]
+    worst = al[0]["_rank"] if al else 9
+    unack = sum(1 for a in al if a["acknowledged"] == "no")
+    summary = ["%d active alert(s)%s: %s; %d not acknowledged." % (len(al), " matching '%s'" % want if want else "",
+                                                                   sw_alert_counts(al) or "none", unack)] if al else \
+        ["No active alert%s in SolarWinds." % (" matching '%s'" % want if want else "")]
+    summary.append("Most severe first, newest first within a severity. Times are UTC.")
+    return sw_done(t0, "SWQL Orion.AlertActive + AlertObjects + AlertConfigurations", {"active_alerts": sw_public(al)}, summary,
+                   ("%d ACTIVE ALERT(S)" % len(al) + (" · %s" % sw_alert_counts(al).upper() if al else "")) if al else "NO ACTIVE ALERTS",
+                   "bad" if worst <= 1 else "warn" if al else "ok")
+
+
+def sw_nodes(sess, v, issues_only=False):
+    t0 = time.time()
+    want = str(v.get("filter") or "").strip().lower()
+    nodes = [n for n in sw_nodes_read(sess) if sw_match(want, n, ("node", "ip", "vendor", "model", "version"))]
+    nodes.sort(key=lambda n: (0 if n["_cls"] == "bad" else 1 if n["issue"] or n["_cls"] == "warn" else
+                              3 if n["_cls"] == "admin" else 2, str(n["node"]).lower()))
+    bad = [n for n in nodes if n["_cls"] == "bad"]
+    att = [n for n in nodes if n["issue"]]
+    total = len(nodes)
+    if issues_only:
+        nodes = att
+    c = collections.Counter(n["status"] for n in nodes)
+    summary = ["%d node(s)%s; %d down / unreachable / critical, %d need attention (not up, CPU or memory >= 90%%, packet loss)."
+               % (total, " matching '%s'" % want if want else "", len(bad), len(att))]
+    if not issues_only:
+        summary.append("By status: " + ", ".join("%s %d" % (k, n) for k, n in c.most_common()))
+    label = ("%d NODE(S) DOWN" % len(bad) if bad else "%d NODE(S) NEED ATTENTION" % len(att) if att else "ALL NODES UP") + \
+        ("" if issues_only else " · %d NODES" % len(nodes))
+    return sw_done(t0, "SWQL Orion.Nodes", {"nodes": sw_public(nodes)}, summary, label,
+                   "bad" if bad else "warn" if att else "ok")
+
+
+def sw_node_issues(sess, v):
+    return sw_nodes(sess, {}, issues_only=True)
+
+
+def sw_iface_rows(sess, rows, names=None):
+    if names is None:
+        names = {n["_id"]: n["node"] for n in sw_nodes_read(sess)}
+    for r in rows:
+        r["node"] = names.get(r["_node"], "node %s" % r["_node"])
+    return rows
+
+
+def sw_iface_issues(sess, v):
+    t0 = time.time()
+    lim = num(v.get("util"), 1, 100, 80, "utilization threshold")
+    want = str(v.get("filter") or "").strip().lower()
+    rows = [r for r in sw_iface_rows(sess, sw_ifaces_read(sess)) if sw_match(want, r, ("node", "interface"))]
+    out = []
+    for r in rows:
+        why = ([r["status"].lower()] if r["_cls"] in ("bad", "warn") else []) + \
+              (["utilization %s%%" % r["_util"]] if r["_util"] >= lim else []) + \
+              (["%d errors today" % r["errors_today"]] if r["errors_today"] else []) + \
+              (["%d discards today" % r["discards_today"]] if r["discards_today"] else [])
+        if why and r["_cls"] != "admin":
+            out.append(dict(r, issue=", ".join(why)))
+    out.sort(key=lambda r: (r["_cls"] != "bad", -r["_util"], -(r["errors_today"] + r["discards_today"])))
+    down = sum(1 for r in out if r["_cls"] == "bad")
+    hot = sum(1 for r in out if r["_util"] >= lim)
+    cols = ("node", "interface", "status", "issue", "in_util_%", "out_util_%", "errors_today", "discards_today", "speed", "last_change")
+    pub = [dict((k, r.get(k, "")) for k in cols) for r in out[:1000]]
+    summary = ["%d of %d interface(s)%s have an issue: %d down, %d at or above %d%% utilization, %d with errors or discards today "
+               "(interfaces shut down on purpose are left out)." % (
+                   len(out), len(rows), " matching '%s'" % want if want else "", down, hot, lim,
+                   sum(1 for r in out if r["errors_today"] or r["discards_today"]))]
+    if len(out) > 1000:
+        summary.append("First 1000 shown.")
+    return sw_done(t0, "SWQL Orion.NPM.Interfaces", {"interface_issues": sw_public(pub)}, summary,
+                   ("%d INTERFACE(S) DOWN · " % down if down else "") + ("%d WITH ISSUES" % len(out) if out else "NO INTERFACE ISSUES"),
+                   "bad" if down else "warn" if out else "ok")
+
+
+def sw_iface_top(sess, v):
+    t0 = time.time()
+    n = num(v.get("count"), 1, 200, 20, "how many")
+    want = str(v.get("filter") or "").strip().lower()
+    rows = [r for r in sw_iface_rows(sess, sw_ifaces_read(sess)) if sw_match(want, r, ("node", "interface")) and r["_cls"] != "admin"]
+    rows.sort(key=lambda r: -r["_util"])
+    cols = ("node", "interface", "in_util_%", "out_util_%", "speed", "status", "errors_today", "discards_today")
+    top = [dict((k, r.get(k, "")) for k in cols) for r in rows[:n]]
+    peak = rows[0]["_util"] if rows else 0
+    return sw_done(t0, "SWQL Orion.NPM.Interfaces", {"busiest_interfaces": sw_public(top)},
+                   ["Top %d of %d interface(s)%s by the higher of in / out utilization at the last poll." % (
+                       len(top), len(rows), " matching '%s'" % want if want else "")],
+                   "BUSIEST: %s %s AT %s%%" % (rows[0]["node"], rows[0]["interface"], peak) if rows else "NO INTERFACES",
+                   "bad" if peak >= 90 else "warn" if peak >= 70 else "ok")
+
+
+def sw_node(sess, v):
+    t0 = time.time()
+    want = str(v.get("node") or "").strip().lower()
+    nodes = sw_nodes_read(sess)
+    hit = [n for n in nodes if want in (str(n["node"]).lower(), str(n["ip"]).lower())] or \
+        [n for n in nodes if want in str(n["node"]).lower() or want in str(n["ip"]).lower()]
+    if not hit:
+        raise ValueError("no SolarWinds node named or addressed '%s'" % want)
+    if len(hit) > 1:
+        return sw_done(t0, "SWQL Orion.Nodes", {"matching_nodes": sw_public(hit[:200])},
+                       ["%d nodes match '%s': run it again with the full name or the IP." % (len(hit), want)],
+                       "%d NODES MATCH" % len(hit), "warn")
+    nd = hit[0]
+    ifs = sorted(sw_iface_rows(sess, sw_ifaces_read(sess, nd["_id"]), {nd["_id"]: nd["node"]}),
+                 key=lambda r: ({"bad": 0, "warn": 1, "ok": 2, "admin": 3}.get(r["_cls"], 1), -r["_util"]))
+    try:
+        al = [a for a in sw_alerts_read(sess) if a["_node"] == nd["_id"] or
+              (str(a["node"]).lower() == str(nd["node"]).lower() and a["node"]) or str(a["object"]).lower() == str(nd["node"]).lower()]
+        alerr = ""
+    except SwError as e:
+        al, alerr = [], str(e)
+    down = [r for r in ifs if r["_cls"] == "bad"]
+    summary = ["%s (%s): %s%s." % (nd["node"], nd["ip"], nd["status"], "; " + nd["issue"] if nd["issue"] else ""),
+               "%d interface(s), %d down, busiest %s%%; %d active alert(s)%s." % (
+                   len(ifs), len(down), max([r["_util"] for r in ifs] or [0]), len(al),
+                   " (%s)" % sw_alert_counts(al) if al else "")]
+    if alerr:
+        summary.append("Active alerts not readable: " + alerr)
+    info = {k: x for k, x in nd.items() if not k.startswith("_") and x not in ("", None)}
+    data = {"node": info, "interfaces": sw_public([dict((k, r.get(k, "")) for k in (
+        "interface", "status", "in_util_%", "out_util_%", "errors_today", "discards_today", "speed", "last_change")) for r in ifs]),
+        "active_alerts": sw_public(al)}
+    kind = "bad" if nd["_cls"] == "bad" or down or any(a["_rank"] <= 1 for a in al) else "warn" if nd["issue"] or al else "ok"
+    return sw_done(t0, "SWQL Orion.Nodes + Orion.NPM.Interfaces + Orion.AlertActive", data, summary,
+                   "%s · %s%s%s" % (nd["node"], nd["status"].upper(), " · %d INTERFACE(S) DOWN" % len(down) if down else "",
+                                    " · %d ALERT(S)" % len(al) if al else ""), kind)
+
+
+def sw_overview(sess, v):
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        fn = ex.submit(sw_nodes_read, sess), ex.submit(sw_ifaces_read, sess), ex.submit(sw_alerts_read, sess)
+    nodes = fn[0].result()
+    notes = []
+    try:
+        ifs = sw_iface_rows(sess, fn[1].result(), {n["_id"]: n["node"] for n in nodes})
+    except SwError as e:
+        ifs = []
+        notes.append("Interfaces not readable (no NPM interfaces, or no access): %s" % e)
+    try:
+        al = fn[2].result()
+    except SwError as e:
+        al = []
+        notes.append("Active alerts not readable: %s" % e)
+    cnt = lambda rows: [{"status": k, "count": n} for k, n in collections.Counter(r["status"] for r in rows).most_common()]
+    att = [n for n in nodes if n["issue"]]
+    att.sort(key=lambda n: (n["_cls"] != "bad", str(n["node"]).lower()))
+    ifdown = sorted([r for r in ifs if r["_cls"] == "bad"], key=lambda r: (str(r["node"]).lower(), r["interface"]))
+    badn = sum(1 for n in nodes if n["_cls"] == "bad")
+    data = {"nodes_by_status": cnt(nodes), "interfaces_by_status": cnt(ifs),
+            "active_alerts_by_severity": [{"severity": k, "count": n} for k, n in
+                                          collections.Counter(a["severity"] for a in al).most_common()],
+            "nodes_needing_attention": sw_public(att[:50]),
+            "interfaces_down": sw_public([dict((k, r[k]) for k in ("node", "interface", "status", "last_change")) for r in ifdown[:50]]),
+            "most_severe_alerts": sw_public([dict((k, a[k]) for k in ("severity", "alert", "object", "node", "age", "acknowledged"))
+                                             for a in al[:15]])}
+    summary = ["%d node(s): %d down / unreachable / critical, %d need attention." % (len(nodes), badn, len(att)),
+               "%d interface(s): %d down." % (len(ifs), len(ifdown)) if ifs else "No interface data.",
+               "%d active alert(s)%s." % (len(al), ": " + sw_alert_counts(al) if al else "")] + notes
+    worst = min([a["_rank"] for a in al] or [9])
+    parts = (["%d NODE(S) DOWN" % badn] if badn else []) + (["%d INTERFACE(S) DOWN" % len(ifdown)] if ifdown else []) + \
+        (["%d ALERT(S)" % len(al)] if al else [])
+    return sw_done(t0, "SWQL Orion.Nodes + Orion.NPM.Interfaces + Orion.AlertActive", data, summary,
+                   " · ".join(parts) or "ALL NODES UP · NO ACTIVE ALERTS",
+                   "bad" if badn or worst <= 1 else "warn" if parts or att else "ok")
+
+
+def sw_raw(sess, q):
+    q = q.strip()
+    if not re.match(r"(?is)^SELECT\s", q) or ";" in q or len(q) > 4000:
+        return {"ok": False, "error": "only one SWQL SELECT query (no ';', up to 4000 characters), e.g. "
+                                      "SELECT TOP 10 Caption, IPAddress, StatusDescription FROM Orion.Nodes"}
+    t0 = time.time()
+    try:
+        rows = sw_query(sess, q)
+    except SwError as e:
+        return {"ok": False, "status": e.status, "error": str(e), "request": "SWQL " + q[:300]}
+    return {"ok": True, "status": 200, "data": {"results": rows[:5000]}, "request": "SWQL " + q[:300],
+            "ms": int((time.time() - t0) * 1000), "summary": ["%d row(s)%s." % (len(rows), ", first 5000 shown" if len(rows) > 5000 else "")]}
+
+
+# ---- FortiWeb (WAF) and FortiADC (ADC): REST API, read-only (GET only) ----
+# REST paths and field names change between firmware releases, so every check lists the paths to try in order (the
+# first that answers wins and the result names it), fields are read tolerantly, and the raw box takes any GET to explore
+# a firmware. FortiWeb: /api/v2.0/..., answers {"results": ...}; FortiADC: /api/..., answers {"payload": ...}.
+FX_VNAME = {"fortiweb": "FortiWeb", "fortiadc": "FortiADC"}
+FX_PREFIX = {"fortiweb": ("/api/v2.0/",), "fortiadc": ("/api/",)}
+# a GET whose path names an action is refused, in case a firmware treats it as one
+FX_ACTION_RE = re.compile(r"(?i)(reboot|shutdown|restart|restore|backup|factory|upgrade|firmware_upload|reset|logout|"
+                          r"login|delete|remove|clear|flush|execute|diagnose|import|upload|format|kill|purge|"
+                          r"disconnect|update_now|sync_now)")
+FX_META_RE = re.compile(r"^(q_|can_|_)")   # FortiWeb list metadata (q_ref, q_type, can_delete ...)
+FX_HIDE_RE = re.compile(r"(passw|passphrase|secret|token|api[_-]?key|private[_-]?key|\bpsk\b|pre-?shared|community|"
+                        r"\bkey[_-]?(pass|password)|shared[_-]?key)", re.I)
+
+
+class FxError(ValueError):
+    def __init__(self, status, msg):
+        ValueError.__init__(self, msg)
+        self.status = status
+
+
+def fx_unwrap(d):
+    """FortiWeb {"results": ...}, FortiADC {"payload": ...}; both put an error code there on failure."""
+    if isinstance(d, dict):
+        for k in ("results", "payload"):
+            if k in d:
+                v = d[k]
+                if isinstance(v, int) and not isinstance(v, bool) and v < 0:
+                    raise FxError(200, "the device answered error code %s" % v)
+                if isinstance(v, dict) and isinstance(v.get("errcode"), int) and v["errcode"] < 0:
+                    raise FxError(200, "the device answered error %s%s" % (
+                        v["errcode"], ": " + str(v.get("message")) if v.get("message") else ""))
+                return v
+    return d
+
+
+def fad_login(sess):
+    """FortiADC: POST /api/user/login -> token, used as 'Authorization: Bearer <token>'."""
+    u, p = sess["_cred"]
+    st, raw = http(sess, "POST", "/api/user/login", {"Content-Type": "application/json", "Accept": "application/json"},
+                   json.dumps({"username": u, "password": p}).encode(), 20)
+    try:
+        d = json.loads(raw.decode("utf-8-sig"))
+    except ValueError:
+        d = None
+    tok = d.get("token") if isinstance(d, dict) else None
+    if not tok and isinstance(d, dict) and isinstance(d.get("payload"), dict):
+        tok = d["payload"].get("token")
+    if st in (401, 403) or (200 <= st < 300 and not tok):
+        raise FxError(401, "FortiADC refused the login (HTTP %s): check the user name and password, and that the "
+                           "administrator may use the REST API (trusted hosts include this PC)" % st)
+    if not 200 <= st < 300:
+        raise FxError(st, "FortiADC login answered HTTP %s (is this a FortiADC? check host / port)" % st)
+    sess["hdr"] = {"Authorization": "Bearer " + str(tok), "Accept": "application/json"}
+
+
+def fx_get(sess, path, timeout=30):
+    if FX_ACTION_RE.search(path.split("?")[0]):
+        raise ValueError("refused: %s looks like an action, and this console only reads" % path.split("?")[0])
+    if sess["vendor"] == "fortiadc" and sess.get("vdom") and "vdom=" not in path:
+        path += ("&" if "?" in path else "?") + "vdom=" + urllib.parse.quote(sess["vdom"], safe="")
+    st, ok, d = rest_get(sess, path, timeout)
+    if st == 401 and sess.get("_cred"):   # FortiADC token expired: log in again once
+        fad_login(sess)
+        st, ok, d = rest_get(sess, path, timeout)
+    vn = FX_VNAME[sess["vendor"]]
+    if st in (401, 403):
+        raise FxError(st, "%s refused the request (HTTP %d): the login expired or the administrator profile may "
+                          "not read this" % (vn, st))
+    if not ok:
+        msg = (d.get("message") or d.get("msg") or "") if isinstance(d, dict) else ""
+        raise FxError(st, "HTTP %s%s" % (st, ": " + str(msg)[:200] if msg else ""))
+    if not isinstance(d, (dict, list)):
+        raise FxError(st, "%s did not answer JSON (check host / port and the selected vendor)" % vn)
+    return fx_unwrap(d)
+
+
+def fx_first(sess, paths):
+    """First path this firmware answers -> (data, path used)."""
+    tried = []
+    for p in paths:
+        try:
+            return fx_get(sess, p), p
+        except FxError as e:
+            if e.status in (401, 403):
+                raise
+            tried.append("%s (%s)" % (p.split("?")[0], e))
+    raise FxError(404, "no endpoint for this answered on this firmware; tried: " + "; ".join(tried) +
+                  ". Find the right path with the raw box and tell me, so the check can be updated.")
+
+
+def fx_clean(x, depth=0):
+    """Drop list metadata, hide secret-looking values (shown as 'hidden')."""
+    if depth > 12:
+        return x
+    if isinstance(x, dict):
+        return collections.OrderedDict(
+            (k, "(hidden)" if FX_HIDE_RE.search(str(k)) and x[k] not in (None, "", [], {}) else fx_clean(x[k], depth + 1))
+            for k in x if not FX_META_RE.match(str(k)))
+    if isinstance(x, list):
+        return [fx_clean(v, depth + 1) for v in x]
+    return x
+
+
+def fx_rows(v):
+    if isinstance(v, list):
+        return [x for x in v if isinstance(x, dict)]
+    if isinstance(v, dict):
+        for k in ("data", "items", "list", "entries", "logs", "rules", "payload"):
+            if isinstance(v.get(k), list):
+                return [x for x in v[k] if isinstance(x, dict)]
+        lists = [x for x in v.values() if isinstance(x, list) and x and all(isinstance(i, dict) for i in x)]
+        if len(lists) == 1 and not any(isinstance(x, (int, float, str)) and not isinstance(x, bool) and k not in
+                                       ("domain_view", "count", "total") for k, x in v.items()):
+            return lists[0]   # e.g. {"something": [ ... ], "count": 3}
+        return [v]
+    return []
+
+
+def fx_ref(v):
+    """A reference field as text: 'name', {"name": ..}, [{"name": ..}, ..]."""
+    if isinstance(v, dict):
+        return str(v.get("name") or v.get("mkey") or v.get("id") or "")
+    if isinstance(v, list):
+        return ", ".join(x for x in (fx_ref(i) for i in v) if x)
+    return "" if v is None else str(v)
+
+
+def fx_val(r, *keys):
+    for k in keys:
+        for kk in (k, k.replace("-", "_"), k.replace("_", "-")):
+            if kk in r and r[kk] not in (None, "", [], {}):
+                return fx_ref(r[kk])
+    return ""
+
+
+def fx_name(r):
+    return fx_val(r, "name", "mkey", "id")
+
+
+def fx_match(r, term):
+    return not term or term.lower() in json.dumps(r, default=str).lower()
+
+
+def fx_spec(sess, check):
+    return next(c for c in CATALOG[sess["vendor"]] if c["id"] == check)
+
+
+def fx_done(sess, used, data, summary, t0):
+    return {"ok": True, "status": 200, "request": "GET " + used, "data": data, "summary": summary,
+            "ms": int((time.time() - t0) * 1000)}
+
+
+def fx_generic(sess, vals):
+    """A catalog check that is a list of GET paths: the first that answers, optionally filtered."""
+    t0, spec = time.time(), fx_spec(sess, vals["_check"])
+    paths = [re.sub(r"\{(\w+)\}", lambda m: urllib.parse.quote(vals.get(m.group(1)) or "", safe=""), p) for p in spec["fx"]]
+    d, used = fx_first(sess, paths)
+    rows, term = fx_rows(d), vals.get("filter") or ""
+    if isinstance(d, dict) and rows == [d]:   # one object (status, settings): shown as it is
+        return fx_done(sess, used, fx_clean(d), [], t0)
+    shown = [fx_clean(r) for r in rows if fx_match(r, term)]
+    key = spec.get("key") or "items"
+    return fx_done(sess, used, {key: shown}, ["%d %s%s." % (len(shown), key.replace("_", " "),
+                                                             " matching '%s' (of %d)" % (term, len(rows)) if term else "")], t0)
+
+
+def fx_subrows(sess, base, names, workers=6):
+    """Sub-table of each named object (FortiWeb ...?mkey=NAME, FortiADC ...?pkey=NAME) -> {name: [rows]}."""
+    def one(n):
+        try:
+            return n, fx_rows(fx_get(sess, base + urllib.parse.quote(n, safe="")))
+        except (FxError, urllib.error.URLError, OSError):
+            return n, None
+    with concurrent.futures.ThreadPoolExecutor(workers) as ex:
+        return dict(ex.map(one, names[:200]))
+
+
+# -- FortiWeb --
+FWB = "/api/v2.0/cmdb/"
+
+
+def fwb_policies(sess, vals):
+    """Server policies joined with their virtual server / VIPs, protected hostnames, server pool and protection profile."""
+    t0, term = time.time(), vals.get("filter") or ""
+    pols, used = fx_first(sess, [FWB + "server-policy/policy"])
+    pols = fx_rows(pols)
+    vips = {}
+    try:
+        for v in fx_rows(fx_get(sess, FWB + "system/vip")):
+            vips[fx_name(v)] = fx_val(v, "vip", "vip6", "address")
+    except FxError:
+        pass
+    vsn = sorted({fx_val(p, "vserver") for p in pols} - {""})
+    vsub = fx_subrows(sess, FWB + "server-policy/vserver/vip-list?mkey=", vsn)
+    rows = []
+    for p in pols:
+        vs = fx_val(p, "vserver")
+        addrs = []
+        for it in vsub.get(vs) or []:
+            ref = fx_val(it, "vip", "vip6")
+            addrs.append(vips.get(ref) or ref or fx_val(it, "interface"))
+        mon = fx_val(p, "monitor-mode")
+        prof = fx_val(p, "web-protection-profile")
+        notes = ([] if prof else ["no web protection profile: not inspected"]) + \
+                (["monitor mode: attacks are logged, NOT blocked"] if mon == "enable" else []) + \
+                (["policy disabled"] if fx_val(p, "status") == "disable" else [])
+        r = {"policy": fx_name(p), "status": fx_val(p, "status") or "enable", "mode": fx_val(p, "deployment-mode"),
+             "virtual_server": vs, "addresses": ", ".join(a for a in addrs if a),
+             "http": fx_val(p, "service"), "https": fx_val(p, "https-service"),
+             "certificate": fx_val(p, "certificate"), "protected_hostnames": fx_val(p, "allow-hosts"),
+             "server_pool": fx_val(p, "server-pool"), "protection_profile": prof,
+             "http_to_https": fx_val(p, "http-to-https"), "notes": "; ".join(notes)}
+        if fx_match(r, term):
+            rows.append(r)
+    flag = [r for r in rows if r["notes"]]
+    return fx_done(sess, used, {"server_policies": rows},
+                   ["%d server polic%s%s; %d with something to look at (no profile, monitor mode or disabled)." % (
+                       len(rows), "y" if len(rows) == 1 else "ies", " matching '%s'" % term if term else "", len(flag))], t0)
+
+
+# FortiWeb 8.0 (GUI: Log & Report > Log Access > Attack): logreport.logaccess.filter?log_type=3 ->
+# {"results": {"total", "filter_offset", "payload": [entries]}}; the older guesses stay as fallbacks
+FWB_ATTACK_PATHS = ("/api/v2.0/log/logreport.logaccess.filter?log_type=3&size={n}",
+                    "/api/v2.0/log/logreport.logaccess.filter?log_type=3",
+                    "/api/v2.0/log/attack?size={n}", "/api/v2.0/log/attack.log?size={n}",
+                    "/api/v2.0/log/logaccess.attack?size={n}", "/api/v2.0/log/attack")
+
+
+def fwb_attacks(sess, vals):
+    """Attack log, newest first, filtered by client IP / hostname / URL / signature or action (filtered here)."""
+    t0 = time.time()
+    n = max(1, min(int(vals.get("count") or 100), 1000))
+    if any(vals.get(k) for k in ("ip", "host", "url", "text", "action")):   # search back through up to 7 days
+        raw, used, _n = fwb_logs(sess, 168, cap=5000)
+    else:
+        d, used = fx_first(sess, [p.format(n=n) for p in FWB_ATTACK_PATHS])
+        raw = fx_rows(d)
+    rows = [fx_clean(r) for r in raw]
+    flt = {k: str(vals.get(k) or "").strip().lower() for k in ("ip", "host", "url", "action", "text")}
+
+    def has(r, keys, want):
+        if not want:
+            return True
+        vals_ = [str(r.get(k) or "") for k in keys if k in r]
+        return any(want in v.lower() for v in (vals_ or [json.dumps(r, default=str)]))
+    out = [r for r in rows if has(r, ("src", "srcip", "src_ip", "client_ip", "original_src"), flt["ip"]) and
+           has(r, ("http_host", "host", "hostname"), flt["host"]) and has(r, ("http_url", "url", "uri"), flt["url"]) and
+           has(r, ("action",), flt["action"]) and has(r, (), flt["text"])]
+    tkey = next((k for k in ("timestamp", "time", "date", "datetime", "log_time") if out and k in out[0]), None)
+    if tkey:
+        out.sort(key=lambda r: (str(r.get("date") or ""), str(r.get(tkey) or "")), reverse=True)
+    out = out[:n]
+    cnt = lambda keys: collections.Counter(next((str(r[k]) for k in keys if r.get(k)), "?") for r in out).most_common(8)
+    summ = ["%d attack log entr%s%s." % (len(out), "y" if len(out) == 1 else "ies",
+                                         " matching " + ", ".join("%s '%s'" % kv for kv in flt.items() if kv[1]) if any(flt.values()) else "")]
+    if out:
+        summ += ["By action: " + ", ".join("%s %d" % x for x in cnt(("action",))),
+                 "By attack type: " + ", ".join("%s %d" % x for x in cnt(("main_type", "sub_type", "attack_type", "msg")))]
+    return fx_done(sess, used, {"attacks": out}, summ, t0)
+
+
+# -- FortiWeb security analytics: statistics, ML / API / bot views and insights from the attack log + configuration --
+FWB_CATS = (("ML anomaly", re.compile(r"anomal|machine.?learn|\bml\b", re.I)),
+            ("API protection", re.compile(r"\bapi\b|openapi|swagger|schema|graphql|api.?gateway", re.I)),
+            ("Bot", re.compile(r"bot|crawl|scrap|biometric|fingerprint|captcha|headless", re.I)),
+            ("IP / Geo / reputation", re.compile(r"reputation|geo|ip.?list|block.?list|black.?list|allow.?list|"
+                                                  r"white.?list|period block", re.I)),
+            ("DoS / rate", re.compile(r"\bdos\b|flood|rate.?limit|brute|threshold", re.I)),
+            ("Protocol / constraints", re.compile(r"protocol|constraint|header|method|cookie|parameter valid|"
+                                                   r"hidden field|input rule", re.I)),
+            ("Signatures", re.compile(r"signature|sql|xss|cross.?site|inject|traversal|command|trojan|exploit|"
+                                      r"generic attack|known attack", re.I)))
+FWB_BLOCK_RE = re.compile(r"deny|block|redirect|erase|reset|captcha|drop|period", re.I)
+FWB_STATS_CACHE = {}
+
+
+def fwb_ts(r):
+    """Epoch seconds of a log row (date + time in device time, epoch s / ms, or ISO) or None."""
+    for k in ("timestamp", "eventtime", "itime"):
+        v = r.get(k)
+        if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+            v = float(v)
+            return v / 1e9 if v > 1e17 else v / 1e3 if v > 1e12 else v
+    d, t = str(r.get("date") or ""), str(r.get("time") or "")
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)", d) and re.match(r"(\d\d):(\d\d)(?::(\d\d))?", t)
+    if m:
+        try:
+            return time.mktime(time.strptime("%s %s" % (d[:10], t[:8] if len(t) >= 8 else t[:5] + ":00"), "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            return None
+    m = re.match(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)", str(r.get("date") or r.get("time") or r.get("datetime") or ""))
+    if m:
+        return time.mktime(time.strptime("%s %s" % m.groups(), "%Y-%m-%d %H:%M:%S"))
+    return None
+
+
+def fwb_ml_real(v):
+    """An ml_* log field that holds a real value (firmwares fill them on every entry with none / N/A / 0 / -1)."""
+    s = str(v if v is not None else "").strip().lower()
+    if s in ("", "none", "n/a", "na", "null", "unknown", "-", "off", "disable", "disabled", "[]", "{}"):
+        return False
+    try:
+        return float(s) > 0
+    except ValueError:
+        return True
+
+
+def fwb_cat(r):
+    """Protection category from the attack type (main_type / sub_type / message); the ml_* fields decide only when
+    the type says nothing."""
+    mt, st = str(r.get("main_type") or ""), str(r.get("sub_type") or "")
+    if re.search(r"machine.?learn|\bml\b|anomal", mt + " " + st, re.I):   # FortiWeb 8: main_type "Machine Learning"
+        return ("ML API protection" if re.search(r"api|openapi|swagger|schema|request body|response body|graphql", st, re.I)
+                else "ML anomaly")
+    txt = " ".join(str(r.get(k) or "") for k in ("main_type", "sub_type", "msg", "signature_subclass"))
+    c = next((c for c, rx in FWB_CATS if rx.search(txt)), None)
+    if c:
+        return c
+    if not str(r.get("main_type") or "").strip() and any(str(k).startswith("ml_") and fwb_ml_real(r.get(k)) for k in r):
+        return "ML anomaly"
+    return "Other"
+
+
+FWB_LOG_KEYS = ("action", "src", "srcip", "src_ip", "client_ip", "main_type", "sub_type", "msg", "http_host", "http_url",
+                "signature_id", "date", "time", "timestamp", "eventtime", "policy", "log_id")
+
+
+def fwb_logs(sess, hours, cap=10000):
+    """Attack log rows of the last `hours`, newest first, paging while the firmware pages (stops at `cap`)
+    -> (rows, path, note). The paging parameter is found by trying (offset styles first) and checking that the
+    next page really starts with other entries."""
+    size = 1000
+    d, used, tried = None, None, []
+    for p_ in [p.format(n=size) for p in FWB_ATTACK_PATHS]:   # the first path whose answer holds log entries
+        try:
+            d_ = fx_get(sess, p_)
+        except FxError as e:
+            if e.status in (401, 403):
+                raise
+            tried.append("%s (%s)" % (p_, e))
+            continue
+        r_ = fx_rows(d_)
+        if any(any(k in r for k in FWB_LOG_KEYS) for r in r_[:20]) or (isinstance(d_, dict) and d_.get("payload") == []):
+            d, used = d_, p_
+            break
+        if d is None:   # remember the first answer, for the message if no path has entries
+            d, used = d_, p_
+        tried.append("%s (answered without log entries: %s)" % (p_, ", ".join(sorted(map(str, (
+            d_ if isinstance(d_, dict) else (r_[0] if r_ else {})).keys())))[:300]))
+    if d is None:
+        raise FxError(404, "no attack-log endpoint answered on this firmware; tried: " + "; ".join(tried))
+    rows, note = fx_rows(d), ""
+    total = d.get("total") if isinstance(d, dict) and isinstance(d.get("total"), int) else None
+    since = time.time() - hours * 3600
+    sig = lambda r: json.dumps(r, sort_keys=True, default=str)
+    seen = {sig(r) for r in rows[:5]}
+    styles = ["&filter_offset=%d", "&offset=%d", "&start=%d", "&page=%d"]
+    style, page, plen = None, 2, len(rows)
+    while rows and len(rows) < cap and (total is None or len(rows) < total):
+        ts = [x for x in (fwb_ts(r) for r in rows[-plen:]) if x]
+        if ts and min(ts) < since:
+            break   # this page already reaches back past the range
+        nxt = None
+        for st in ([style] if style else styles):
+            arg = st % (page if st == "&page=%d" else len(rows))
+            try:
+                cand = fx_rows(fx_get(sess, used + arg))
+            except (FxError, ValueError):
+                continue
+            if cand and sig(cand[0]) not in seen:
+                style, nxt = st, cand
+                break
+        if not nxt:
+            if style is None:
+                note = "this firmware returned one page only: the newest %d entries" % len(rows)
+            break
+        seen.update(sig(r) for r in nxt[:5])
+        rows += nxt
+        page += 1
+        if len(nxt) < plen:
+            break
+    if len(rows) >= cap:
+        note = "read the newest %d entries (limit)" % cap
+    return rows[:cap], used, note
+
+
+def fwb_stats(sess, vals):
+    """Statistics of the attack log over a time range (optionally one server policy), ML / API / bot breakdowns,
+    the ML / API / bot policies configured, and insights with the values behind them."""
+    t0 = time.time()
+    hours = {"1h": 1, "6h": 6, "24h": 24, "3d": 72, "7d": 168}.get(str(vals.get("range") or "24h"), 24)
+    pol_want = str(vals.get("policy") or "").strip()
+    key = (id(sess), hours, pol_want)
+    hit = FWB_STATS_CACHE.get(key)
+    if hit and time.time() - hit[0] < 60 and not vals.get("_fresh"):
+        return hit[1]
+    raw, used, note = fwb_logs(sess, hours)
+    if raw and not any(any(k in r for k in FWB_LOG_KEYS) for r in raw[:20]):
+        keys = sorted({str(k) for r in raw[:5] for k in r})[:40]
+        note = ("%s answered, but not with attack-log entries this console knows (%d row(s); fields: %s). Capture the "
+                "GUI's attack-log request (Log & Report > Log Access > Attack, F12 > Network) and send its path and 2 "
+                "entries, so the statistics can read your firmware's log." % (used, len(raw), ", ".join(keys) or "none"))
+        raw = []
+    now = time.time()
+    rows = []
+    for r in raw:
+        r = fx_clean(r)
+        ts = fwb_ts(r)
+        r["_ts"] = ts
+        rows.append(r)
+    tsv = [r["_ts"] for r in rows if r["_ts"]]
+    ref = max([now] + tsv) if tsv else now
+    since = ref - hours * 3600
+    inrange = [r for r in rows if r["_ts"] is None or r["_ts"] >= since]
+    pols_all = sorted({str(r.get("policy") or "") for r in inrange} - {""})
+    if pol_want:
+        inrange = [r for r in inrange if str(r.get("policy") or "") == pol_want]
+    for r in inrange:
+        r["_cat"] = fwb_cat(r)
+        act = str(r.get("action") or "")
+        r["_blk"] = bool(FWB_BLOCK_RE.search(act))
+    n = len(inrange)
+    blocked = sum(1 for r in inrange if r["_blk"])
+    g = lambda r, *ks: next((str(r[k]) for k in ks if r.get(k) not in (None, "", "N/A")), "")
+
+    def top(rows_, fn, k=10):
+        c = collections.Counter(x for x in (fn(r) for r in rows_) if x)
+        return [{"name": a, "count": b, "pct": round(100.0 * b / max(1, len(rows_)), 1)} for a, b in c.most_common(k)]
+    # time series: hourly buckets (5-minute buckets for 1 h)
+    step = 300 if hours == 1 else 3600 if hours <= 72 else 3 * 3600
+    nb = int(hours * 3600 / step)
+    start = ref - nb * step
+    tot, blk = [0] * nb, [0] * nb
+    for r in inrange:
+        if r["_ts"] and r["_ts"] >= start:
+            i = min(nb - 1, int((r["_ts"] - start) / step))
+            tot[i] += 1
+            blk[i] += r["_blk"]
+    fmt = "%H:%M" if hours <= 24 else "%m-%d %H:%M"
+    labels = [time.strftime(fmt, time.localtime(start + (i + 1) * step)) for i in range(nb)]
+    series = {"attacks": [[labels[i], tot[i]] for i in range(nb)],
+              "blocked_pct": [[labels[i], round(100.0 * blk[i] / tot[i], 1) if tot[i] else None] for i in range(nb)]}
+    src = lambda r: g(r, "src", "srcip", "src_ip", "client_ip", "original_src")
+    host = lambda r: g(r, "http_host", "host", "hostname")
+    url = lambda r: g(r, "http_url", "url", "uri").split("?")[0]
+    sig = lambda r: (g(r, "signature_id") + " " + g(r, "msg", "sub_type")[:60]).strip() if g(r, "signature_id") else ""
+    typ = lambda r: " · ".join(x for x in (g(r, "main_type"), g(r, "sub_type")) if x) or g(r, "msg")[:80]
+    sub = lambda r: g(r, "sub_type") or g(r, "main_type")
+    cats = top(inrange, lambda r: r["_cat"], 10)
+    ml = [r for r in inrange if r["_cat"] == "ML anomaly"]
+    api = [r for r in inrange if r["_cat"] in ("API protection", "ML API protection")]
+    prop_rx = re.compile(r'(required|additional|unknown|missing|invalid)?\s*propert(?:y|ies)\s*\\?"([^"\\]{1,60})\\?"\s*'
+                         r'(not found|not allowed|is not allowed|is required|invalid|does not match|mismatch)?', re.I)
+
+    def props(r):   # "Required property "TransID" not found" -> "TransID (missing)"
+        out_ = []
+        for m in prop_rx.finditer(g(r, "msg", "msg_src")):
+            kind = (m.group(3) or m.group(1) or "").lower()
+            out_.append("%s (%s)" % (m.group(2), "missing" if "not found" in kind or kind in ("required", "missing", "is required")
+                                     else "not allowed" if "allowed" in kind or kind in ("additional", "unknown") else kind or "?"))
+        return out_
+    prop_c = collections.Counter(p_ for r in api for p_ in props(r))
+    bot = [r for r in inrange if r["_cat"] == "Bot"]
+    ips = collections.Counter(src(r) for r in inrange if src(r))
+    # configuration: policies (mode / profile), ML, API and bot policies
+    cfg, cfg_notes = {}, []
+    try:
+        pr = fwb_policies(sess, {})["data"]["server_policies"]
+    except (FxError, KeyError, urllib.error.URLError, OSError):
+        pr = []
+    for nm, paths in (("ml_policies", (FWB + "waf/machine-learning-policy", FWB + "waf/ml-policy")),
+                      ("api_learning_policies", (FWB_MLAPI + "get_policy_rules", FWB + "waf/api-learning-policy",
+                                                FWB + "waf/api-protection-learning-policy")),
+                      ("api_protection_policies", (FWB + "waf/api-protection-policy", FWB + "waf/openapi-validation-policy")),
+                      ("bot_policies", (FWB + "waf/bot-detection-policy", FWB + "waf/bot-mitigate-policy"))):
+        try:
+            d, _p = fx_first(sess, list(paths))
+            rows_ = [fx_clean(x) for x in fx_rows(d)]
+            if any(isinstance(x.get("rule"), list) for x in rows_):
+                rows_ = fwb_ml_rules(rows_)
+            cfg[nm] = [{k: v for k, v in x.items() if not isinstance(v, (list, dict))} for x in rows_][:50]
+        except (FxError, urllib.error.URLError, OSError):
+            cfg[nm] = None
+            cfg_notes.append(nm.replace("_", " "))
+    # insights: each with what was seen and what to look at
+    ins = []
+
+    def add(sev, title, detail):
+        ins.append({"severity": sev, "title": title, "detail": detail})
+    if n:
+        last_h = sum(tot[-max(1, 3600 // step):])
+        base_hours = max(1, (nb * step - 3600) / 3600.0)
+        base = (n - last_h) / base_hours if hours > 1 else None
+        if base is not None and last_h >= 20 and last_h > 3 * max(1.0, base):
+            add("high", "Attack spike in the last hour", "%d attacks in the last hour vs %.1f per hour before (x%.1f)."
+                % (last_h, base, last_h / max(1.0, base)))
+        a, c = (ips.most_common(1) or [("", 0)])[0]
+        if c >= 20 and c > 0.3 * n:
+            ua = collections.Counter(g(r, "http_agent") for r in inrange if src(r) == a and g(r, "http_agent")).most_common(1)
+            ua = ua[0][0][:80] if ua else ""
+            try:
+                internal = ipaddress.ip_address(a).is_private
+            except ValueError:
+                internal = False
+            auto = bool(re.search(r"playwright|selenium|puppeteer|headless|curl|python|postman|jmeter|k6|locust|"
+                                  r"burp|zap|nikto|sqlmap|acunetix|nessus|qualys|nuclei|go-http|okhttp", ua, re.I))
+            add("medium", "One client is %d%% of all attacks" % (100 * c // n),
+                "%s: %d of %d attacks%s. %s" % (
+                    a, c, n, ", user agent '%s'" % ua if ua else "",
+                    ("It is an internal address" + (" running an automation / test tool" if auto else "") +
+                     ": most likely your own testing or scanner (exclude it from the statistics, or whitelist it for the "
+                     "test window), or a proxy / load balancer in front of FortiWeb hiding the real clients (then use "
+                     "X-Forwarded-For as the client IP in the server policy).") if internal else
+                    ("The user agent is an automation / attack tool: consider an IP block or a threat-score rule."
+                     if auto else "Consider an IP block / threat-score rule, or check it is not a scanner you run.")))
+        alert = n - blocked
+        if alert > 0.5 * n and alert >= 10:
+            add("medium", "Most attacks were only logged, not blocked",
+                "%d of %d (%.0f%%) had an alert-only action. Check the actions in the protection profile / signature "
+                "policy, or server policies in monitor mode." % (alert, n, 100.0 * alert / n))
+        mon = {p["policy"] for p in pr if "monitor mode" in p.get("notes", "")}
+        hitmon = collections.Counter(str(r.get("policy") or "") for r in inrange if str(r.get("policy") or "") in mon)
+        for p_, c_ in hitmon.most_common(3):
+            add("high", "Attacks on a policy in monitor mode: %s" % p_,
+                "%d attacks reached %s, which only logs (monitor mode)." % (c_, p_))
+        # possible false positives: one signature on one URL, from many different clients that each hit it only a
+        # few times and tripped nothing else (ordinary users), unlike attackers who try several signatures / URLs
+        grp, seen_by = collections.defaultdict(list), collections.defaultdict(set)
+        for r in inrange:
+            seen_by[src(r)].add((sig(r) or typ(r), host(r), url(r)))
+            if sig(r):
+                grp[(sig(r), host(r), url(r))].append(src(r))
+        fps = []
+        for (s_, h_, u_), cl in grp.items():
+            dc = collections.Counter(cl)
+            only = sum(1 for c_ in dc if len(seen_by[c_]) == 1)
+            if len(dc) >= 5 and max(dc.values()) <= 3 and only >= 0.8 * len(dc):
+                fps.append((len(cl), len(dc), s_, h_, u_))
+        for c_, d_, s_, h_, u_ in sorted(fps, reverse=True)[:3]:
+            add("medium", "Possible false positive: signature %s" % s_.split(" ")[0],
+                "%d hits on %s%s from %d different clients that each hit it only a few times and tripped nothing else: "
+                "typical of legitimate requests matching the signature. Review it and add an exception for this URL if so." % (c_, h_, u_, d_))
+        if ml:
+            mu = collections.Counter("%s%s" % (host(r), url(r)) for r in ml).most_common(1)[0]
+            add("info", "ML anomaly detection: %d event(s)" % len(ml),
+                "Most on %s (%d). Anomalies on one URL often follow an application change: check the model of that "
+                "URL / parameter (relearn if the change is legitimate)." % mu)
+        if api:
+            au = collections.Counter("%s %s%s" % (g(r, "http_method").upper(), host(r), url(r)) for r in api).most_common(1)[0]
+            pr_ = ", ".join("%s ×%d" % x for x in prop_c.most_common(4))
+            agents = collections.Counter(g(r, "http_agent") for r in api if g(r, "http_agent")).most_common(1)
+            ag = agents[0][0][:60] if agents else ""
+            tool = bool(re.search(r"playwright|selenium|puppeteer|headless|postman|jmeter|k6|locust|curl|python", ag, re.I))
+            add("medium" if len(api) >= 20 and not tool else "info", "API protection: %d schema violation(s)" % len(api),
+                "Most on %s (%d)%s%s. %s" % (au[0], au[1], ". Properties: " + pr_ if pr_ else "",
+                                             ". Main client: '%s'" % ag if ag else "",
+                                             "The requests come from an automation / test tool, so the test payloads may not "
+                                             "match the API schema: fix the test data or relearn the schema if the API "
+                                             "changed." if tool else
+                                             "Many violations on one endpoint after a release usually mean the learned / "
+                                             "uploaded API schema is out of date; otherwise clients are sending malformed "
+                                             "or tampered bodies."))
+    for p in pr:
+        if "no web protection profile" in p.get("notes", ""):
+            add("high", "Server policy without protection: %s" % p["policy"],
+                "%s has no web protection profile, so its traffic is not inspected." % p["policy"])
+    ins.sort(key=lambda x: {"high": 0, "medium": 1, "info": 2}[x["severity"]])
+    out = {"ok": True, "status": 200, "request": "GET %s (+ configuration)" % used, "ms": 0,
+           "summary": ["%d attack(s) in the last %s%s: %d blocked (%.0f%%), %d logged only. %d insight(s)." % (
+               n, vals.get("range") or "24h", " on policy " + pol_want if pol_want else "", blocked,
+               100.0 * blocked / n if n else 0, n - blocked, len(ins))] + ([note] if note else []),
+           "data": {"kpi": {"attacks": n, "blocked": blocked, "alert_only": n - blocked,
+                            "blocked_pct": round(100.0 * blocked / n, 1) if n else None,
+                            "clients": len(ips), "hosts": len({host(r) for r in inrange} - {""}),
+                            "ml": len(ml), "api": len(api), "bot": len(bot),
+                            "high_threat": sum(1 for r in inrange if re.search(r"high|critical", g(r, "threat_level",
+                                                                                                   "severity_level"), re.I))},
+                    "range": vals.get("range") or "24h", "policy": pol_want, "policies_seen": pols_all,
+                    "series": series, "bucket": "%d min" % (step // 60) if step < 3600 else "%d h" % (step // 3600),
+                    "insights": ins,
+                    "by_category": cats, "by_action": top(inrange, lambda r: g(r, "action"), 8),
+                    "by_type": top(inrange, typ, 10), "by_owasp": top(inrange, lambda r: g(r, "owasp_top10"), 10),
+                    "by_owasp_api": top(inrange, lambda r: g(r, "owasp_api_top10"), 10),
+                    "by_ja4": top(inrange, lambda r: g(r, "ja4"), 8),
+                    "by_agent": top(inrange, lambda r: g(r, "http_agent")[:90], 8),
+                    "by_signature": top(inrange, sig, 10), "by_client": top(inrange, src, 10),
+                    "by_country": top(inrange, lambda r: g(r, "srccountry", "country", "src_country"), 10),
+                    "by_host": top(inrange, host, 10), "by_url": top(inrange, lambda r: (host(r) + url(r)) if url(r) else "", 10),
+                    "by_policy": top(inrange, lambda r: g(r, "policy"), 10),
+                    "by_method": top(inrange, lambda r: g(r, "http_method"), 8),
+                    "by_threat": top(inrange, lambda r: g(r, "threat_level", "severity_level"), 6),
+                    "ml": {"events": len(ml), "by_type": top(ml, sub, 8),
+                           "by_url": top(ml, lambda r: host(r) + url(r), 8),
+                           "by_parameter": top(ml, lambda r: g(r, "ml_arg_name", "parameter", "arg_name", "ml_svm_log_match_types"), 8)},
+                    "api": {"events": len(api), "by_type": top(api, sub, 8),
+                            "by_property": [{"name": a, "count": b, "pct": round(100.0 * b / max(1, len(api)), 1)}
+                                            for a, b in prop_c.most_common(10)],
+                            "by_owasp_api": top(api, lambda r: g(r, "owasp_api_top10"), 8),
+                            "by_endpoint": top(api, lambda r: ("%s %s%s" % (g(r, "http_method"), host(r), url(r))).strip(), 10)},
+                    "bot": {"events": len(bot), "by_type": top(bot, typ, 8), "by_client": top(bot, src, 8)},
+                    "config": dict(cfg, server_policies=[{k: p[k] for k in ("policy", "mode", "protection_profile",
+                                                                           "server_pool", "notes")} for p in pr]),
+                    "config_not_read": cfg_notes, "log_path": used, "log_note": note, "rows_read": len(raw),
+                    "time_parsed": len(tsv)}}
+    out["ms"] = int((time.time() - t0) * 1000)
+    audit(sess, "FortiWeb analytics (%s%s)" % (out["data"]["range"], ", policy " + pol_want if pol_want else ""))
+    FWB_STATS_CACHE[key] = (time.time(), out)
+    for k in [k for k, v in FWB_STATS_CACHE.items() if time.time() - v[0] > 300]:
+        FWB_STATS_CACHE.pop(k, None)
+    return out
+
+
+# -- FortiWeb ML based API protection (the GUI's own read API: API Protection > ML Based API Protection) --
+# .geturls = learned domains / URLs, .eventlog and .schemafile per domain_name + policy_name (seen on FortiWeb 8.0)
+FWB_MLAPI = "/api/v2.0/machine_learning/api_learning_policy."
+FWB_MLAPI_VIEWS = {"urls": "geturls", "rules": "get_policy_rules", "overview": "overview", "eventlog": "eventlog",
+                   "schema": "schemafile"}
+FWB_DOMAIN_RE = re.compile(r"^[A-Za-z0-9*][A-Za-z0-9.*_:-]{0,252}$")
+OA_METHODS = ("get", "post", "put", "patch", "delete", "head", "options", "trace")
+
+
+def yaml_scalar(s):
+    s = s.strip()
+    if s[:1] not in ("'", '"') and " #" in s:
+        s = s.split(" #", 1)[0].rstrip()
+    if len(s) >= 2 and s[0] == s[-1] == "'":
+        return s[1:-1].replace("''", "'")
+    if len(s) >= 2 and s[0] == s[-1] == '"':
+        try:
+            return json.loads(s)
+        except ValueError:
+            return s[1:-1]
+    if s in ("[]", "{}"):
+        return [] if s == "[]" else {}
+    if s.startswith("[") and s.endswith("]"):
+        return [yaml_scalar(x) for x in s[1:-1].split(",") if x.strip()]
+    low = s.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "~", ""):
+        return None
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        return float(s)
+    return s
+
+
+YAML_KEY_RE = re.compile(r"""^('(?:[^']|'')*'|"(?:[^"\\]|\\.)*"|[^'"\s][^:]*?|[^'"\s])\s*:(?:\s+(.*)|\s*)$""")
+
+
+def yaml_load(text):
+    """A small YAML reader for generated documents such as FortiWeb's learned OpenAPI schema (block mappings and
+    sequences, quoted / plain scalars, [] {} and simple flow lists, | > block text). Not a full YAML parser."""
+    lines = []
+    for raw in str(text).replace("\r", "").split("\n"):
+        st = raw.strip()
+        if not st or st.startswith("#") or st in ("---", "..."):
+            continue
+        lines.append([len(raw) - len(raw.lstrip(" ")), raw.strip()])
+
+    def key_of(c):
+        m = YAML_KEY_RE.match(c)
+        if not m or c.startswith("- ") or c == "-":
+            return None
+        k = m.group(1)
+        k = yaml_scalar(k) if k[:1] in ("'", '"') else k
+        return str(k), (m.group(2) or "")
+
+    def block(i, ind):
+        if i >= len(lines):
+            return None, i
+        c = lines[i][1]
+        return (seq if c == "-" or c.startswith("- ") else mapping)(i, ind)
+
+    def text_block(i, ind, style):
+        out = []
+        while i < len(lines) and lines[i][0] > ind:
+            out.append(lines[i][1])
+            i += 1
+        return ("\n" if style.startswith("|") else " ").join(out), i
+
+    def value(i, ind, rest):
+        rest = rest.strip()
+        if rest[:1] in ("|", ">"):
+            return text_block(i + 1, ind, rest)
+        if rest:
+            return yaml_scalar(rest), i + 1
+        if i + 1 < len(lines) and (lines[i + 1][0] > ind or (lines[i + 1][0] == ind and
+                                                              (lines[i + 1][1] == "-" or lines[i + 1][1].startswith("- ")))):
+            return block(i + 1, lines[i + 1][0])
+        return None, i + 1
+
+    def mapping(i, ind):
+        out = collections.OrderedDict()
+        while i < len(lines) and lines[i][0] == ind and not (lines[i][1] == "-" or lines[i][1].startswith("- ")):
+            kv = key_of(lines[i][1])
+            if not kv:
+                i += 1
+                continue
+            out[kv[0]], i = value(i, ind, kv[1])
+        return out, i
+
+    def seq(i, ind):
+        out = []
+        while i < len(lines) and lines[i][0] == ind and (lines[i][1] == "-" or lines[i][1].startswith("- ")):
+            item = lines[i][1][1:].strip()
+            if not item:
+                v, i = block(i + 1, lines[i + 1][0]) if i + 1 < len(lines) and lines[i + 1][0] > ind else (None, i + 1)
+            elif key_of(item):   # "- key: value" starts a mapping indented under the dash
+                lines[i] = [ind + len(lines[i][1]) - len(item), item]
+                v, i = mapping(i, lines[i][0])
+            else:
+                v, i = yaml_scalar(item), i + 1
+            out.append(v)
+        return out, i
+    if not lines:
+        return None
+    v, _ = block(0, lines[0][0])
+    return v
+
+
+def oa_text(x, depth=0):
+    """The schema text inside an answer: a YAML / JSON string with openapi / paths, wherever it sits."""
+    if depth > 6:
+        return None
+    if isinstance(x, str) and re.search(r"(^|\n)\s*[\"']?(openapi|swagger|paths)[\"']?\s*:", x):
+        return x
+    if isinstance(x, dict):
+        for v in x.values():
+            f = oa_text(v, depth + 1)
+            if f:
+                return f
+    if isinstance(x, list):
+        for v in x[:20]:
+            f = oa_text(v, depth + 1)
+            if f:
+                return f
+    return None
+
+
+def oa_schema_fields(sch, doc, prefix="", depth=0, required=(), out=None):
+    """Flatten a JSON schema into [{name, type, required}] (properties, items, oneOf / anyOf / allOf, $ref)."""
+    out = [] if out is None else out
+    if not isinstance(sch, dict) or depth > 5 or len(out) >= 80:
+        return out
+    if isinstance(sch.get("$ref"), str) and sch["$ref"].startswith("#/"):
+        tgt = doc
+        for part in sch["$ref"][2:].split("/"):
+            tgt = tgt.get(part) if isinstance(tgt, dict) else None
+        return oa_schema_fields(tgt, doc, prefix, depth + 1, required, out)
+    for comb in ("allOf",):
+        for s_ in sch.get(comb) or []:
+            oa_schema_fields(s_, doc, prefix, depth + 1, required, out)
+    props = sch.get("properties") if isinstance(sch.get("properties"), dict) else {}
+    req = set(sch.get("required") or []) if isinstance(sch.get("required"), list) else set()
+    for name, ps in props.items():
+        ps = ps if isinstance(ps, dict) else {}
+        alts = ps.get("oneOf") or ps.get("anyOf") or []
+        typ = " | ".join(str((a or {}).get("type") or "?") for a in alts if isinstance(a, dict)) if alts else \
+            str(ps.get("type") or ("object" if ps.get("properties") else "array" if ps.get("items") else ""))
+        if typ == "array" and isinstance(ps.get("items"), dict) and ps["items"].get("type"):
+            typ = "array of %s" % ps["items"]["type"]
+        out.append({"name": prefix + name, "type": typ, "required": name in req,
+                    "format": str(ps.get("format") or ps.get("pattern") or "")[:60]})
+        if isinstance(ps.get("properties"), dict):
+            oa_schema_fields(ps, doc, prefix + name + ".", depth + 1, (), out)
+        elif isinstance(ps.get("items"), dict):
+            oa_schema_fields(ps["items"], doc, prefix + name + "[].", depth + 1, (), out)
+        for a in alts:
+            if isinstance(a, dict) and isinstance(a.get("properties"), dict):
+                oa_schema_fields(a, doc, prefix + name + ".", depth + 1, (), out)
+    return out
+
+
+def oa_find(x, depth=0):
+    """The OpenAPI / Swagger document in an answer: a dict with "paths", maybe inside the results or as a JSON string."""
+    if depth > 6:
+        return None
+    if isinstance(x, str) and x.lstrip()[:1] in "{[" and '"paths"' in x:
+        try:
+            return oa_find(json.loads(x), depth + 1)
+        except ValueError:
+            return None
+    if isinstance(x, dict):
+        if isinstance(x.get("paths"), dict):
+            return x
+        for v in x.values():
+            f = oa_find(v, depth + 1)
+            if f:
+                return f
+    if isinstance(x, list):
+        for v in x[:50]:
+            f = oa_find(v, depth + 1)
+            if f:
+                return f
+    return None
+
+
+def oa_endpoints(doc):
+    """One row per path + method: parameters, request body fields (flattened schema), responses, url_id."""
+    rows = []
+    for path, ops in (doc.get("paths") or {}).items():
+        if not isinstance(ops, dict):
+            continue
+        common = ops.get("parameters") if isinstance(ops.get("parameters"), list) else []
+        for m, op in ops.items():
+            if str(m).lower() not in OA_METHODS or not isinstance(op, dict):
+                continue
+            ps = [p for p in common + (op.get("parameters") if isinstance(op.get("parameters"), list) else [])
+                  if isinstance(p, dict)]
+            params = [{"in": str(p.get("in") or "?"), "name": str(p.get("name") or "?"),
+                       "type": str((p.get("schema") or {}).get("type") or p.get("type") or "") if isinstance(p.get("schema") or {}, dict) else "",
+                       "required": bool(p.get("required"))} for p in ps if p.get("in") != "body"]
+            body = op.get("requestBody") if isinstance(op.get("requestBody"), dict) else {}
+            content = body.get("content") if isinstance(body.get("content"), dict) else {}
+            fields = []
+            for ct in content.values():
+                if isinstance(ct, dict):
+                    oa_schema_fields(ct.get("schema"), doc, out=fields)
+            for p in ps:   # Swagger 2: body parameter
+                if p.get("in") == "body":
+                    oa_schema_fields(p.get("schema"), doc, out=fields)
+            resp = op.get("responses") if isinstance(op.get("responses"), dict) else {}
+            responses = []
+            for code, rv in resp.items():
+                rv = rv if isinstance(rv, dict) else {}
+                rf = []
+                for ct in (rv.get("content") or {}).values() if isinstance(rv.get("content"), dict) else []:
+                    if isinstance(ct, dict):
+                        oa_schema_fields(ct.get("schema"), doc, out=rf)
+                responses.append({"code": str(code), "description": str(rv.get("description") or "")[:120],
+                                  "fields": rf[:40]})
+            prm = ["%s:%s%s%s" % (x["in"], x["name"], "(%s)" % x["type"] if x["type"] else "", "*" if x["required"] else "")
+                   for x in params]
+            rows.append({"method": str(m).upper(), "path": str(path),
+                         "url_id": op.get("url_id", ops.get("url_id", "")),
+                         "parameters": len(params), "parameter_list": ", ".join(prm)[:400],
+                         "body_fields": ", ".join(dict.fromkeys(f["name"] for f in fields))[:400],
+                         "body_types": ", ".join(content.keys()),
+                         "responses": ", ".join(sorted(r["code"] for r in responses))[:80],
+                         "detail": {"params": params, "body": fields[:80], "body_types": list(content.keys()),
+                                    "responses": responses, "summary": str(op.get("summary") or op.get("description") or "")[:200]}})
+    rows.sort(key=lambda r: (r["path"], OA_METHODS.index(r["method"].lower())))
+    return rows
+
+
+def fwb_ml_rules(rows):
+    """.get_policy_rules (FortiWeb 8.0): {"rules": [{"policy-name", "status", "rule": [{"domain-name",
+    "api-path-size", "api-learning-pattern-size"}]}]} -> one row per policy and domain."""
+    out = []
+    for p in rows:
+        subs = p.get("rule") if isinstance(p.get("rule"), list) else []
+        for r in [x for x in subs if isinstance(x, dict)] or [{}]:
+            out.append({"rule_id": r.get("id", ""), "policy": fx_val(p, "policy-name", "policy_name", "name"),
+                        "status": {1: "enable", 0: "disable", "1": "enable", "0": "disable"}.get(p.get("status"), p.get("status")),
+                        "domain": fx_val(r, "domain-name", "domain_name", "domain"),
+                        "api_paths": r.get("api-path-size", r.get("api_path_size", "")),
+                        "learning_patterns": r.get("api-learning-pattern-size", r.get("api_learning_pattern_size", ""))})
+    return out
+
+
+def fwb_ml_inventory(rows):
+    """Learned endpoints (.geturls?rule_id=, FortiWeb 8.0: id, url_id, path, method, status, zombie, excessive_data,
+    need_auth, category, dlp_category, action, severity, start_training_cnt) -> inventory + AppSec findings mapped to
+    the OWASP API Security Top 10 (2023)."""
+    clean = lambda xs: [str(x).strip().strip('"').strip() for x in (xs if isinstance(xs, list) else []) if str(x).strip('" ')]
+    flag = lambda v: str(v).strip().lower() in ("1", "true", "yes", "enable")
+    eps = []
+    for r in rows:
+        eps.append({"path": str(r.get("path") or r.get("url") or "url #%s" % r.get("url_id", r.get("id", "?"))),
+                    "method": str(r.get("method") or "").upper(), "status": str(r.get("status") or ""),
+                    "auth": "required" if flag(r.get("need_auth")) else "not required",
+                    "zombie": flag(r.get("zombie")), "excessive_data": flag(r.get("excessive_data")),
+                    "data": ", ".join(clean(r.get("category"))), "dlp": ", ".join(clean(r.get("dlp_category"))),
+                    "action": r.get("action", ""), "severity": r.get("severity", ""),
+                    "training_threshold": r.get("start_training_cnt", ""), "url_id": r.get("url_id", "")})
+    n = len(eps)
+    sens_rx = re.compile(r"person|address|card|credit|bank|iban|ssn|passport|national|phone|mail|birth|health|"
+                         r"password|token|secret|account|\bid\b", re.I)
+    ep = lambda e: "%s %s" % (e["method"], e["path"])
+    top = lambda c: [{"name": a, "count": b, "pct": round(100.0 * b / max(1, n), 1)} for a, b in c.most_common(12)]
+    zombies = [e for e in eps if e["zombie"]]
+    public_rx = re.compile(r"log.?in|log.?on|sign.?in|sign.?up|register|otp|forgot|reset.?pass|token|oauth|captcha", re.I)
+    noauth_all = [e for e in eps if e["auth"] == "not required" and (sens_rx.search(e["data"]) or e["dlp"])]
+    noauth_sens = [e for e in noauth_all if not public_rx.search(e["path"])]
+    expected_public = len(noauth_all) - len(noauth_sens)
+    excessive = [e for e in eps if e["excessive_data"]]
+    collecting = [e for e in eps if re.search(r"collect|sampl", e["status"], re.I)]
+    running = [e for e in eps if re.search(r"running", e["status"], re.I)]
+    sens_collect = [e for e in collecting if sens_rx.search(e["data"]) or e["dlp"]]
+    unsafe = [e for e in eps if e["method"] in ("DELETE", "PUT", "PATCH") and e["auth"] == "not required"]
+    lst = lambda es, k=6: "; ".join(ep(e) + (" [" + e["data"] + "]" if e["data"] else "") for e in es[:k]) + \
+        (" … and %d more" % (len(es) - k) if len(es) > k else "")
+    ins = []
+    if noauth_sens:
+        ins.append({"severity": "high", "owasp": "API2:2023 Broken Authentication",
+                    "title": "%d endpoint(s) carry sensitive data without requiring authentication" % len(noauth_sens),
+                    "detail": lst(noauth_sens) + ". Confirm these are meant to be public; otherwise enforce authentication "
+                              "(and keep the ML model in block mode on them)." + (
+                                  " (%d sign-in / registration / token endpoint(s) not counted: they are public by design.)"
+                                  % expected_public if expected_public else "")})
+    if unsafe:
+        ins.append({"severity": "high", "owasp": "API5:2023 Broken Function Level Authorization",
+                    "title": "%d state-changing endpoint(s) (PUT / PATCH / DELETE) without authentication" % len(unsafe),
+                    "detail": lst(unsafe) + "."})
+    if excessive:
+        ins.append({"severity": "high", "owasp": "API3:2023 Broken Object Property Level Authorization",
+                    "title": "%d endpoint(s) flagged for excessive data exposure" % len(excessive),
+                    "detail": lst(excessive) + ". The responses return more data than clients use: trim them server-side."})
+    if zombies:
+        ins.append({"severity": "medium" if len(zombies) < n else "info", "owasp": "API9:2023 Improper Inventory Management",
+                    "title": "%d of %d endpoints are zombie APIs (learned, no longer used)" % (len(zombies), n),
+                    "detail": ("Every learned endpoint is marked zombie: this domain gets no traffic now (see the overview); "
+                               "if the API was retired, remove the policy / routes." if len(zombies) == n else
+                               lst(zombies) + ". Unused endpoints that still answer widen the attack surface: decommission "
+                                              "or block them.")})
+    if sens_collect:
+        ins.append({"severity": "medium", "owasp": "",
+                    "title": "%d endpoint(s) with sensitive data are still collecting samples (no ML model yet)" % len(sens_collect),
+                    "detail": lst(sens_collect) + "."})
+    if collecting:
+        thr = next((e["training_threshold"] for e in collecting if e["training_threshold"] != ""), "")
+        ins.append({"severity": "info", "owasp": "",
+                    "title": "%d of %d endpoints still collecting samples%s" % (
+                        len(collecting), n, " (model starts after %s samples)" % thr if thr != "" else ""),
+                    "detail": "They are not protected by ML until the model runs."})
+    cats = collections.Counter(c for e in eps for c in (e["data"].split(", ") if e["data"] else []))
+    return {"kpi": {"endpoints": n, "running": len(running), "collecting": len(collecting), "zombie": len(zombies),
+                    "auth_required": sum(1 for e in eps if e["auth"] == "required"),
+                    "sensitive_no_auth": len(noauth_sens), "excessive_data": len(excessive),
+                    "with_data_categories": sum(1 for e in eps if e["data"])},
+            "by_status": top(collections.Counter(e["status"] or "?" for e in eps)),
+            "by_method": top(collections.Counter(e["method"] or "?" for e in eps)),
+            "by_auth": top(collections.Counter(e["auth"] for e in eps)),
+            "by_category": [{"name": a, "count": b, "pct": round(100.0 * b / max(1, n), 1)} for a, b in cats.most_common(12)],
+            "insights": ins, "endpoints": eps}
+
+
+def fwb_mlapi(sess, vals):
+    """ML based API protection: learned domains / URLs, the learned schema (endpoints, parameters) or the event log."""
+    t0 = time.time()
+    view = str(vals.get("view") or "urls")
+    if view not in FWB_MLAPI_VIEWS:
+        raise ValueError("view must be one of: " + ", ".join(FWB_MLAPI_VIEWS))
+    dom, pol = str(vals.get("domain") or "").strip(), str(vals.get("policy") or "").strip()
+    rid = str(vals.get("rule_id") if vals.get("rule_id") is not None else "").strip()
+    if rid and not re.fullmatch(r"\d{1,10}", rid):
+        raise ValueError("invalid rule id")
+    path = FWB_MLAPI + FWB_MLAPI_VIEWS[view]
+    if view == "urls" and rid:   # the learned URLs of one domain entry (rule id from the policy list)
+        path += "?rule_id=" + rid
+    if view not in ("urls", "rules"):
+        if not dom or not pol:
+            raise ValueError("pick a domain and a server policy (from the learned URLs list)")
+        if not FWB_DOMAIN_RE.match(dom) or not PARAM_RE.match(pol):
+            raise ValueError("invalid domain or policy name")
+        path += "?domain_name=%s&policy_name=%s" % (urllib.parse.quote(dom, safe=""), urllib.parse.quote(pol, safe=""))
+    if view == "overview":   # FortiWeb 8.0: summary_data, categories (epoch hours) + *_series [{name, data}], top10_* lists
+        d = fx_clean(fx_get(sess, path, 60))
+        d = d if isinstance(d, dict) else {}
+        kpis, tops, other, groups = [], collections.OrderedDict(), collections.OrderedDict(), collections.OrderedDict()
+        sd = d.get("summary_data") if isinstance(d.get("summary_data"), dict) else {}
+        for k, v in sd.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                kpis.append({"name": str(k), "value": v})
+        for k, v in d.items():   # other top-level numbers
+            if k != "summary_data" and isinstance(v, (int, float)) and not isinstance(v, bool):
+                kpis.append({"name": str(k), "value": v})
+        cats = d.get("categories") if isinstance(d.get("categories"), list) else []
+
+        def lab(c):
+            try:
+                x = float(c)
+                return time.strftime("%m-%d %H:%M", time.localtime(x / 1000 if x > 1e12 else x))
+            except (TypeError, ValueError):
+                return str(c)
+        labels = [lab(c) for c in cats]
+        for k, v in d.items():
+            if k.endswith("_series") and isinstance(v, list):
+                ser = collections.OrderedDict()
+                for s_ in v:
+                    if isinstance(s_, dict) and isinstance(s_.get("data"), list):
+                        vals = [x if isinstance(x, (int, float)) and not isinstance(x, bool) else None for x in s_["data"]]
+                        ls = labels if len(labels) == len(vals) else [str(i + 1) for i in range(len(vals))]
+                        ser[str(s_.get("name") or "series %d" % (len(ser) + 1))] = [[ls[i], vals[i]] for i in range(len(vals))]
+                groups[k] = {"title": {"event_series": "ML API protection events", "responsecode_series": "Responses"}.get(
+                    k, k.replace("_", " ").capitalize()), "series": ser,
+                    "totals": collections.OrderedDict((n, sum(x for _, x in p if x)) for n, p in ser.items())}
+            elif isinstance(v, list) and all(isinstance(i, dict) for i in v) and k != "categories":
+                # ranked list: label = first text field, value = first number field
+                rows = []
+                for i in v:
+                    lk = next((a for a, b in i.items() if isinstance(b, str) and b), None)
+                    nk = next((a for a, b in i.items() if isinstance(b, (int, float)) and not isinstance(b, bool)), None)
+                    if lk:
+                        rows.append({"name": i[lk], "count": i[nk] if nk else 1})
+                rows.sort(key=lambda r: -r["count"])
+                tot = sum(r["count"] for r in rows) or 1
+                for r in rows:
+                    r["pct"] = round(100.0 * r["count"] / tot, 1)
+                tops[k] = {"title": {"top10_endpoint": "Top endpoints", "top10_attacks": "Top attacks",
+                                     "top10_cats": "Data categories found in the API traffic"}.get(k, k.replace("_", " ").capitalize()),
+                           "rows": rows, "raw": v[:20]}
+            elif isinstance(v, (dict, list)) and k not in ("summary_data", "categories"):
+                other[k] = v
+        kv = lambda rx: next((k["value"] for k in kpis if re.search(rx, k["name"], re.I)), None)
+        total, run, coll, disc = kv(r"endpoint|total|url.?count|api.?count"), kv(r"running"), kv(r"collect|sampl"), kv(r"discard")
+        ins = []
+        if total and coll is not None and coll > 0.5 * total:
+            ins.append({"severity": "medium", "title": "Most endpoints are still collecting samples",
+                        "detail": "%s of %s endpoints (%.0f%%) have no model yet, so ML does not protect them; they need "
+                                  "more traffic, or a lower sample threshold in the API learning policy."
+                                  % (coll, total, 100.0 * coll / total)})
+        if disc:
+            ins.append({"severity": "medium", "title": "%s model(s) discarded" % disc,
+                        "detail": "Discarded models leave those endpoints without ML protection; check why (too few or "
+                                  "inconsistent samples) in the GUI."})
+        if total and run is not None:
+            ins.append({"severity": "info", "title": "%s of %s endpoints protected by a running model (%.0f%%)" % (
+                run, total, 100.0 * run / total), "detail": "%s still collecting samples." % coll if coll else ""})
+        ev = (groups.get("event_series") or {}).get("totals") or {}
+        rc = (groups.get("responsecode_series") or {}).get("totals") or {}
+        span = "%d h" % len(labels) if labels else "the period shown"
+        if groups and not any(sum(g["totals"].values()) for g in groups.values()):
+            ins.append({"severity": "info", "title": "No traffic recorded in the last %s" % span,
+                        "detail": "Every event and response counter is 0 for this domain: it received no requests through "
+                                  "this policy in that time (or the domain / policy is not in use). Models cannot learn "
+                                  "without traffic, so endpoints that are collecting samples stay unprotected."})
+        else:
+            al = sum(n for k, n in ev.items() if re.search(r"alert", k, re.I))
+            bl = sum(n for k, n in ev.items() if re.search(r"block|deny", k, re.I))
+            if al and not bl:
+                ins.append({"severity": "medium", "title": "ML API violations are only alerted, not blocked",
+                            "detail": "%d alert(s) and 0 blocks in the last %s: the API learning policy action is "
+                                      "alert-only, so violations reach the application." % (al, span)})
+            rtot = sum(rc.values())
+            r5 = sum(n for k, n in rc.items() if k.lstrip().startswith("5"))
+            r4 = sum(n for k, n in rc.items() if k.lstrip().startswith("4"))
+            if rtot and r5 > 0.05 * rtot:
+                ins.append({"severity": "medium", "title": "%.1f%% server errors (5XX)" % (100.0 * r5 / rtot),
+                            "detail": "%d of %d responses in the last %s were 5XX." % (r5, rtot, span)})
+            if rtot and r4 > 0.2 * rtot:
+                ins.append({"severity": "info", "title": "%.1f%% client errors (4XX)" % (100.0 * r4 / rtot),
+                            "detail": "%d of %d responses were 4XX: probing, broken clients or an API change." % (r4, rtot)})
+        sens = [r["name"] for r in (tops.get("top10_cats") or {}).get("rows", [])
+                if re.search(r"person|address|card|credit|bank|iban|ssn|passport|national|phone|mail|birth|health|"
+                             r"password|token|secret|account", str(r["name"]), re.I)]
+        if sens:
+            ins.append({"severity": "info", "title": "Sensitive data in this API: " + ", ".join(sens),
+                        "detail": "ML found these data categories in the parameters; make sure those endpoints have "
+                                  "running models, block (not alert) actions, and are covered by data leak prevention."})
+        audit(sess, "ML API overview %s / %s" % (dom, pol))
+        return {"ok": True, "status": 200, "request": "GET " + path, "ms": int((time.time() - t0) * 1000),
+                "summary": ["ML API overview of %s (policy %s): %s." % (dom, pol, ", ".join(
+                    "%s %s" % (k["name"].replace("_", " "), k["value"]) for k in kpis[:8]) or "no counts found")] +
+                           ["%s over %s: %s." % (g["title"], span, ", ".join("%s %s" % kv_ for kv_ in g["totals"].items()))
+                            for g in groups.values()],
+                "data": {"domain": dom, "policy": pol, "kpis": kpis, "groups": groups, "tops": tops, "lists": other,
+                         "insights": ins}}
+    if view == "schema":   # FortiWeb 8.0: YAML text (OpenAPI 3, "Automatically generated by APID"); JSON also read
+        st, ok, d = rest_get(sess, path, 60)
+        if st in (401, 403) or not ok:
+            raise FxError(st, "HTTP %s reading the learned schema%s" % (st, ": the admin profile needs read access to API "
+                                                                         "protection" if st in (401, 403) else ""))
+        body = fx_unwrap(d) if isinstance(d, dict) else d
+        doc, text, fmt = oa_find(body), None, "json"
+        if not doc:
+            text = oa_text(body)
+            if text:
+                try:
+                    doc = oa_find(yaml_load(text))
+                except (ValueError, IndexError, TypeError):
+                    doc = None
+                fmt = "yaml"
+        if not doc:
+            return {"ok": True, "status": st, "request": "GET " + path, "ms": int((time.time() - t0) * 1000),
+                    "summary": ["The learned schema could not be read as OpenAPI; shown as it is."],
+                    "data": {"schema_raw": d if isinstance(d, (dict, list)) else str(d)[:200000]}}
+        if text is None:
+            text = json.dumps(doc, indent=2, ensure_ascii=False)
+        eps = oa_endpoints(doc)
+        flags = {}
+        if rid:   # join the inventory (status, authentication, zombie, data categories) by url_id
+            try:
+                ud = fwb_mlapi(sess, {"view": "urls", "rule_id": rid}).get("data", {})
+                iv, raw_rows = ud.get("inventory") or {}, ud.get("urls") or []
+                ids = [r.get("url_id") for r in raw_rows]
+                for uid, e_ in zip(ids, iv.get("endpoints") or []):
+                    flags[str(uid)] = {k: e_[k] for k in ("status", "auth", "zombie", "excessive_data", "data", "dlp")}
+            except (ValueError, urllib.error.URLError, OSError):
+                flags = {}
+        for e_ in eps:
+            if str(e_.get("url_id")) in flags:
+                e_["flags"] = flags[str(e_["url_id"])]
+        meth = collections.Counter(e_["method"] for e_ in eps)
+        info = doc.get("info") if isinstance(doc.get("info"), dict) else {}
+        audit(sess, "ML API schema %s / %s" % (dom, pol))
+        return {"ok": True, "status": st, "request": "GET " + path, "ms": int((time.time() - t0) * 1000),
+                "summary": ["Learned schema of %s (policy %s): %d endpoint(s) on %d path(s); %s." % (
+                    dom, pol, len(eps), len({e_["path"] for e_ in eps}), ", ".join("%s %d" % x for x in meth.most_common()))],
+                "data": {"domain": dom, "policy": pol, "openapi": str(doc.get("openapi") or doc.get("swagger") or ""),
+                         "title": str(info.get("title") or ""), "description": str(info.get("description") or "")[:300],
+                         "version": str(info.get("version") or ""), "format": fmt, "text": text[:400000],
+                         "by_method": [{"name": k, "count": v, "pct": round(100.0 * v / max(1, len(eps)), 1)}
+                                       for k, v in meth.most_common()],
+                         "endpoints": eps}}
+    d = fx_get(sess, path, 60)
+    rows = [fx_clean(r) for r in fx_rows(d)]
+    if view == "rules" and any(isinstance(r.get("rule"), list) for r in rows):
+        rows = fwb_ml_rules(rows)
+    audit(sess, "ML API %s%s" % (view, " %s / %s" % (dom, pol) if dom else ""))
+    out = {"ok": True, "status": 200, "request": "GET " + path, "ms": int((time.time() - t0) * 1000),
+           "summary": ["%d %s%s." % (len(rows), {"urls": "learned URL / domain row(s)", "rules": "API learning policy / rule "
+                                                                                                    "row(s)"}.get(view, "event(s)"),
+                                     " for %s (policy %s)" % (dom, pol) if dom else "")],
+           "data": {{"urls": "urls", "rules": "policies"}.get(view, "events"): rows}}
+    if view == "urls" and rows and any("method" in r and ("status" in r or "need_auth" in r) for r in rows):
+        out["data"]["inventory"] = fwb_ml_inventory(rows)
+        iv = out["data"]["inventory"]
+        out["summary"] = ["%d learned endpoint(s): %d with a running model, %d collecting samples, %d zombie, %d need "
+                          "authentication; %d AppSec finding(s)." % (iv["kpi"]["endpoints"], iv["kpi"]["running"],
+                                                                      iv["kpi"]["collecting"], iv["kpi"]["zombie"],
+                                                                      iv["kpi"]["auth_required"], len(iv["insights"]))]
+        return out
+    if view in ("urls", "rules"):   # domain + policy pairs for the picker, whatever the field names are
+        pairs = collections.OrderedDict()
+        for r in rows:
+            dk = next((k for k in r if "domain" in k.lower() and isinstance(r[k], str) and r[k]), None)
+            pk = next((k for k in r if "policy" in k.lower() and "id" not in k.lower() and isinstance(r[k], str) and r[k]), None)
+            if dk:
+                pairs.setdefault((r[dk], r[pk] if pk else ""), (r.get("api_paths", ""), r.get("rule_id", "")))
+        out["data"]["domains"] = [dict({"domain": a, "policy": b}, **({"paths": n} if n != "" else {}),
+                                       **({"rule_id": i} if i != "" else {})) for (a, b), (n, i) in pairs.items()]
+    return out
+
+
+def do_fwb_ml(b):
+    sess = SESSIONS.get(b.get("id"))
+    if not sess or sess.get("vendor") != "fortiweb":
+        return {"ok": False, "error": "the FortiWeb is no longer connected"}
+    try:
+        return fwb_mlapi(sess, {"view": b.get("view"), "domain": b.get("domain"), "policy": b.get("policy"),
+                                "rule_id": b.get("rule_id")})
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+
+
+def do_fwb_stats(b):
+    sess = SESSIONS.get(b.get("id"))
+    if not sess or sess.get("vendor") != "fortiweb":
+        return {"ok": False, "error": "the FortiWeb is no longer connected"}
+    try:
+        r = str(b.get("range") or "24h")
+        if r not in ("1h", "6h", "24h", "3d", "7d"):
+            raise ValueError("invalid time range")
+        pol = str(b.get("policy") or "").strip()
+        if pol and not PARAM_RE.match(pol):
+            raise ValueError("invalid policy name")
+        return fwb_stats(sess, {"range": r, "policy": pol, "_fresh": bool(b.get("fresh"))})
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+
+
+# -- FortiADC --
+FAD = "/api/"
+
+
+def fad_vs(sess, vals):
+    """Virtual servers with their pool, members (real server address : port, status) and content routing."""
+    t0, term = time.time(), vals.get("filter") or ""
+    vss, used = fx_first(sess, [FAD + "load_balance_virtual_server"])
+    vss = fx_rows(vss)
+    try:
+        reals = {fx_name(r): r for r in fx_rows(fx_get(sess, FAD + "load_balance_real_server"))}
+    except FxError:
+        reals = {}
+    pools = sorted({fx_val(v, "pool") for v in vss} - {""})
+    mem = fx_subrows(sess, FAD + "load_balance_pool_child_pool_member?pkey=", pools)
+    rows = []
+    for v in vss:
+        pool = fx_val(v, "pool")
+        members = []
+        for m in mem.get(pool) or []:
+            rs = fx_val(m, "real_server_id", "real-server", "real_server", "real_server_name")
+            addr = fx_val(reals.get(rs) or {}, "address", "ip", "address6") or rs
+            members.append("%s%s%s" % (addr, ":" + fx_val(m, "port") if fx_val(m, "port") else "",
+                                       " (%s)" % fx_val(m, "status") if fx_val(m, "status") not in ("", "enable") else ""))
+        r = {"virtual_server": fx_name(v), "status": fx_val(v, "status") or "enable", "type": fx_val(v, "type"),
+             "address": fx_val(v, "address", "ip", "address6"), "port": fx_val(v, "port"),
+             "profile": fx_val(v, "profile"), "pool": pool, "members": ", ".join(members) if pool in mem else
+             ("(could not read)" if pool else ""), "content_routing": fx_val(v, "content_routing_list", "content-routing-list",
+                                                                            "content_routing"),
+             "scripts": fx_val(v, "scripting_list", "scripting-list", "script", "scripting"),
+             "waf_profile": fx_val(v, "waf_profile", "waf-profile"), "ssl_profile": fx_val(v, "client_ssl_profile",
+                                                                                      "client-ssl-profile")}
+        if fx_match(r, term):
+            rows.append(r)
+    return fx_done(sess, used, {"virtual_servers": rows},
+                   ["%d virtual server(s)%s." % (len(rows), " matching '%s'" % term if term else "")], t0)
+
+
+# -- both: where is an IP / hostname / name used in the configuration --
+FX_FIND = {"fortiweb": [("server policy", FWB + "server-policy/policy", None),
+                        ("virtual server", FWB + "server-policy/vserver", FWB + "server-policy/vserver/vip-list?mkey="),
+                        ("virtual IP", FWB + "system/vip", None),
+                        ("server pool", FWB + "server-policy/server-pool", FWB + "server-policy/server-pool/pserver-list?mkey="),
+                        ("protected hostnames", FWB + "server-policy/allow-hosts", FWB + "server-policy/allow-hosts/host-list?mkey="),
+                        ("URL rewriting", FWB + "waf/url-rewrite.url-rewrite-rule", None),
+                        ("IP list", FWB + "waf/ip-list", FWB + "waf/ip-list/members?mkey=")],
+           "fortiadc": [("virtual server", FAD + "load_balance_virtual_server", None),
+                        ("real server", FAD + "load_balance_real_server", None),
+                        ("pool", FAD + "load_balance_pool", FAD + "load_balance_pool_child_pool_member?pkey="),
+                        ("content routing", FAD + "load_balance_content_routing",
+                         FAD + "load_balance_content_routing_child_match_condition?pkey="),
+                        ("content rewriting", FAD + "load_balance_content_rewriting", None),
+                        ("health check", FAD + "system_health_check", None)]}
+
+
+def fx_find(sess, vals):
+    """Every configuration object (and sub-entry) whose values contain the term, with the matching fields."""
+    t0, term = time.time(), (vals.get("term") or "").strip().lower()
+
+    def hits(r, path=""):
+        out = []
+        if isinstance(r, dict):
+            for k, v in r.items():
+                out += hits(v, "%s.%s" % (path, k) if path else str(k))
+        elif isinstance(r, list):
+            for i, v in enumerate(r):
+                out += hits(v, path)
+        elif term in str(r).lower():
+            out.append("%s = %s" % (path, r))
+        return out
+    rows, notes = [], []
+
+    def table(item):
+        what, base, sub = item
+        try:
+            objs = [fx_clean(r) for r in fx_rows(fx_get(sess, base))]
+        except (FxError, urllib.error.URLError, OSError) as e:
+            return [], "%s: not read (%s)" % (what, str(getattr(e, "reason", e))[:80])
+        found = [{"type": what, "object": fx_name(o), "matches": "; ".join(hits(o)[:6])} for o in objs if hits(o)]
+        if sub:
+            for n, kids in fx_subrows(sess, sub, [fx_name(o) for o in objs if fx_name(o)]).items():
+                for k in kids or []:
+                    h = hits(fx_clean(k))
+                    if h:
+                        found.append({"type": what + " entry", "object": "%s / %s" % (n, fx_name(k) or "?"),
+                                      "matches": "; ".join(h[:6])})
+        return found, None
+    with concurrent.futures.ThreadPoolExecutor(4) as ex:
+        for found, note in ex.map(table, FX_FIND[sess["vendor"]]):
+            rows += found
+            if note:
+                notes.append(note)
+    return {"ok": True, "status": 200, "request": "search the %s configuration for '%s'" % (FX_VNAME[sess["vendor"]], term),
+            "data": {"found": rows, "not_read": notes},
+            "summary": ["'%s' is used in %d object(s) / entr%s." % (term, len(rows), "y" if len(rows) == 1 else "ies")] +
+                       (["Not read on this firmware: " + "; ".join(notes)] if notes else []),
+            "ms": int((time.time() - t0) * 1000)}
+
+
+def fx_status(sess):
+    """System status for connect: proves the login and names the unit."""
+    paths = {"fortiweb": ["/api/v2.0/system/status.systemstatus", "/api/v2.0/system/status",
+                          "/api/v2.0/cmdb/system/global"],
+             "fortiadc": ["/api/platform/info", "/api/system_status", "/api/system_global"]}[sess["vendor"]]
+    d, _ = fx_first(sess, paths)
+    return d if isinstance(d, dict) else (d[0] if isinstance(d, list) and d and isinstance(d[0], dict) else {})
+
+
+def fx_raw(sess, q):
+    v = sess["vendor"]
+    if not q.startswith(FX_PREFIX[v]) or ".." in q or "\n" in q or "\r" in q or len(q) > 1000:
+        return {"ok": False, "error": "a GET path starting with " + FX_PREFIX[v][0] + ", e.g. " + (
+            "/api/v2.0/cmdb/server-policy/policy" if v == "fortiweb" else "/api/load_balance_virtual_server")}
+    t0 = time.time()
+    try:
+        d = fx_get(sess, q)
+    except FxError as e:
+        return {"ok": False, "status": e.status, "error": str(e), "request": "GET " + q}
+    return {"ok": True, "status": 200, "request": "GET " + q, "data": fx_clean(d), "ms": int((time.time() - t0) * 1000)}
+
+
 PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_routes, "pan_sessions": pan_sessions,
                 "pan_resources": pan_resources, "fg_resources": fg_resources,
                 "f5_perf": f5_perf, "f5_vs_top": f5_vs_top, "pan_app_traffic": pan_app_traffic,
                 "pan_snat": pan_snat, "fg_snat": fg_snat, "f5_snat": f5_snat_lookup, "f5_conns": f5_conns,
-                "f5_irules": f5_irules}
+                "f5_irules": f5_irules, "adv_config": lambda s_, v_: adv_config(s_, v_),
+                "sw_overview": sw_overview, "sw_alerts": sw_alerts, "sw_nodes": sw_nodes, "sw_node_issues": sw_node_issues,
+                "sw_node": sw_node, "sw_iface_issues": sw_iface_issues, "sw_iface_top": sw_iface_top,
+                "fx_generic": fx_generic, "fwb_policies": fwb_policies, "fwb_attacks": fwb_attacks, "fad_vs": fad_vs,
+                "fwb_stats": fwb_stats, "fwb_mlapi": fwb_mlapi,
+                "fx_find": fx_find}
 
 
 def do_ipcheck(b):
@@ -10484,7 +12378,7 @@ def do_cf(b):
 # ---- Local LLM assistant: explain the current output, chat about it, or let the model run read-only checks --------
 # Talks to an OpenAI-compatible chat API (Ollama, LM Studio, llama.cpp server, vLLM). Settings live in memory only.
 # Sent only to this PC or an approved host (LLM_APPROVED); secrets are masked and large output trimmed before sending.
-LLM_CFG = {"url": "http://127.0.0.1:11434/v1", "model": "", "key": "", "budget": 24000}
+LLM_CFG = {"url": "http://127.0.0.1:11434/v1", "model": "", "key": "", "budget": 60000}
 LLM_LOCAL = ("127.0.0.1", "localhost", "::1")
 # The only model servers device data may be sent to, besides this PC: exact host names, no wildcards, one per line in
 # llm_approved.txt next to this script (not in git: lines starting with # are comments). Any other address is refused,
@@ -10504,9 +12398,18 @@ LLM_SECRET_KEY = re.compile(r"(passw|passphrase|secret|token|api[_-]?key|apikey|
 LLM_PEM = re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?(-----END [A-Z0-9 ]+-----|$)", re.S)
 LLM_HASH = re.compile(r"\$(1|2[abxy]?|5|6|y|sha512|md5)\$[^\s\"',;]{8,}")
 LLM_BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{16,}")
+# secrets written in code: TCL 'set api_key "..."' and HTTP::header / cookie insert|replace of an auth / key header
+LLM_CODE_SECRET = re.compile(r'(?i)(\bset\s+[\w:]*(?:passw|secret|token|api_?key|apikey|psk|credential|private_?key)[\w:]*\s+)'
+                             r'("[^"\n]*"|\{[^}\n]*\}|[^\s;\]]+)')
+# ... and Lua / JavaScript style: local api_key = "...", password: '...'
+LLM_ASSIGN_SECRET = re.compile(r'(?i)(\b[\w.]*(?:passw|secret|token|api_?key|apikey|psk|credential|private_?key)[\w.]*'
+                               r'["\']?\s*(?:=|:)\s*)("[^"\n]*"|\'[^\'\n]*\')')
+LLM_HDR_SECRET = re.compile(r'(?i)(\b(?:header|cookie)\s+(?:insert|replace)\s+"?[\w-]*(?:auth|token|api-?key|secret|passw)'
+                            r'[\w-]*"?\s+)("[^"\n]*"|\{[^}\n]*\}|[^\s;\]]+)')
 LLM_SYSTEM = (
     "You are a network-security troubleshooting assistant inside ITSec Ops, a read-only console for F5 BIG-IP, "
-    "Palo Alto PAN-OS, FortiGate and Cloudflare. Answer only from the data you are given or that tools return, and quote "
+    "Palo Alto PAN-OS, FortiGate, FortiWeb (WAF), FortiADC (ADC / load balancer), Cloudflare and SolarWinds "
+    "monitoring. Answer only from the data you are given or that tools return, and quote "
     "the values that matter (IPs, rule / policy names, times, percentages, counts). If the data does not show something, "
     "say so and name the check that would show it. Start with the conclusion, then the evidence, then next steps; keep it "
     "short and use plain markdown (short paragraphs, '-' bullets, **bold**, `code`). Never invent device output. Data may "
@@ -10599,6 +12502,9 @@ def llm_redact(x, depth=0):
     if isinstance(x, str):
         x = LLM_PEM.sub("[redacted PEM block]", x)
         x = LLM_HASH.sub("[redacted hash]", x)
+        x = LLM_CODE_SECRET.sub(r'\1"[redacted]"', x)
+        x = LLM_HDR_SECRET.sub(r'\1"[redacted]"', x)
+        x = LLM_ASSIGN_SECRET.sub(r'\1"[redacted]"', x)
         return LLM_BEARER.sub(r"\1 [redacted]", x)
     return x
 
@@ -10726,7 +12632,7 @@ def llm_chat_ollama(messages, tools, est):
     """Ollama's own /api/chat: unlike its /v1 API it takes num_ctx, so the input is not cut to the default
     2k-4k token window (which made answers ignore the output)."""
     # A few fixed sizes: every change of num_ctx makes Ollama reload the model, which costs minutes on a laptop.
-    ctx = next((c for c in (8192, 16384, 32768) if est + 2048 <= c), 32768)
+    ctx = next((c for c in (8192, 16384, 32768, 65536) if est + 2048 <= c), 65536)
     nm = []
     for m in messages:
         m = dict(m)
@@ -10864,8 +12770,13 @@ def llm_chat(messages, tools=None, max_tokens=None):
 # Agent tools: only the console's own read-only lookups, on every connected device (tool names start with the vendor:
 # pa_, fg_, f5_, cf_; a 'device' field picks one when several of a vendor are connected). Active tools (tcpdump,
 # file download, backups, packet capture, F5 shell) are never offered.
-LLM_PFX = {"paloalto": "pa", "fortigate": "fg", "f5": "f5", "cloudflare": "cf"}
-LLM_VNAME = {"paloalto": "Palo Alto", "fortigate": "FortiGate", "f5": "F5 BIG-IP", "cloudflare": "Cloudflare"}
+LLM_PFX = {"paloalto": "pa", "fortigate": "fg", "f5": "f5", "cloudflare": "cf", "solarwinds": "sw", "fortiweb": "fwb",
+           "fortiadc": "fad"}
+LLM_VNAME = {"paloalto": "Palo Alto", "fortigate": "FortiGate", "f5": "F5 BIG-IP", "cloudflare": "Cloudflare",
+             "solarwinds": "SolarWinds (network monitoring: node / interface health and alerts)",
+             "fortiweb": "FortiWeb (WAF: server policies, protected hostnames, server pools, protection profiles, "
+                         "attack log)",
+             "fortiadc": "FortiADC (load balancer: virtual servers, pools, real servers, content routing, Lua scripts)"}
 
 
 def llm_devices():
@@ -10885,8 +12796,9 @@ def llm_tools():
     S = lambda d, **k: dict({"type": "string", "description": d}, **k)
     if not devs:
         return tools
-    conn = ["%s (%s)" % (l, s["vendor"]) for l, (_, s) in devs.items()]
-    tool("flow_trace", "Follow ONE flow hop by hop through the connected devices it actually crosses (%s), found from "
+    conn = ["%s (%s)" % (l, s["vendor"]) for l, (_, s) in devs.items() if s["vendor"] in FLOW_STAGE]
+    if conn:
+        tool("flow_trace", "Follow ONE flow hop by hop through the connected devices it actually crosses (%s), found from "
          "their routes, VIPs and virtual servers; devices not on the path are only listed. Checks Cloudflare DNS + WAF "
          "events, FortiGate policy + VIP mapping, F5 virtual server / pool "
          "members / SNAT (+ WAF log), Palo Alto policy for F5 SNAT -> pool member (+ traffic logs); a public IP that "
@@ -10910,7 +12822,16 @@ def llm_tools():
                                                                           "leave it empty and say so)"),
               "proto": S("tcp, udp or icmp (default tcp)"),
               "device": S("only this firewall; empty = all connected firewalls", enum=fws)}, ["src", "dst"])
-    for v in ("paloalto", "fortigate", "f5", "cloudflare"):
+    if any(s["vendor"] in DASH_VENDORS for _, s in devs.values()):
+        tool("dashboard", "Snapshot of the operations dashboard from its last refresh (usually minutes old; the time is "
+             "in the result): every connected firewall / F5 with health, HA state and sync, CPU / memory / sessions, "
+             "interfaces down, SolarWinds' view of it; F5s / firewalls SolarWinds monitors but the console is not "
+             "connected to; and per Orion server: nodes up %, nodes / interfaces down, active alerts, busiest interfaces, "
+             "highest CPU, slowest nodes and 24-hour trends. Use it FIRST for overall health questions ('what needs "
+             "attention', 'is anything down', 'which firewall is busiest', 'how was the last 24 h'), then run live "
+             "checks for details.",
+             {"device": S("optional: only devices whose name or IP contains this (Orion summaries are always included)")})
+    for v in ("paloalto", "fortigate", "f5", "cloudflare", "solarwinds", "fortiweb", "fortiadc"):
         labels = [l for l, (_, s) in devs.items() if s["vendor"] == v]
         if not labels:
             continue
@@ -10948,6 +12869,9 @@ def llm_tools():
         if v == "f5":
             vt("ip_lookup", "where an IP appears on the BIG-IP: pools, nodes, virtual servers, data groups, policies.",
                {"ip": S("IP address")}, ["ip"])
+            vt("irule_code", "read the full code of one iRule (numbered lines), to explain or review it or to see how "
+               "it handles a request. Get the name from the hostname / IP lookup or the iRules check.",
+               {"name": S("iRule name, e.g. /Common/my_rule or my_rule")}, ["name"])
             vt("hostname_lookup", "which virtual servers / policies / iRules handle a hostname.",
                {"hostname": S("host name")}, ["hostname"])
             vt("waf_log_search", "search the ASM / WAF request log by client IP, support ID, hostname, URL or status.",
@@ -10969,6 +12893,12 @@ def llm_run_tool(name, a):
     a = a if isinstance(a, dict) else {}
     s = lambda k: str(a.get(k) or "").strip()
     devs = llm_devices()
+    if name == "dashboard":
+        dash_ensure()
+        for _, d in devs.values():
+            if d["vendor"] in DASH_VENDORS:
+                audit(d, "LLM agent read the dashboard snapshot")
+        return dash_snapshot(s("device"))
     if name in ("flow_trace", "policy_check"):
         for _, d in devs.values():
             audit(d, "LLM agent ran " + llm_label(name, a))
@@ -11010,6 +12940,8 @@ def llm_run_tool(name, a):
         b = {"id": sid, "period": s("period") or "last-hour", "sort": "bytes", "scan": "5000",
              "filters": {k: str(x) for k, x in f.items() if x not in (None, "")}}
         return fg_auto_logs(do_acc, b) if v == "fortigate" else do_acc(b)
+    if name == "irule_code" and v == "f5":
+        return llm_irule(sid, s("name"))
     if name == "hostname_lookup" and v == "f5":
         return do_f5_host({"id": sid, "hostname": s("hostname")})
     if name == "waf_log_search" and v == "f5":
@@ -11078,7 +13010,7 @@ def do_llm_config(b):
         if model and not re.match(r"^[\w.:/@+-]{1,128}$", model):
             raise ValueError("invalid model name")
         LLM_CFG.update(url=url, model=model,
-                       budget=num(b.get("budget"), 4000, 400000, 24000, "context budget"))
+                       budget=num(b.get("budget"), 4000, 400000, 60000, "context budget"))
         if b.get("key") is not None and str(b.get("key")) != "":
             LLM_CFG["key"] = str(b["key"]).strip()
         if b.get("clear_key"):
@@ -11167,6 +13099,39 @@ def do_llm_chat(b):
                                                          for l, (_, d) in alldev.items())
     msgs, trimmed, sent = [{"role": "system", "content": sysmsg}], False, ""
     ctx = b.get("context")
+    if b.get("source") == "fwbstats":   # asked from the FortiWeb analytics view: its statistics (cached up to 60 s)
+        src_ = b.get("src") if isinstance(b.get("src"), dict) else {}
+        r_ = do_fwb_stats({"id": src_.get("id"), "range": src_.get("range"), "policy": src_.get("policy")})
+        if not r_.get("ok"):
+            raise ValueError(r_.get("error") or "could not read the FortiWeb statistics")
+        ctx = r_
+        if src_.get("ml_domain") and src_.get("ml_policy"):
+            ml_ = {}
+            for v_ in ("overview", "urls", "schema", "eventlog"):
+                if v_ == "urls" and not str(src_.get("ml_rule_id") or "").isdigit():
+                    continue
+                try:
+                    x_ = fwb_mlapi(SESSIONS[src_["id"]], {"view": v_, "domain": src_["ml_domain"], "policy": src_["ml_policy"],
+                                                         "rule_id": src_.get("ml_rule_id") if v_ in ("urls", "schema") else None})
+                    ml_[v_] = {"summary": x_.get("summary"),
+                               "data": {k: v for k, v in (x_.get("data") or {}).items() if k != "text"}}
+                except (ValueError, KeyError, urllib.error.URLError, OSError) as e_:
+                    ml_[v_] = {"error": str(e_)}
+            ctx = dict(r_, data=dict(r_["data"], ml_api_protection=dict(ml_, domain=src_["ml_domain"], policy=src_["ml_policy"])))
+        b = dict(b, label="FortiWeb security statistics, last %s%s" % (r_["data"]["range"], ", policy " + r_["data"]["policy"]
+                                                                        if r_["data"]["policy"] else ""),
+                 device=str(src_.get("name") or ""), time=time.strftime("%Y-%m-%d %H:%M:%S"))
+    if b.get("source") == "irule":   # asked from the iRule pop-up: the iRule's code, read fresh from the F5
+        ctx = llm_irule(b.get("irule_id"), str(b.get("irule_name") or ""))
+        b = dict(b, label=ctx["request"], device=ctx["data"]["device"], time=time.strftime("%Y-%m-%d %H:%M:%S"))
+    if b.get("source") == "dashboard":   # asked from the dashboard: its current snapshot is the output to answer from
+        dash_ensure()
+        ctx = dash_snapshot()
+        b = dict(b, label="Operations dashboard (all devices; SolarWinds if connected)", device="",
+                 time=(DASH["last"] or "")[:40])
+        for _, d in alldev.values():
+            if d["vendor"] in DASH_VENDORS:
+                audit(d, "LLM %s read the dashboard snapshot" % mode)
     if isinstance(ctx, dict) and (ctx.get("data") is not None or ctx.get("summary") or ctx.get("error")):
         txt, trimmed = llm_pack(ctx, budget if mode != "agent" else budget // 2)
         sent = txt
@@ -11205,7 +13170,9 @@ def do_llm_chat(b):
         tools, answer, seen = llm_tools(), "", set()
         msgs[0]["content"] += ("\nYou can run read-only checks on ALL the connected devices listed above with the tools, "
                                "whichever device is selected. Tool names start with the device type: pa_ = Palo Alto, "
-                               "fg_ = FortiGate, f5_ = F5 BIG-IP, cf_ = Cloudflare; pick the device with the 'device' "
+                               "fg_ = FortiGate, f5_ = F5 BIG-IP, cf_ = Cloudflare, sw_ = SolarWinds, fwb_ = FortiWeb (WAF), "
+                               "fad_ = FortiADC (load balancer); the 'dashboard' "
+                               "tool gives the latest overall health of everything at once. Pick the device with the 'device' "
                                "field when several of a type are connected. Decide which devices and checks the question "
                                "needs, combine them across devices when needed (e.g. Cloudflare event -> F5 WAF log -> "
                                "firewall log for the same IP), and run only what you need (at most 8 calls; several "
@@ -11252,7 +13219,10 @@ def do_llm_chat(b):
                                   "verdict": (res.get("verdict") or {}).get("label", "") if isinstance(res.get("verdict"), dict) else "",
                                   "error": res.get("error", ""),
                                   "result": res if len(json.dumps(res, default=str)) < 3000000 else None})
-                txt, tr = llm_pack(res, max(3000, budget // 4))
+                # each result gets a quarter of the budget, and all results together at most twice the budget, so
+                # 8 large results cannot overflow the model's context window
+                room = budget * 2 - sum(len(x) for x in seen_txt)
+                txt, tr = llm_pack(res, max(3000, min(budget // 4, room)))
                 seen_txt.append(txt)
                 trimmed = trimmed or tr
                 msgs.append({"role": "tool", "tool_call_id": c.get("id") or name, "name": name, "content": txt})
@@ -11448,7 +13418,7 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/api/connect": do_connect, "/api/run": do_run, "/api/ssh": do_ssh, "/api/term/open": do_term_open, "/api/term/read": do_term_read,
                   "/api/term/write": do_term_write, "/api/term/resize": do_term_resize, "/api/term/close": do_term_close,
                   "/api/raw": do_raw, "/api/disconnect": do_disconnect, "/api/vault": do_vault,
-                  "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/natmap": do_nat_map, "/api/vipmap": do_vip_map, "/api/f5host": do_f5_host, "/api/f5irule": do_f5_irule, "/api/f5logs": do_f5_logs,
+                  "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/natmap": do_nat_map, "/api/vipmap": do_vip_map, "/api/f5host": do_f5_host, "/api/f5irule": do_f5_irule, "/api/fwbstats": do_fwb_stats, "/api/fwbml": do_fwb_ml, "/api/f5logs": do_f5_logs,
                   "/api/f5capture": do_f5_capture, "/api/f5file": do_f5_file, "/api/policy": do_policy_search, "/api/profile/save": do_profile_save,
                   "/api/profile/delete": do_profile_delete, 
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
@@ -11539,7 +13509,7 @@ border:1px solid transparent;cursor:pointer}
 .dev.sel{border-color:var(--violet);background:var(--panel2);box-shadow:0 0 14px #7C6CFF33}
 .tag{font-size:11px;padding:1px 7px;border-radius:99px;margin-left:6px}
 .f5{background:#FF7A5922;color:var(--coral)}.paloalto{background:#2EE6C522;color:var(--mint)}
-.fortigate{background:#7C6CFF33;color:#b3a9ff}.cloudflare{background:#F3802022;color:#F38020}
+.fortigate{background:#7C6CFF33;color:#b3a9ff}.cloudflare{background:#F3802022;color:#F38020}.solarwinds{background:#3DA5F433;color:#5cb8ff}.fortiweb{background:#E5484D26;color:#ff8a8d}.fortiadc{background:#12A59426;color:#3fd1bd}
 .grp{margin:12px 0 4px;color:var(--mint);font-size:12px;letter-spacing:.1em;text-transform:uppercase}
 .chkrow{display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px dashed #2a285088;flex-wrap:wrap}
 .chkrow .lbl{flex:1 1 220px}
@@ -11610,7 +13580,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #aicard.full{left:16px;right:16px;top:16px;bottom:16px;width:auto;height:auto;z-index:90}
 #aicard.full .aihead{cursor:default}#aicard .aititle{cursor:default;user-select:none}
 #aicard.full .aimsg{max-width:min(85%,1100px)}
-#aicard.full ~ #aifab,body:has(#aicard.full:not([hidden])) #aifab{display:none}
+#aicard.full:not([hidden]) ~ #aifab,body:has(#aicard.full:not([hidden])) #aifab{display:none}
 #aicard .aihead{display:flex;align-items:center;gap:12px;padding:12px 14px;background:#2b2b2e;color:#fff;flex:0 0 auto}
 #aicard .aihead .aititle{flex:1;min-width:0}#aicard .aihead b{display:block;font-size:15px;font-weight:600}
 #aicard .aihead small{display:block;font-size:12px;color:#b8b8c0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -11631,6 +13601,10 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 .aimsg p{margin:4px 0}.aimsg ul{margin:4px 0 4px 20px;padding:0}.aimsg .aih{font-weight:600;margin:10px 0 2px}
 .aimsg pre{white-space:pre-wrap;background:#e4e7ec;color:#1d1d1f;padding:8px;border-radius:6px;font-size:12.5px}
 .aimsg code{background:#e4e7ec;color:#1d1d1f;padding:0 4px;border-radius:4px;font-size:12.5px}
+.aimsg .aitw{overflow-x:auto;margin:6px 0}.aimsg .aitbl{border-collapse:collapse;font-size:12.5px;background:#fff;min-width:100%}
+.aimsg .aitbl th{text-align:left;background:#e4e7ec;color:#1d1d1f;padding:4px 7px;white-space:nowrap}
+.aimsg .aitbl td{border-top:1px solid #d5d9e0;padding:4px 7px;vertical-align:top;color:#1d1d1f}
+.aimsg .aitbl td.v-bad{color:#c62828;font-weight:700;white-space:nowrap}.aimsg .aitbl td.v-ok{color:#16803c;font-weight:700;white-space:nowrap}.aimsg .aitbl td.v-warn{color:#9a6200;font-weight:700;white-space:nowrap}
 .aiwarn{background:#fff7e6;color:#8a4b00;border:1px solid #f5c26b;border-radius:8px;padding:6px 10px;margin:0 0 8px;font-size:12.5px;line-height:1.4}
 .aimeta{font-size:11.5px;color:#6b7280;margin-top:6px}.aimeta.bad{color:#b42318}.aimeta.lnk{color:#0b7a6a!important;text-decoration:underline}
 .aistep{font-size:12.5px;display:flex;gap:6px;align-items:center;margin:2px 0 6px;flex-wrap:wrap}.aistep .ok{color:#15803d}.aistep .bad{color:#b42318}.aistep .muted{color:#6b7280}
@@ -11686,6 +13660,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #irpop .irhead{display:flex;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line)}
 #irpop .irhead h3{margin:0;font-size:15px;flex:1;min-width:0;overflow-wrap:anywhere}#irpop .irhead span{color:var(--dim);font-size:12.5px;font-weight:400}
 #irpop .irhead button{flex:none;padding:5px 12px}
+#irpop .irhead .irai{background:linear-gradient(135deg,#7C6CFF,#2EE6C5);color:#fff;border:0;font-weight:600}#irpop .irhead .irai:disabled{opacity:.5}
 #irpop .ircode{margin:0;overflow:auto;padding:10px 0;font:12.5px/1.55 ui-monospace,Menlo,Consolas,monospace;background:var(--panel2);border-radius:0 0 12px 12px;counter-reset:ln;flex:1}
 #irpop .ircode div{white-space:pre;padding:0 14px 0 0}#irpop .ircode div::before{counter-increment:ln;content:counter(ln);display:inline-block;width:44px;margin-right:12px;text-align:right;color:var(--dim);opacity:.7;user-select:none}
 #irpop .irmsg{padding:18px 14px;color:var(--dim)}
@@ -11707,18 +13682,49 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #advpanel td{border-bottom:1px solid var(--line);padding:5px 8px;vertical-align:top}#advpanel td.nw{white-space:nowrap}
 #advpanel a{color:var(--mint)}#advpanel .afoot{margin-top:10px;color:var(--dim);font-size:12px;line-height:1.5}
 /* ---- Operations dashboard ---- */
+#fwbv{position:fixed;inset:0;z-index:56;background:var(--bg);color:var(--text);overflow:auto;padding-bottom:24px}#fwbv[hidden]{display:none}
+#fwbv .swbox{background:var(--panel)}.fwbpad{padding:10px 20px 0}#fwbv .swg3.fwbpad,#fwbv .swg2.fwbpad{margin-top:0}
+.fwbscroll{overflow:auto;max-height:340px}.fwbtab{border-collapse:collapse;width:100%;font-size:12px}
+.fwbtab th{text-align:left;color:var(--dim);font-weight:600;border-bottom:1px solid var(--line);padding:4px 8px;white-space:nowrap;position:sticky;top:0;background:var(--panel)}
+.fwbtab td{border-bottom:1px solid var(--line);padding:4px 8px;vertical-align:top;overflow-wrap:break-word;word-break:normal}.fwbtab td.k-warnt{color:#b26b00}
+#fwbv .dmeter{grid-template-columns:minmax(0,42%) 1fr 104px}#fwbv .dmeter>span:last-child:empty{display:none}#fwbv .dmeter .v{white-space:nowrap}
+.fwbsbar .fwbflt{margin:0;flex:1}.fwbapiv{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:12px;margin-top:10px}
+@media (max-width:900px){.fwbapiv{grid-template-columns:1fr}}
+#fwbv pre.fwbyaml{margin:0;max-height:640px;overflow:auto;background:#1e1f24!important;color:#e8e8ec!important;border:0;border-radius:10px;padding:10px 12px;font:12px/1.55 Consolas,monospace;white-space:pre}
+.fwbyaml .yk{color:#ff8a8d}.fwbyaml .yk.yp{color:#f3b765;font-weight:600}.fwbyaml .ys{color:#c3e88d}.fwbyaml .yn{color:#f78c6c}.fwbyaml .yb{color:#ffcb6b}.fwbyaml .yv{color:#e8e8ec}
+.fwbyaml .yhl{background:#3b3f4a;border-radius:3px}
+.fwbapis{max-height:640px;overflow:auto;padding-right:4px}.fwbapih h3{margin:0 0 4px;font-size:22px;display:flex;align-items:center;gap:10px;overflow-wrap:anywhere}
+.fwbver{font-size:11px;background:#6b7280;color:#fff;border-radius:10px;padding:2px 8px;font-weight:700}
+.fwbop{border:1px solid var(--line);border-radius:8px;margin:8px 0;background:var(--panel)}.fwbop summary{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px;cursor:pointer;list-style:none}
+.fwbop summary::-webkit-details-marker{display:none}.fwbmb{min-width:70px;text-align:center;color:#fff;font-weight:700;border-radius:5px;padding:5px 8px;font-size:12.5px;background:#6b7280}
+.fwbpath{font-family:Consolas,monospace;font-size:13px;font-weight:600;overflow-wrap:anywhere;flex:1 1 220px}
+.fwbop.m-get{border-color:#61affe;background:#61affe14}.fwbop.m-get .fwbmb{background:#2f80ed}
+.fwbop.m-post{border-color:#49cc90;background:#49cc9014}.fwbop.m-post .fwbmb{background:#1f9d67}
+.fwbop.m-put{border-color:#fca130;background:#fca13014}.fwbop.m-put .fwbmb{background:#c86f00}
+.fwbop.m-patch{border-color:#50e3c2;background:#50e3c214}.fwbop.m-patch .fwbmb{background:#0e9f84}
+.fwbop.m-delete{border-color:#f93e3e;background:#f93e3e14}.fwbop.m-delete .fwbmb{background:#d12f2f}
+.fwbopb{padding:4px 12px 10px}.fwbopb h5{margin:10px 0 4px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+.fwbflt{width:100%;margin:10px 0 6px}#fwbv .fwbk{padding:8px 0 0}.fwbmlg{margin-top:12px}.fwbtree{margin-top:12px;max-height:520px;overflow:auto}.fwbtree details{margin-left:14px}.fwbtree>details{margin-left:0}
+.fwbtree summary{cursor:pointer;padding:3px 0;display:flex;gap:6px;align-items:center;flex-wrap:wrap}.fwbtc{color:var(--dim);font-size:12px}
+.fwbleaf{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-left:30px;padding:2px 0;font-size:12.5px}.fwbm{font-weight:700;min-width:52px;font-family:Consolas,monospace;font-size:12px}.dpill.fwbow{color:#5b34b0;border-color:#b3a9ff}[data-theme=dark] .dpill.fwbow{color:#b3a9ff}.fwbmli{margin-top:8px}.fwbmlh{margin:14px 0 6px!important}.fwbpre{max-height:420px;overflow:auto;font-size:11.5px;background:var(--panel2);padding:8px;border-radius:8px}
+.fwbrow select{flex:1;min-width:0;width:auto}
+.fwbcard .fwbcdesc{margin:4px 0 0;font-size:12.5px}.fwbcrow{display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap}.fwbcrow select{width:auto;min-width:170px;margin:0}.fwbcrow button{width:auto;margin:0}.fwbcsum{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:10px;font-size:13px;color:var(--dim)}.fwbcsum b{color:var(--text);font-size:16px}
+.fwbrow{display:flex;gap:8px;margin:8px 0}.fwbrow input{flex:1;min-width:0}.fwbrow button{width:auto}.fwbfoot{padding:14px 20px 0;font-size:12px}
 #dash{position:fixed;inset:0;z-index:55;background:var(--bg);color:var(--text);overflow:auto;padding-bottom:24px}#dash[hidden]{display:none}
-#dash .dbar{position:sticky;top:0;z-index:2;display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
-#dash .dbar h2{margin:0;font-size:17px;flex:1 1 220px}#dash .dmeta{color:var(--dim);font-size:12.5px}
-#dash .dlbl{display:flex;gap:6px;align-items:center;margin:0;font-size:13px;color:var(--text)}#dash .dlbl select{width:auto}
-#dash .dclose{margin-left:0}
-#dash .dsum{display:flex;flex-wrap:wrap;gap:10px;padding:16px 20px 0}
-#dash .dsum div{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 16px;min-width:130px}
-#dash .dsum b{display:block;font-size:24px;font-variant-numeric:tabular-nums}#dash .dsum span{font-size:12px;color:var(--dim)}
-#dash .dsum .k-bad b{color:var(--bad)}#dash .dsum .k-warn b{color:#d08700}
-#dash .dsec{margin:18px 20px 0;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--mint)}
-#dash .dgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(380px,100%),1fr));gap:14px;padding:10px 20px 0}
-#dash .dempty{padding:30px 20px;color:var(--dim)}
+:is(#dash,#fwbv) .dbar{position:sticky;top:0;z-index:2;display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
+:is(#dash,#fwbv) .dbar h2{margin:0;font-size:17px;flex:1 1 220px}:is(#dash,#fwbv) .dmeta{color:var(--dim);font-size:12.5px}
+:is(#dash,#fwbv) .dlbl{display:flex;gap:6px;align-items:center;margin:0;font-size:13px;color:var(--text)}:is(#dash,#fwbv) .dlbl select{width:auto}
+:is(#dash,#fwbv) .dclose{margin-left:0}
+:is(#dash,#fwbv) .dask{background:linear-gradient(135deg,#7C6CFF,#2EE6C5);color:#fff;border:0;font-weight:600}
+#ai_src{display:flex;gap:8px;align-items:center;padding:6px 14px;font-size:12px;background:#eef0ff;color:#3b3486;border-bottom:1px solid #dcdcf5}#ai_src[hidden]{display:none}
+#ai_src b{flex:1}#ai_src button{border:0;background:none;color:inherit;cursor:pointer;font-size:13px;padding:0 2px;margin:0;width:auto}
+:is(#dash,#fwbv) .dsum{display:flex;flex-wrap:wrap;gap:10px;padding:16px 20px 0}
+:is(#dash,#fwbv) .dsum div{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 16px;min-width:130px}
+:is(#dash,#fwbv) .dsum b{display:block;font-size:24px;font-variant-numeric:tabular-nums}:is(#dash,#fwbv) .dsum span{font-size:12px;color:var(--dim)}
+:is(#dash,#fwbv) .dsum .k-bad b{color:var(--bad)}:is(#dash,#fwbv) .dsum .k-warn b{color:#d08700}
+:is(#dash,#fwbv) .dsec{margin:18px 20px 0;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--mint)}
+:is(#dash,#fwbv) .dgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(380px,100%),1fr));gap:14px;padding:10px 20px 0}
+:is(#dash,#fwbv) .dempty{padding:30px 20px;color:var(--dim)}
 .dcard{background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--ok);border-radius:14px;padding:12px 14px;min-width:0}
 .dcard.k-warn{border-top-color:#d08700}.dcard.k-bad{border-top-color:var(--bad)}
 .dcard .dh{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.dcard .dh b{font-size:15px}
@@ -11740,6 +13746,32 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 .dif span{font-size:11.5px;padding:2px 7px;border-radius:6px;border:1px solid var(--line);color:var(--dim);cursor:default}
 .dif span.k-good{color:var(--ok);border-color:var(--ok)}.dif span.k-bad{color:#fff;background:var(--bad);border-color:var(--bad);font-weight:700}
 .dif span.k-admin{color:#b26b00;border-color:#d08700}.dif span.k-idle{opacity:.6;border-style:dashed}
+/* SolarWinds panel on the dashboard */
+.swp{margin:10px 20px 0;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px 14px}
+.swp .swh{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.swp .swh b{font-size:15px}
+.swp .swh .dv{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--mint)}.swp .swh .dhost{font-size:12px;color:var(--dim)}.swp .swh .dt{margin-left:auto;font-size:11.5px;color:var(--dim)}
+:is(#dash,#fwbv) .swp .swk{padding:12px 0 0}:is(#dash,#fwbv) .swp .swk div{background:var(--panel2);min-width:118px;padding:8px 14px}:is(#dash,#fwbv) .swp .swk b{font-size:21px}
+.swp h4{margin:0 0 8px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}.swp h4.swsub{margin:14px 0 0;text-transform:none;letter-spacing:0;font-size:11.5px}
+.swg2,.swg4,.swg3{display:grid;gap:12px;margin-top:12px}.swg2{grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr))}
+.swg4{grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));margin-top:8px}.swg3{grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr))}
+.swbox{border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:0;background:var(--panel)}
+.swbox .dline{font-size:12.5px;margin:3px 0}.swbox .dline.k-dim{color:var(--dim)}.swbox .dline.k-good{color:var(--ok)}
+.swsb{display:flex;gap:2px;height:14px;border-radius:7px;overflow:hidden}.swsb i{display:block;min-width:4px;cursor:default}
+.s-ok{background:var(--ok)}.s-bad{background:var(--bad)}.s-warn{background:#d08700}.s-admin{background:#9aa3b5}
+.swlg{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:8px;font-size:12px;color:var(--dim)}.swlg span{display:inline-flex;align-items:center;gap:5px}
+.swlg i{width:10px;height:10px;border-radius:3px;display:inline-block}.swlg b{color:var(--text);font-variant-numeric:tabular-nums}
+.swct{display:flex;align-items:baseline;gap:8px}.swct h4{flex:1;margin:0}.swct b{font-size:18px;font-variant-numeric:tabular-nums}
+.swsvg{width:100%;height:auto;display:block;margin-top:4px}.swsvg .g{stroke:var(--line);stroke-width:1}
+.swsvg .ln{fill:none;stroke:var(--mint);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.swsvg .pt{fill:var(--mint);stroke:var(--panel);stroke-width:2}
+.swsvg .ax{font-size:9.5px;fill:var(--dim)}.swsvg .hit{fill:transparent}.swsvg .cx{stroke:var(--dim);stroke-width:1;stroke-dasharray:2 2}
+.swr{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:12.5px;padding:4px 0;border-bottom:1px dashed var(--line)}.swr:last-child{border-bottom:0}
+.swr b{font-weight:600}.swr .swd{color:var(--dim);flex:1 1 160px;min-width:0;overflow-wrap:anywhere}
+.dcard .swo{display:flex;flex-wrap:wrap;gap:5px}
+.dcard.obs{border-style:dashed;border-top-style:solid}
+.dcard .dobs{font-size:11px;padding:1px 8px;border-radius:10px;border:1px dashed var(--mint);color:var(--mint)}
+.dcard .dhint{font-size:11.5px;color:var(--dim);margin-top:10px}
+:is(#dash,#fwbv) .dobsbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:8px 20px 0;font-size:12.5px;color:var(--dim)}
+:is(#dash,#fwbv) .dobsbar label{display:flex;gap:6px;align-items:center;margin:0;color:var(--text)}:is(#dash,#fwbv) .dobsbar input{width:auto;margin:0}
 /* ---- Device monitor: bell, panel, pop-ups ---- */
 #monbtn{position:relative}.themebtn:not([hidden])~.themebtn{margin-left:8px}#monbtn.alert{border-color:var(--bad);box-shadow:0 0 0 3px #e5484d33}
 #monbadge{position:absolute;top:-6px;right:-6px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#d92d20;color:#fff;font-size:11px;font-weight:700;line-height:18px}
@@ -11787,7 +13819,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 [data-theme=light] button.primary:hover{background:#095db0;color:#fff}
 [data-theme=light] .dev.sel{border-color:var(--mint);background:#eef5fd;box-shadow:none}
 [data-theme=light] .f5{background:#fdeee8;color:#c2410c}[data-theme=light] .paloalto{background:#e6f4ee;color:#0f7a4f}
-[data-theme=light] .fortigate{background:#efeafb;color:#5b34b0}[data-theme=light] .cloudflare{background:#fef1e4;color:#b45309}
+[data-theme=light] .fortigate{background:#efeafb;color:#5b34b0}[data-theme=light] .cloudflare{background:#fef1e4;color:#b45309}[data-theme=light] .solarwinds{background:#e6f2fd;color:#0b5cad}[data-theme=light] .fortiweb{background:#fdecec;color:#b42318}[data-theme=light] .fortiadc{background:#e3f6f3;color:#0b7a6c}
 [data-theme=light] .chkrow{border-bottom-color:var(--line)}
 [data-theme=light] .chkrow .lbl{font-size:13.5px;color:#1c2733}
 /* Semibold Segoe UI everywhere in the light theme (the portal look); the SSH terminal keeps its regular weight */
@@ -11841,7 +13873,12 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 <div id="advbar" hidden></div><div id="advpanel" hidden></div>
 <div id="dash" hidden><div class="dbar"><h2>▦ Operations dashboard</h2><span class="dmeta" id="dash_meta"></span>
 <label class="dlbl">Refresh every <select id="dash_iv" onchange="dashSet({interval:+this.value})"><option value="300">5 min</option><option value="600">10 min</option><option value="1200">20 min</option><option value="1800">30 min</option><option value="3600">60 min</option></select></label>
-<button onclick="dashSet({now:1})">Refresh now</button><button class="themebtn dclose" onclick="dashToggle(false)" title="Close (Esc)" aria-label="Close">✕</button></div><div id="dashbody"></div></div>
+<button onclick="dashSet({now:1})">Refresh now</button><button class="dask" onclick="dashAsk()" title="Ask the AI assistant about everything the dashboard shows">✦ Ask AI</button><button class="themebtn dclose" onclick="dashToggle(false)" title="Close (Esc)" aria-label="Close">✕</button></div><div id="dashbody"></div></div>
+<div id="fwbv" hidden><div class="dbar"><h2>🛡 FortiWeb analytics</h2><span class="dmeta" id="fwb_meta"></span>
+<label class="dlbl" id="fwb_devl">FortiWeb <select id="fwb_dev" onchange="fwbSid=this.value;fwbLoad(false)"></select></label>
+<label class="dlbl">Range <select id="fwb_range" onchange="fwbLoad(false)"><option value="1h">1 hour</option><option value="6h">6 hours</option><option value="24h" selected>24 hours</option><option value="3d">3 days</option><option value="7d">7 days</option></select></label>
+<label class="dlbl">Policy <select id="fwb_pol" onchange="fwbLoad(false)"><option value="">All server policies</option></select></label>
+<button onclick="fwbLoad(true)">Refresh</button><button class="dask" onclick="fwbAsk()" title="Ask the AI assistant to assess these statistics">✦ Ask AI</button><button class="themebtn dclose" onclick="fwbToggle(false)" title="Close (Esc)" aria-label="Close">✕</button></div><div id="fwbbody"></div></div>
 <div id="monpanel" hidden></div><div id="montoasts" aria-live="assertive"></div>
 <div class="wrap" id="wrap">
 <div id="lpane">
@@ -11860,13 +13897,17 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
     <select id="vendor"><option value="f5">F5 BIG-IP (iControl REST)</option>
     <option value="paloalto">Palo Alto (PAN-OS XML API)</option>
     <option value="fortigate">FortiGate (REST API)</option>
-    <option value="cloudflare">Cloudflare (API token)</option></select>
+    <option value="cloudflare">Cloudflare (API token)</option>
+    <option value="fortiweb">FortiWeb (REST API, read-only)</option>
+    <option value="fortiadc">FortiADC (REST API, read-only)</option>
+    <option value="solarwinds">SolarWinds Orion (SWIS API, read-only)</option></select>
     <label>Display name (optional)</label><input id="name" placeholder="e.g. edge-fw-01">
     <div class="row" id="f-host"><div><label>Mgmt host / IP</label><input id="host"></div>
     <div style="max-width:90px"><label>Port</label><input id="port" value="443"></div></div>
     <div id="f-user"><label>Username</label><input id="username" autocomplete="off"></div>
     <div id="f-pass"><label>Password</label><input id="password" type="password" autocomplete="off"></div>
     <div id="f-key"><label id="keylbl">API key</label><input id="apikey" type="password" autocomplete="off"></div>
+    <div id="f-vdom" style="display:none"><label>VDOM / ADOM (optional; FortiWeb default root)</label><input id="vdom" autocomplete="off" placeholder="root"></div>
     <div id="f-acct" style="display:none"><label>Account ID (optional; needed for account-owned tokens)</label><input id="account" autocomplete="off" placeholder="32 hex characters"></div>
     <div class="chk" id="f-ins"><input type="checkbox" id="insecure"><span>Skip TLS verification (self-signed mgmt cert). Credentials are then sent to whatever answers at that address: use only on a trusted network.</span></div>
     <div class="chk" id="f-rem"><input type="checkbox" id="remember" onchange="remUi()"><span>Remember this login on this PC (encrypted for your Windows account and a passphrase; saved_logins.dat, not in git)</span></div>
@@ -11898,7 +13939,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 </div>
 <div id="rpane">
   <div class="panebar"><span>Checks &amp; tools</span><button id="rpane_btn" onclick="paneToggle('r')" title="Collapse this pane: the output moves up" aria-label="Collapse the checks pane">Hide ▴</button></div>
-  <div id="sshtool"></div><div id="terms"></div><div id="flowtrace"></div><div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
+  <div id="fwbtools"></div><div id="sshtool"></div><div id="terms"></div><div id="flowtrace"></div><div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
   <div id="iplookup"></div><div id="f5tools"></div>
   <div class="card" id="main"><h3>Checks</h3><div class="muted">Connect a device to begin.</div></div>
   <div class="card"><h3>Raw read-only query</h3>
@@ -11928,12 +13969,13 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
         <div><label>Model server (OpenAI-compatible API)</label><input id="ai_url" placeholder="http://127.0.0.1:11434/v1"></div>
         <div><label>Model</label><input id="ai_model" list="ai_models" placeholder="qwen2.5:7b"><datalist id="ai_models"></datalist></div>
         <div><label>API key (optional, kept in memory only)</label><input id="ai_key" type="password" placeholder="(none)" autocomplete="off"></div>
-        <div><label>Context budget (characters sent per output)</label><input id="ai_budget" value="24000"></div>
+        <div><label>Context budget (characters sent per output)</label><input id="ai_budget" value="60000" title="About 3-4 characters per token: 60000 needs a model context of at least 32k tokens. The output on screen gets this much; in Ask &amp; run checks it gets half, and all check results together get at most twice this."></div>
       </div>
       <div id="ai_route" class="muted" style="font-size:12.5px;margin-top:6px"></div>
       <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px"><button onclick="aiModels()">List models</button><button class="primary" onclick="aiSave(true)">Save</button></div>
       <div id="ai_cfgmsg" class="muted"></div><div id="ai_mlist"></div>
     </details>
+    <div id="ai_src" hidden></div>
     <div id="ai_log"></div>
     <div id="ai_chips"><button onclick="aiAsk('explain')">Explain the current output</button><button onclick="aiAsk('chat')">Ask about the current output</button><button onclick="aiAsk('agent')">Ask &amp; run read-only checks</button><button onclick="$('#ai_file').click()">Analyse a packet capture (.pcap)</button><button onclick="aiClear()">Start a new conversation</button></div>
     </div>
@@ -11947,7 +13989,10 @@ const T="__TOKEN__";const $=s=>document.querySelector(s);let catalog={},devices=
 const hints={f5:"GET path, e.g. /mgmt/tm/ltm/virtual?$select=name,destination",
 paloalto:"XML op command starting with <show> or <test>, e.g. <show><clock/></show>",
 fortigate:"GET path, e.g. /api/v2/monitor/system/status",
-cloudflare:"GET path, e.g. /client/v4/zones?per_page=50 — or a GraphQL query starting with { or query"};
+cloudflare:"GET path, e.g. /client/v4/zones?per_page=50 — or a GraphQL query starting with { or query",
+fortiweb:"GET path, e.g. /api/v2.0/cmdb/server-policy/policy (read-only: paths naming an action are refused)",
+fortiadc:"GET path, e.g. /api/load_balance_virtual_server (read-only: paths naming an action are refused)",
+solarwinds:"SWQL SELECT query, e.g. SELECT TOP 10 Caption, IPAddress, StatusDescription FROM Orion.Nodes WHERE Status=2"};
 async function api(p,b){const o={headers:{"X-Token":T,"Content-Type":"application/json"}};
  if(b){o.method="POST";o.body=JSON.stringify(b)}const r=await fetch(p,o);return r.json()}
 let profiles=[];
@@ -11974,12 +14019,15 @@ async function deleteProfile(){const id=$("#profiles").value;if(!id)return;
 function fields(){const v=$("#vendor").value,cf=v==="cloudflare";
  $("#f-user").style.display=v==="fortigate"||cf?"none":"";
  $("#f-pass").style.display=v==="fortigate"||cf?"none":"";
- $("#f-key").style.display=v==="f5"?"none":"";
+ $("#f-key").style.display=v==="f5"||v==="solarwinds"?"none":"";
  $("#f-host").style.display=$("#f-ins").style.display=cf?"none":"";
- $("#f-acct").style.display=cf?"":"none";
+ $("#f-acct").style.display=cf?"":"none";const fx=v==="fortiweb"||v==="fortiadc";$("#f-vdom").style.display=fx?"":"none";
+ const pt=$("#port").value.trim();
+ if(v==="solarwinds"&&(pt===""||pt==="443"))$("#port").value="17774";
+ else if(v!=="solarwinds"&&(pt==="17774"||pt==="17778"))$("#port").value="443";
  if(cf){$("#host").value="api.cloudflare.com";$("#port").value="443";$("#insecure").checked=false}
  else if($("#host").value==="api.cloudflare.com")$("#host").value="";
- $("#keylbl").textContent=cf?"API token (read-only permissions)":v==="fortigate"?"REST API token":"API key (or leave blank and use user/password)"}
+ $("#keylbl").textContent=cf?"API token (read-only permissions)":v==="fortigate"?"REST API token":fx?"API token (optional: or leave blank and use a read-only administrator's user / password)":"API key (or leave blank and use user/password)"}
 $("#vendor").onchange=fields;fields();
 let vault={};
 async function vaultLoad(){vault=await api("/api/vault",{action:"status"});renderVault();remUi()}
@@ -12008,7 +14056,7 @@ async function vaultReset(ev){ev.preventDefault();if(!confirm("Delete all saved 
  vault=await api("/api/vault",{action:"reset"});renderVault();remUi()}
 async function connect(){$("#cerr").textContent="Connecting…";
  const b={vendor:$("#vendor").value,name:$("#name").value,host:$("#host").value,port:$("#port").value,
- username:$("#username").value,password:$("#password").value,apikey:$("#apikey").value,insecure:$("#insecure").checked,account:$("#account").value};
+ username:$("#username").value,password:$("#password").value,apikey:$("#apikey").value,insecure:$("#insecure").checked,account:$("#account").value,vdom:$("#vdom").value};
  if($("#remember").checked){b.remember=true;b.vault_pass=$("#vpass").value}
  const r=await api("/api/connect",b);
  if(!r.ok){$("#cerr").textContent=r.error;return}
@@ -12020,9 +14068,9 @@ async function disconnect(id,ev){ev.stopPropagation();await api("/api/disconnect
  devices=devices.filter(d=>d.id!==id);if(cur===id)cur=devices.length?devices[0].id:null;renderAll()}
 function select(id){cur=id;try{sessionStorage.setItem("cur",id||"")}catch(e){}renderAll()}
 function dev(){return devices.find(d=>d.id===cur)}
-function renderAll(){renderDevs();renderChecks();renderSsh();renderCf();renderAcc();renderAppsec();renderIp();renderF5();const d=dev();
+function renderAll(){renderDevs();renderChecks();renderFwb();renderSsh();renderCf();renderAcc();renderAppsec();renderIp();renderF5();const d=dev();
  $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:""}
-function renderFlow(){const box=$("#flowtrace");if(!devices.length){box.innerHTML="";return}
+function renderFlow(){const box=$("#flowtrace");if(!devices.some(d=>["f5","paloalto","fortigate","cloudflare"].includes(d.vendor))){box.innerHTML="";return}
  if(!$("#ft_dst")){box.innerHTML='<div class="card"><h3>Flow trace · one flow on every connected device</h3><div class="row3">'+
   fld("ft_src","Source / client IP","203.0.113.5")+fld("ft_dst","Destination IP or hostname","shop.example.com or 10.5.1.20")+
   fld("ft_port","Destination port (optional)","443")+
@@ -12212,7 +14260,7 @@ async function runRaw(){const q=$("#raw").value;if(!q)return;setBusy("raw query"
  const r=await api("/api/raw",{id:cur,query:q});show(r,"raw")}
 function setBusy(l){$("#ometa").textContent="running "+l+"…";$("#pretty").textContent="";$("#verdict").innerHTML=""}
 let lastCtx={label:"",device:"",time:""};
-function show(r,l){last=r;const m=$("#ometa");m.textContent="";
+function show(r,l){last=r;if(typeof aiSrcSet==="function")aiSrcSet(null);const m=$("#ometa");m.textContent="";
  lastCtx={label:l,device:l==="TLS / header check"?"":((dev()||{}).name||""),time:new Date().toISOString()};
  const s=document.createElement("span");
  if(r.error){s.className="bad";s.textContent=l+" · error: "+r.error}
@@ -12410,7 +14458,7 @@ async function showAudit(){const r=await api("/api/audit");last={ok:true,status:
  show(last,"audit log")}
 function fld(id,l,ph,v){return '<div><label>'+l+'</label><input id="'+id+'" placeholder="'+ph+'" value="'+(v||'')+'"></div>'}
 function g(i){const e=$("#"+i);return e?e.value:""}
-function renderIp(){const box=$("#iplookup");box.innerHTML="";const d=dev();if(!d||d.vendor==="cloudflare")return;const v=d.vendor;
+function renderIp(){const box=$("#iplookup");box.innerHTML="";const d=dev();if(!d||["cloudflare","solarwinds","fortiweb","fortiadc"].includes(d.vendor))return;const v=d.vendor;
  if(v==="paloalto"||v==="fortigate"){const pan=v==="paloalto";
   box.innerHTML='<div class="card"><h3>Policy lookup · by IP, by '+(pan?'rule name, or list all security rules':'policy name or ID, or list all firewall policies')+'</h3><div class="row3">'+
   (pan?fld("pl_q","IP, subnet or rule name (blank = all rules)","10.1.1.10, 10.1.2.32/28 or allow-web")+fld("pl_vsys","vsys","vsys1","vsys1")
@@ -12483,7 +14531,7 @@ const WITHIN=["any time","last 15 minutes","last hour","last 6 hours","last 12 h
 function wsel(id){return sel(id,"Time range (up to 1 day)",WITHIN,"any time")}
 function sel(id,label,opts,def){return '<div><label>'+label+'</label><select id="'+id+'">'+
  opts.map(o=>'<option'+(o===def?' selected':'')+'>'+o+'</option>').join("")+'</select></div>'}
-function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if(!d||d.vendor==="cloudflare")return;const v=d.vendor;
+function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if(!d||["cloudflare","solarwinds","fortiweb","fortiadc"].includes(d.vendor))return;const v=d.vendor;
  let h='<div class="card"><h3>AppSec checks · read-only</h3><div class="row3">';
  if(v==="paloalto")h+=fld("as_vsys","vsys","vsys1","vsys1");
  if(v==="fortigate")h+=fld("as_vdom","VDOM (optional)","root");
@@ -12762,7 +14810,12 @@ function tilesNode(list){const w=mk("div","dtiles");w.style.marginBottom="12px";
   if(t.sub)x.appendChild(mk("div","dl",t.sub));
   if(t.spark&&t.spark.length>1){const sp=mk("div");sp.innerHTML=dSpark(t.spark);x.appendChild(sp)}w.appendChild(x)});return w}
 // ---- AI assistant (local LLM): explain / chat about the current output, or let the model run read-only checks ----
-let aiHist=[];
+let aiHist=[],aiSrc=null;
+// what the AI talks about instead of the output on screen: {kind:"dashboard"} or {kind:"irule",id,name,device}; null = the output
+function aiSrcSet(s){s=s||null;if(JSON.stringify(s)===JSON.stringify(aiSrc))return;aiSrc=s;aiHist=[];const b=$("#ai_src");b.textContent="";b.hidden=!s;if(!s)return;
+ b.appendChild(mk("span",null,"✦"));b.appendChild(mk("b",null,s.kind==="irule"?"Talking about iRule "+s.name+" on "+s.device+" (read from the F5)":s.kind==="fwbstats"?"Talking about the FortiWeb statistics of "+s.name+" (last "+s.range+(s.policy?", "+s.policy:"")+(s.ml_domain?"; ML API: "+s.ml_domain:"")+")":"Talking about the operations dashboard (fresh snapshot with each question)"));
+ const x=mk("button",null,"✕");x.title="Stop: talk about the console output again";x.setAttribute("aria-label",x.title);x.onclick=()=>aiSrcSet(null);b.appendChild(x)}
+function dashAsk(){aiSrcSet({kind:"dashboard"});aiToggle(true);aiAsk("chat","Using the dashboard data: what needs attention right now, most urgent first? For each item give the device, the values and the likely cause, then the next check to run. Also say if anything looks wrong in the 24-hour trends.","What needs attention on the dashboard right now?")}
 async function aiInit(){const r=await api("/api/llm/config",{});if(!r.ok)return;
  $("#ai_url").value=r.url;$("#ai_model").value=r.model||"";aiRoute(r);$("#ai_budget").value=r.budget;
  $("#ai_key").placeholder=r.has_key?"(set · type to replace)":"(none)";if(!r.model)$("#ai_cfg").open=true;aiStatus(r.model);aiWelcome()}
@@ -12786,16 +14839,22 @@ async function aiModels(){if(!await aiSave(false))return;const m=$("#ai_cfgmsg")
 function aiModelList(ms){const box=$("#ai_mlist");box.innerHTML="";
  ms.forEach(x=>{const b=mk("button",x===g("ai_model")?"cur":"",(x===g("ai_model")?"✓ ":"")+x);
   b.onclick=async()=>{$("#ai_model").value=x;if(await aiSave(false)){aiModelList(ms);const m=$("#ai_cfgmsg");m.className="ok";m.textContent="Using "+x+" (saved)"}};box.appendChild(b)})}
-function aiMd(t){const out=[];let inCode=false,code=[],list=null;
+function aiMd(t){const out=[];let inCode=false,code=[],list=null,tbl=null;
  const inl=s=>esc(s).replace(/`([^`]+)`/g,"<code>$1</code>").replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>");
  const endList=()=>{if(list){out.push("<ul>"+list.join("")+"</ul>");list=null}};
+ const verd=c=>{const u=c.replace(/\*/g,"").trim().toUpperCase();return /^APPLIES\b/.test(u)?' class="v-bad"':/^(DOES NOT APPLY|NOT APPLICABLE)\b/.test(u)?' class="v-ok"':/^CAN.?T TELL\b/.test(u)?' class="v-warn"':""};
+ const endTbl=()=>{if(!tbl)return;const rows=tbl.filter(r=>!r.every(c=>/^:?-{2,}:?$/.test(c.trim())));tbl=null;if(!rows.length)return;
+  out.push('<div class="aitw"><table class="aitbl"><tr>'+rows[0].map(c=>"<th>"+inl(c.trim())+"</th>").join("")+"</tr>"+
+   rows.slice(1).map(r=>"<tr>"+r.map(c=>"<td"+verd(c)+">"+inl(c.trim())+"</td>").join("")+"</tr>").join("")+"</table></div>")};
  String(t||"").split("\n").forEach(l=>{
-  if(/^\s*```/.test(l)){if(inCode){out.push("<pre>"+esc(code.join("\n"))+"</pre>");code=[];inCode=false}else{endList();inCode=true}return}
+  if(/^\s*```/.test(l)){if(inCode){out.push("<pre>"+esc(code.join("\n"))+"</pre>");code=[];inCode=false}else{endList();endTbl();inCode=true}return}
   if(inCode){code.push(l);return}
+  if(/^\s*\|.*\|\s*$/.test(l)){endList();(tbl=tbl||[]).push(l.trim().slice(1,-1).split("|"));return}
+  endTbl();
   const m=l.match(/^\s*(?:[-*]|\d+[.)])\s+(.*)/);if(m){(list=list||[]).push("<li>"+inl(m[1])+"</li>");return}
   endList();const h=l.match(/^#{1,6}\s+(.*)/);if(h){out.push('<div class="aih">'+inl(h[1])+"</div>");return}
   if(l.trim())out.push("<p>"+inl(l)+"</p>")});
- if(inCode)out.push("<pre>"+esc(code.join("\n"))+"</pre>");endList();return out.join("")}
+ if(inCode)out.push("<pre>"+esc(code.join("\n"))+"</pre>");endList();endTbl();return out.join("")}
 function aiRow(kind,d){const row=mk("div","airow "+(kind==="user"?"user":"bot"));if(kind!=="user")row.appendChild(mk("span","aiav","✦"));row.appendChild(d);return row}
 function aiAdd(kind,text,r){const box=$("#ai_log"),d=mk("div","aimsg "+kind);
  if(kind==="bot"&&r&&r.welcome)d.innerHTML=aiMd(text);
@@ -12826,7 +14885,7 @@ document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#aicard").hidde
 function aiClear(){aiHist=[];$("#ai_log").innerHTML="";aiWelcome()}
 async function aiAsk(mode,qx,sx){const q=qx||g("ai_q").trim();
  if(mode!=="explain"&&!q)return aiAdd("err","Type a question first.");
- if(mode!=="agent"&&!last)return aiAdd("err","Run a check first: there is no output to talk about yet.");
+ if(mode!=="agent"&&!last&&!aiSrc)return aiAdd("err","Run a check first: there is no output to talk about yet.");
  if(mode==="agent"&&!devices.length)return aiAdd("err","Connect a device first: the checks run on the connected devices.");
  if(!await aiSave(false))return;
  if(mode==="explain"){aiHist=[];$("#ai_log").innerHTML=""}
@@ -12838,7 +14897,7 @@ async function aiAsk(mode,qx,sx){const q=qx||g("ai_q").trim();
  const t0=Date.now(),btns=[...document.querySelectorAll("#ai_chips button,#ai_send")],card=$("#aicard"),wrow=aiRow("bot",wait);
  const tick=()=>{wait.title=Math.round((Date.now()-t0)/1000)+" s"};
  tick();$("#ai_log").appendChild(wrow);card.classList.add("busy");aiScroll();const iv=setInterval(tick,1000);btns.forEach(b=>b.disabled=true);
- let r;try{r=await api("/api/llm/chat",{id:cur,mode,question:q,history:aiHist,context:last,label:lastCtx.label,device:lastCtx.device,time:lastCtx.time})}
+ let r;try{r=await api("/api/llm/chat",{id:cur,mode,question:q,history:aiHist,context:aiSrc?null:last,source:aiSrc?aiSrc.kind:"",src:aiSrc,irule_id:aiSrc&&aiSrc.id,irule_name:aiSrc&&aiSrc.name,label:lastCtx.label,device:lastCtx.device,time:lastCtx.time})}
  catch(e){r={ok:false,error:"no answer from the console: "+e.message+" (is netops_console.py still running?)"}}
  finally{clearInterval(iv);wrow.remove();card.classList.remove("busy");btns.forEach(b=>b.disabled=false)}
  if(!r.ok)return aiAdd("err",r.error||"error");
@@ -13044,8 +15103,9 @@ function paneToggle(w,force){const cls=w+"col",wr=$("#wrap"),on=force==null?!wr.
  b.setAttribute("aria-label",b.title);try{localStorage.setItem("pane_"+w,on?"1":"")}catch(e){}}
 try{if(localStorage.getItem("pane_l"))paneToggle("l",true);if(localStorage.getItem("pane_r"))paneToggle("r",true)}catch(e){}
 // ---- Operations dashboard: resources, interfaces and HA of every firewall and F5 (the console refreshes it) ----
-let dashOpen=false,dashData=null,dashAt=0;const DASH_V={paloalto:"Palo Alto",fortigate:"FortiGate",f5:"F5 BIG-IP"};
-function dashBtn(){const show=devices.some(d=>["f5","paloalto","fortigate"].includes(d.vendor));$("#dashbtn").hidden=!show;if(!show&&dashOpen)dashToggle(false)}
+let dashOpen=false,dashData=null,dashAt=0;const DASH_V={paloalto:"Palo Alto",fortigate:"FortiGate",f5:"F5 BIG-IP",firewall:"Firewall"};
+let dashObs=true;try{dashObs=localStorage.getItem("dash_obs")!=="0"}catch(e){}
+function dashBtn(){if(typeof fwbBtn==="function")fwbBtn();const show=devices.some(d=>["f5","paloalto","fortigate","solarwinds"].includes(d.vendor));$("#dashbtn").hidden=!show;if(!show&&dashOpen)dashToggle(false)}
 function dashToggle(on){dashOpen=on==null?!dashOpen:!!on;$("#dash").hidden=!dashOpen;document.documentElement.style.overflow=dashOpen?"hidden":"";
  try{localStorage.setItem("dash_open",dashOpen?"1":"")}catch(e){}if(dashOpen)dashLoad()}
 async function dashLoad(){let r;try{r=await api("/api/dash")}catch(e){return}if(!r||!r.ok)return;dashData=r;dashAt=Date.now();dashRender();dashClock();
@@ -13057,7 +15117,9 @@ function dashSpark(vals){const v=(vals||[]).map(x=>x==null?null:+x);if(v.filter(
  const p=document.createElementNS(ns,"path");p.setAttribute("d",d);s.appendChild(p);const t=document.createElementNS(ns,"title");
  t.textContent="Last "+n+" refreshes: "+v.map(x=>x==null?"-":x+"%").join(", ");s.appendChild(t);return s}
 function dashFmt(t){return t.fmt==="pct"?(+t.value).toFixed(1)+"%":(+t.value).toLocaleString()}
-function dashKind(d){let k=0;const up=x=>{k=Math.max(k,x)};if(d.res)up(d.res.kind==="bad"?2:d.res.kind==="info"?1:0);
+function dashKind(d){if(d.vendor==="solarwinds")return d.sw?d.sw.kind||"":"warn";
+ if(d.observed){const o=d.orion;return o.cls==="bad"||o.if_down||/critical|serious/i.test(o.worst||"")?"bad":o.cls==="warn"||o.alerts||o.issue?"warn":""}
+ let k=0;const up=x=>{k=Math.max(k,x)};if(d.res)up(d.res.kind==="bad"?2:d.res.kind==="info"?1:0);
  if((d.ifaces||[]).some(i=>i.cls==="bad"))up(2);if(d.ha)up(d.ha.cls==="bad"?2:d.ha.cls==="warn"?1:0);if((d.errors||[]).length)up(1);return["","warn","bad"][k]}
 function dashCard(d){const c=mk("div","dcard k-"+dashKind(d)),h=mk("div","dh");h.appendChild(mk("b",null,d.device));h.appendChild(mk("span","dv",DASH_V[d.vendor]||d.vendor));
  h.appendChild(mk("span","dhost",d.host||""));h.appendChild(mk("span","dt",d.time?"read "+d.time+(d.ms!=null?" \u00b7 "+(d.ms/1000).toFixed(1)+" s":""):""));c.appendChild(h);
@@ -13079,20 +15141,315 @@ function dashCard(d){const c=mk("div","dcard k-"+dashKind(d)),h=mk("div","dh");h
   const w=mk("div","dif");bad.concat(ifs.filter(i=>i.cls!=="bad")).forEach(i=>{const x=mk("span","k-"+i.cls,i.name);
    x.title=i.name+": "+i.state+(i.speed?" \u00b7 "+i.speed:"")+(i.errors?" \u00b7 "+i.errors.toLocaleString()+" errors/drops":"")+(i.cls==="idle"?" (never seen up: treated as unused)":"");w.appendChild(x)});c.appendChild(w)}
  else{c.appendChild(mk("h4",null,"Interfaces"));c.appendChild(mk("div","dline k-dim","not read"))}
+ const o=d.orion;if(o){c.appendChild(mk("h4",null,"SolarWinds view"+(o.source?" · "+o.source:"")));
+  if(o.missing)c.appendChild(mk("div","dline k-dim","No SolarWinds node with this unit's address or name."));
+  else{const r=mk("div","dharow swo"),p=(t,k,ti)=>{const x=mk("span","dpill"+(k?" k-"+k:""),t);if(ti)x.title=ti;r.appendChild(x)};
+   p(o.status,{ok:"good",bad:"bad",warn:"warn"}[o.cls]||"","Orion node "+o.node);
+   if(o.rt!==""&&o.rt!=null)p("response "+o.rt+" ms","",null);if(o.loss!==""&&o.loss!=null)p("loss "+o.loss+"%",o.loss>0?"warn":"",null);
+   if(o.cpu!==""&&o.cpu!=null)p("CPU "+o.cpu+"%",o.cpu>=90?"bad":o.cpu>=75?"warn":"",null);
+   p(o.alerts?o.alerts+" alert(s) · worst "+o.worst:"no active alert",o.alerts?(/critical|serious/i.test(o.worst)?"bad":"warn"):"good",null);
+   if(o.if_down)p(o.if_down+" interface(s) down","bad",null);if(o.busiest)p("busiest "+o.busiest,"",null);c.appendChild(r)}}
  (d.errors||[]).forEach(e=>c.appendChild(mk("div","dline k-warn","Could not read "+e)));return c}
-function dashRender(){if(!dashData||!dashOpen)return;const r=dashData,devs=r.devices||[],body=$("#dashbody");body.textContent="";$("#dash_iv").value=String(r.interval);
- const sum=mk("div","dsum"),tile=(v,l,k)=>{const x=mk("div",k?"k-"+k:"");x.appendChild(mk("b",null,String(v)));x.appendChild(mk("span",null,l));sum.appendChild(x)};
- const kinds=devs.map(dashKind),ifd=devs.reduce((n,d)=>n+(d.ifaces||[]).filter(i=>i.cls==="bad").length,0),hab=devs.filter(d=>d.ha&&(d.ha.cls==="bad"||d.ha.cls==="warn")).length;
- tile(devs.length,"devices");tile(kinds.filter(k=>k==="bad").length,"critical",kinds.includes("bad")?"bad":"");tile(kinds.filter(k=>k==="warn").length,"warning",kinds.includes("warn")?"warn":"");
- tile(ifd,"interfaces down",ifd?"bad":"");tile(hab,"HA problems",hab?"bad":"");body.appendChild(sum);
- if(!devs.length){body.appendChild(mk("div","dempty",r.busy?"Reading the devices for the first time\u2026 this can take a minute.":"No data yet."));return}
+// card of an F5 / firewall that Orion monitors but this console is not connected to (Orion's data only)
+function dashCardObs(d){const o=d.orion,c=mk("div","dcard obs k-"+dashKind(d)),h=mk("div","dh");h.appendChild(mk("b",null,d.device));
+ h.appendChild(mk("span","dv",d.vendor==="firewall"?(o.make||"Firewall"):DASH_V[d.vendor]||d.vendor));h.appendChild(mk("span","dhost",d.host||""));
+ const b=mk("span","dobs","SolarWinds only");b.title="Seen by "+(o.source||"SolarWinds")+"; not connected in this console";h.appendChild(b);
+ h.appendChild(mk("span","dt",d.time?"read "+d.time:""));c.appendChild(h);
+ const det=[o.model,o.version&&("version "+o.version),o.last_boot&&("booted "+o.last_boot)].filter(Boolean).join(" · ");if(det)c.appendChild(mk("div","dline k-dim",det));
+ c.appendChild(mk("h4",null,"Status"));const r=mk("div","dharow swo"),p=(t,k,ti)=>{const x=mk("span","dpill"+(k?" k-"+k:""),t);if(ti)x.title=ti;r.appendChild(x)};
+ p(o.status,SWK[o.cls]||"","Orion node "+o.node);if(o.rt!==""&&o.rt!=null)p("response "+o.rt+" ms",o.rt>=200?"warn":"",null);
+ if(o.loss!==""&&o.loss!=null)p("loss "+o.loss+"%",o.loss>0?"warn":"",null);
+ p(o.alerts?o.alerts+" alert(s) · worst "+o.worst:"no active alert",o.alerts?(/critical|serious/i.test(o.worst)?"bad":"warn"):"good",null);c.appendChild(r);
+ if(o.issue&&o.issue.toLowerCase()!==String(o.status).toLowerCase())c.appendChild(mk("div","dline k-"+(o.cls==="bad"?"bad":"warn"),"△ "+o.issue));
+ c.appendChild(mk("h4",null,"Resources"));const pc=v=>v===""||v==null?null:+v,cpu=pc(o.cpu),mem=pc(o.mem);
+ if(cpu==null&&mem==null)c.appendChild(mk("div","dline k-dim","not polled by Orion"));
+ if(cpu!=null)c.appendChild(swMeter("CPU",cpu,100,cpu+"%",cpu>=90?"bad":cpu>=75?"warn":"","CPU load (Orion)"));
+ if(mem!=null)c.appendChild(swMeter("Memory",mem,100,mem+"%",mem>=90?"bad":mem>=80?"warn":"","Memory used (Orion)"));
+ const n=o.if_n||{},tot=(n.ok||0)+(n.bad||0)+(n.warn||0)+(n.admin||0);
+ c.appendChild(mk("h4",null,"Interfaces"+(tot?" · "+(n.ok||0)+" up"+(n.bad?" · "+n.bad+" DOWN":"")+(n.warn?" · "+n.warn+" warning":"")+(n.admin?" · "+n.admin+" shutdown":""):"")));
+ if(!tot)c.appendChild(mk("div","dline k-dim","no interface monitored in Orion"));
+ if((o.if_down_names||[]).length){const w=mk("div","dif");o.if_down_names.forEach(x=>{const s=mk("span","k-bad",x);s.title=x+": down (Orion)";w.appendChild(s)});c.appendChild(w)}
+ (o.if_busy||[]).forEach(i=>c.appendChild(swMeter(i.interface,i.util,100,i.util+"%",i.util>=90?"bad":i.util>=70?"warn":"",i.interface+": in "+i.in+"%, out "+i.out+"%"+(i.speed?" of "+i.speed:""))));
+ if((o.alert_list||[]).length){c.appendChild(mk("h4",null,"Active alerts"));o.alert_list.forEach(a=>{const x=mk("div","swr");
+  x.appendChild(mk("span","dpill k-"+(/critical|serious/i.test(a.severity)?"bad":/warning/i.test(a.severity)?"warn":""),a.severity));x.appendChild(mk("b",null,a.alert));
+  x.appendChild(mk("span","swd",(a.object&&a.object!==o.node?a.object+" · ":"")+a.age+(a.acknowledged!=="no"?" · ack":"")));c.appendChild(x)})}
+ if(d.vendor!=="firewall")c.appendChild(mk("div","dhint","Connect it in the console to add HA, sessions and configuration checks."));return c}
+function dashObsSet(on){dashObs=!!on;try{localStorage.setItem("dash_obs",dashObs?"1":"0")}catch(e){}dashRender()}
+// ---- SolarWinds panel: network-wide health from Orion ----
+const SWK={ok:"good",bad:"bad",warn:"warn"};
+function swBar(title,rows){const w=mk("div","swbox");w.appendChild(mk("h4",null,title));
+ if(!rows){w.appendChild(mk("div","dline k-dim","not read"));return w}const tot=rows.reduce((n,r)=>n+r.count,0);
+ if(!tot){w.appendChild(mk("div","dline k-dim","none"));return w}
+ const b=mk("div","swsb");rows.forEach(r=>{const s=mk("i","s-"+r.cls);s.style.flexGrow=r.count;s.title=r.status+": "+r.count.toLocaleString()+" ("+(100*r.count/tot).toFixed(1)+"%)";b.appendChild(s)});w.appendChild(b);
+ const l=mk("div","swlg");rows.forEach(r=>{const x=mk("span");x.appendChild(mk("i","s-"+r.cls));x.appendChild(document.createTextNode(r.status+" "));x.appendChild(mk("b",null,r.count.toLocaleString()));l.appendChild(x)});w.appendChild(l);return w}
+function swLine(title,pts,unit,fixMax,WW){const w=mk("div","swbox swch");const vals=(pts||[]).map(p=>p[1]===""||p[1]==null?null:+p[1]);
+ const h=mk("div","swct");h.appendChild(mk("h4",null,title));const lastV=[...vals].reverse().find(v=>v!=null);
+ h.appendChild(mk("b",null,lastV==null?"—":(Math.round(lastV*10)/10).toLocaleString()+unit));w.appendChild(h);
+ if(vals.filter(v=>v!=null).length<2){w.appendChild(mk("div","dline k-dim","not enough data yet"));return w}
+ const W=WW||300,H=86,L=4,R=4,T=6,B=16,n=vals.length,mx=fixMax||Math.max(1,...vals.filter(v=>v!=null))*1.15,ns="http://www.w3.org/2000/svg";
+ const X=i=>L+i*(W-L-R)/(n-1),Y=v=>T+(H-T-B)*(1-Math.min(v,mx)/mx),s=document.createElementNS(ns,"svg");s.setAttribute("viewBox","0 0 "+W+" "+H);s.setAttribute("class","swsvg");
+ const el=(t,a)=>{const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);s.appendChild(e);return e};
+ [0,.5,1].forEach(f=>el("line",{x1:L,x2:W-R,y1:T+(H-T-B)*f,y2:T+(H-T-B)*f,class:"g"}));
+ let d="";vals.forEach((v,i)=>{if(v==null){d+=" ";return}d+=(d&&!d.endsWith(" ")?"L":"M")+X(i).toFixed(1)+" "+Y(v).toFixed(1)});
+ el("path",{d:d.replace(/ (?=M)/g,""),class:"ln"});
+ const li=vals.length-1-[...vals].reverse().findIndex(v=>v!=null);el("circle",{cx:X(li),cy:Y(vals[li]),r:3,class:"pt"});
+ const t1=el("text",{x:L,y:H-3,class:"ax"});t1.textContent=pts[0][0];const t2=el("text",{x:W-R,y:H-3,class:"ax","text-anchor":"end"});t2.textContent=pts[n-1][0];
+ const t3=el("text",{x:W-R,y:T+8,class:"ax","text-anchor":"end"});t3.textContent="max "+(Math.round(mx/1.15*10)/10)+unit;if(fixMax)t3.textContent=fixMax+unit;
+ const cross=el("line",{y1:T,y2:H-B,class:"cx",visibility:"hidden"});
+ vals.forEach((v,i)=>{const r=el("rect",{x:X(i)-(W-L-R)/(n-1)/2,y:0,width:(W-L-R)/(n-1),height:H,class:"hit"});
+  const tt=document.createElementNS(ns,"title");tt.textContent=pts[i][0]+": "+(v==null?"no data":(Math.round(v*100)/100)+unit);r.appendChild(tt);
+  r.addEventListener("mouseenter",()=>{cross.setAttribute("x1",X(i));cross.setAttribute("x2",X(i));cross.setAttribute("visibility","visible")});
+  r.addEventListener("mouseleave",()=>cross.setAttribute("visibility","hidden"))});
+ w.appendChild(s);return w}
+function swList(title,rows,fn,empty){const w=mk("div","swbox");w.appendChild(mk("h4",null,title));
+ if(rows==null){w.appendChild(mk("div","dline k-dim","not read"));return w}if(!rows.length){w.appendChild(mk("div","dline k-good",empty||"none"));return w}
+ rows.forEach(r=>w.appendChild(fn(r)));return w}
+function swMeter(label,val,max,txt,kind,title){const m=mk("div","dmeter k-"+(kind||""));m.title=title||label;m.appendChild(mk("span","l",label));
+ const b=mk("span","bar"),i=mk("i");i.style.width=Math.min(100,Math.max(0,100*val/(max||100)))+"%";b.appendChild(i);m.appendChild(b);m.appendChild(mk("span","v",txt));m.appendChild(mk("span"));return m}
+function swPanel(d){const w=mk("div","swp"),s=d.sw;const h=mk("div","dh swh");h.appendChild(mk("b",null,d.device));h.appendChild(mk("span","dv","SolarWinds Orion"));
+ h.appendChild(mk("span","dhost",d.host||""));h.appendChild(mk("span","dt",d.time?"read "+d.time+(d.ms!=null?" · "+(d.ms/1000).toFixed(1)+" s":""):""));w.appendChild(h);
+ if(!s){(d.errors||["no data"]).forEach(e=>w.appendChild(mk("div","dline k-warn","Could not read "+e)));return w}
+ const k=s.kpi,t=mk("div","dsum swk"),tile=(v,l,kk,ti)=>{const x=mk("div",kk?"k-"+kk:"");x.appendChild(mk("b",null,String(v)));x.appendChild(mk("span",null,l));if(ti)x.title=ti;t.appendChild(x)};
+ tile(k.availability==null?"—":k.availability+"%","nodes up",k.availability!=null&&k.availability<100?(k.availability<95?"bad":"warn"):"",k.up+" of "+(k.nodes-k.unmanaged)+" managed nodes are up");
+ tile(k.down,"nodes down",k.down?"bad":"");tile(k.warn,"nodes warning",k.warn?"warn":"");tile(k.if_down,"interfaces down",k.if_down?"bad":"");
+ tile(k.if_hot,"interfaces ≥ 80%",k.if_hot?"warn":"");tile(k.alerts,"active alerts",k.critical?"bad":k.alerts?"warn":"",k.critical+" critical or serious");
+ tile(k.unack,"not acknowledged",k.unack?"warn":"");tile(k.nodes.toLocaleString(),"nodes · "+k.ifaces.toLocaleString()+" interfaces","",k.unmanaged+" unmanaged");w.appendChild(t);
+ const g1=mk("div","swg2");g1.appendChild(swBar("Nodes by status",s.node_status));g1.appendChild(swBar("Interfaces by status",s.if_status));w.appendChild(g1);
+ const g2=mk("div","swg4"),tr=s.trend;
+ if(tr){g2.appendChild(swLine("Average CPU",tr.cpu,"%",100));g2.appendChild(swLine("Average memory",tr.mem,"%",100));
+  g2.appendChild(swLine("Average response time",tr.rt," ms"));g2.appendChild(swLine("Average packet loss",tr.loss,"%"))}
+ else{const hs=(s.hist||[]),P=f=>hs.map(x=>[x.t,x[f]]);g2.appendChild(swLine("Nodes up",P("availability"),"%",100));g2.appendChild(swLine("Active alerts",P("alerts"),""));
+  g2.appendChild(swLine("Interfaces down",P("if_down"),""));g2.appendChild(swLine("Average CPU",P("cpu"),"%",100))}
+ w.appendChild(mk("h4","swsub","Last 24 hours · "+(tr?s.trend_src:"this console's refreshes (Orion history not readable)")));w.appendChild(g2);
+ const g3=mk("div","swg3");
+ g3.appendChild(swList("Needs attention"+(s.attention_total>s.attention.length?" · "+s.attention.length+" of "+s.attention_total:""),s.attention,r=>{const x=mk("div","swr");
+  x.appendChild(mk("span","dpill k-"+(SWK[r.cls]||""),r.status));x.appendChild(mk("b",null,r.node));x.appendChild(mk("span","swd",r.issue));x.title=r.node+" ("+r.ip+") · CPU "+r["cpu_%"]+"% · memory "+r["memory_%"]+"% · response "+r.response_ms+" ms · loss "+r["packet_loss_%"]+"%";return x},"every node is up, CPU and memory below 90%"));
+ g3.appendChild(swList("Active alerts · most severe first",s.alerts,r=>{const x=mk("div","swr");
+  x.appendChild(mk("span","dpill k-"+(/critical|serious/i.test(r.severity)?"bad":/warning/i.test(r.severity)?"warn":""),r.severity));x.appendChild(mk("b",null,r.alert));
+  x.appendChild(mk("span","swd",(r.object||"")+(r.node&&r.node!==r.object?" · "+r.node:"")+" · "+r.age+(r.acknowledged!=="no"?" · ack":"")));return x},"no active alert"));
+ g3.appendChild(swList("Busiest interfaces",s.busiest,r=>swMeter(r.node+" · "+r.interface,r.util,100,r.util+"%",r.util>=90?"bad":r.util>=70?"warn":"",
+  r.node+" "+r.interface+": in "+r.in+"%, out "+r.out+"%"+(r.speed?" of "+r.speed:"")),"no interface data"));
+ g3.appendChild(swList("Interfaces down",s.if_down,r=>{const x=mk("div","swr");x.appendChild(mk("span","dpill k-bad","down"));x.appendChild(mk("b",null,r.node));
+  x.appendChild(mk("span","swd",r.interface+(r.since?" · since "+r.since:"")));return x},"no interface down"));
+ g3.appendChild(swList("Highest CPU",s.top_cpu,r=>swMeter(r.node,+r["cpu_%"]||0,100,r["cpu_%"]+"%",r["cpu_%"]>=90?"bad":r["cpu_%"]>=75?"warn":"",r.node+" ("+r.ip+"): CPU "+r["cpu_%"]+"%, memory "+r["memory_%"]+"%")));
+ const mxr=Math.max(1,...(s.slowest||[]).map(r=>+r.response_ms||0));
+ g3.appendChild(swList("Slowest to respond",s.slowest,r=>swMeter(r.node,+r.response_ms||0,mxr,r.response_ms+" ms",r.response_ms>=200?"warn":"",r.node+" ("+r.ip+"): "+r.response_ms+" ms, loss "+r["packet_loss_%"]+"%")));
+ w.appendChild(g3);(d.errors||[]).forEach(e=>w.appendChild(mk("div","dline k-warn","Could not read "+e)));return w}
+function dashRender(){if(!dashData||!dashOpen)return;const r=dashData,all=r.devices||[],body=$("#dashbody");body.textContent="";$("#dash_iv").value=String(r.interval);
+ const sws=all.filter(d=>d.vendor==="solarwinds"),conn=all.filter(d=>d.vendor!=="solarwinds"&&!d.observed),obs=all.filter(d=>d.observed);
+ const devs=conn.concat(dashObs?obs:[]);
+ sws.forEach(d=>{body.appendChild(mk("h3","dsec","Network monitoring · SolarWinds"));body.appendChild(swPanel(d))});
+ if(sws.length&&!conn.length&&!obs.length)return;
+ if(sws.length)body.appendChild(mk("h3","dsec","Firewalls & load balancers"));
+ if(obs.length){const b=mk("div","dobsbar"),l=mk("label"),cb=mk("input");cb.type="checkbox";cb.checked=dashObs;cb.onchange=()=>dashObsSet(cb.checked);
+  l.appendChild(cb);l.appendChild(document.createTextNode("Show the "+obs.length+" F5 / firewall"+(obs.length>1?"s":"")+" seen only in SolarWinds"));b.appendChild(l);
+  b.appendChild(mk("span",null,"(dashed cards: Orion's data only, not connected in this console)"));body.appendChild(b)}
+ const sum=mk("div","dsum"),tile=(v,l,k,ti)=>{const x=mk("div",k?"k-"+k:"");x.appendChild(mk("b",null,String(v)));x.appendChild(mk("span",null,l));if(ti)x.title=ti;sum.appendChild(x)};
+ const kinds=devs.map(dashKind),ifd=devs.reduce((n,d)=>n+(d.observed?(d.orion.if_down||0):(d.ifaces||[]).filter(i=>i.cls==="bad").length),0),hab=conn.filter(d=>d.ha&&(d.ha.cls==="bad"||d.ha.cls==="warn")).length;
+ tile(conn.length,obs.length?"connected":"devices");if(obs.length&&dashObs)tile(obs.length,"seen only in SolarWinds","","Firewalls and F5s Orion monitors that are not connected here");
+ tile(kinds.filter(k=>k==="bad").length,"critical",kinds.includes("bad")?"bad":"");tile(kinds.filter(k=>k==="warn").length,"warning",kinds.includes("warn")?"warn":"");
+ tile(ifd,"interfaces down",ifd?"bad":"");tile(hab,"HA problems",hab?"bad":"",obs.length?"connected devices only (Orion does not report HA)":"");body.appendChild(sum);
+ if(!devs.length){body.appendChild(mk("div","dempty",r.busy?"Reading the devices for the first time… this can take a minute.":obs.length?"Tick the box above to show the devices seen in SolarWinds.":"No data yet."));return}
  [["Firewalls",devs.filter(d=>d.vendor!=="f5")],["Load balancers (F5)",devs.filter(d=>d.vendor==="f5")]].forEach(([t,list])=>{if(!list.length)return;
-  body.appendChild(mk("h3","dsec",t));const g=mk("div","dgrid");list.forEach(d=>g.appendChild(dashCard(d)));body.appendChild(g)})}
+  const no=list.filter(d=>d.observed).length;
+  body.appendChild(mk("h3","dsec",t+(no?" · "+(list.length-no)+" connected, "+no+" from SolarWinds":"")));const g=mk("div","dgrid");list.forEach(d=>g.appendChild(d.observed?dashCardObs(d):dashCard(d)));body.appendChild(g)})}
 function dashClock(){if(!dashOpen||!dashData)return;const r=dashData,m=$("#dash_meta");
  if(r.busy){m.textContent="Refreshing now\u2026"+(r.last?" (last: "+r.last+")":"");return}
  const left=r.next_in==null?null:Math.max(0,r.next_in-Math.round((Date.now()-dashAt)/1000));
  m.textContent=(r.last?"Last refresh "+r.last+" (took "+r.took+" s)":"Not refreshed yet")+(left==null?"":" \u00b7 next in "+Math.floor(left/60)+":"+String(left%60).padStart(2,"0"))}
 setInterval(dashClock,1000);setInterval(()=>{if(dashOpen)dashLoad()},15000);
+/* ---- FortiWeb analytics: statistics, ML / API / bot, insights (from the attack log + configuration) ---- */
+let fwbOpen=false,fwbData=null,fwbSid="",fwbBusy=false,fwbPath="";
+// the FortiWeb's own analytics card (Checks & tools pane, only for the selected FortiWeb)
+function renderFwb(){const box=$("#fwbtools");if(!box)return;box.textContent="";const d=dev();if(!d||d.vendor!=="fortiweb")return;
+ const c=mk("div","card fwbcard"),h=mk("h3",null,"🛡 FortiWeb analytics");c.appendChild(h);
+ c.appendChild(mk("p","muted fwbcdesc","Attack statistics and trends, insights (spikes, monitor-mode hits, possible false positives), ML anomaly detection, ML based API protection (learned endpoints, schema, OWASP API findings) and bots, from this unit's logs. Read-only."));
+ const last=fwbData&&fwbSid===d.id?fwbData.data:null;
+ if(last){const k=last.kpi,s=mk("div","fwbcsum");[[k.attacks.toLocaleString(),"attacks"],[k.blocked_pct==null?"—":k.blocked_pct+"%","blocked"],[k.ml,"ML anomalies"],[k.api,"API violations"],[last.insights.length,"insights"]].forEach(([v,l])=>{const x=mk("span");x.appendChild(mk("b",null,String(v)));x.appendChild(document.createTextNode(" "+l));s.appendChild(x)});
+  c.appendChild(s);c.appendChild(mk("div","muted fwbcdesc","Last "+last.range+(last.policy?" · "+last.policy:"")+" · "+($("#fwb_meta").textContent||"")))}
+ const row=mk("div","fwbcrow"),sel=mk("select");sel.setAttribute("aria-label","Time range");let saved="24h";try{saved=localStorage.getItem("fwb_range")||"24h"}catch(e){}
+ [["1h","Last hour"],["6h","Last 6 hours"],["24h","Last 24 hours"],["3d","Last 3 days"],["7d","Last 7 days"]].forEach(([v,l])=>{const o=mk("option",null,l);o.value=v;sel.appendChild(o)});
+ sel.value=saved;const b=mk("button","primary","Open analytics");b.onclick=()=>fwbOpenFor(d.id,sel.value);row.appendChild(sel);row.appendChild(b);
+ c.appendChild(row);box.appendChild(c)}
+function fwbOpenFor(id,range){fwbSid=id;try{localStorage.setItem("fwb_range",range)}catch(e){}fwbToggle(true)}
+function fwbBtn(){if(!devices.some(d=>d.vendor==="fortiweb")&&fwbOpen)fwbToggle(false)}
+function fwbToggle(on){fwbOpen=on==null?!fwbOpen:!!on;$("#fwbv").hidden=!fwbOpen;document.documentElement.style.overflow=fwbOpen||dashOpen?"hidden":"";
+ if(fwbOpen){const f=devices.filter(d=>d.vendor==="fortiweb"),s=$("#fwb_dev");s.textContent="";f.forEach(d=>{const o=mk("option",null,d.name);o.value=d.id;s.appendChild(o)});
+  if(!f.some(d=>d.id===fwbSid))fwbSid=(f[0]||{}).id||"";s.value=fwbSid;$("#fwb_devl").hidden=f.length<2;
+  try{const r=localStorage.getItem("fwb_range");if(r)$("#fwb_range").value=r;fwbPath=localStorage.getItem("fwb_path")||""}catch(e){}
+  fwbLoad(false)}}
+async function fwbLoad(fresh){if(!fwbSid||fwbBusy)return;fwbBusy=true;const m=$("#fwb_meta");m.textContent="Reading the attack log and configuration…";
+ const range=$("#fwb_range").value,policy=$("#fwb_pol").value;try{localStorage.setItem("fwb_range",range)}catch(e){}
+ let r;try{r=await api("/api/fwbstats",{id:fwbSid,range,policy,fresh:!!fresh})}catch(e){r={ok:false,error:String(e)}}fwbBusy=false;
+ if(!r||!r.ok){m.textContent="";const b=$("#fwbbody");b.textContent="";b.appendChild(mk("div","dempty","Could not read: "+((r&&r.error)||"no answer")));return}
+ fwbData=r;const nm=(devices.find(x=>x.id===fwbSid)||{}).name;$("#fwbv h2").textContent="🛡 FortiWeb analytics"+(nm?" · "+nm:"");m.textContent="Read "+new Date().toLocaleTimeString()+" · "+(r.ms/1000).toFixed(1)+" s · "+r.data.rows_read.toLocaleString()+" log entries read";fwbRender();renderFwb()}
+function fwbTop(title,rows,empty,tip){return swList(title,rows,r=>swMeter(r.name,r.count,(rows[0]||{}).count||1,r.count.toLocaleString()+" · "+r.pct+"%","",(tip||"")+r.name+": "+r.count.toLocaleString()+" ("+r.pct+"%)"),empty||"none in this range")}
+function fwbTable(title,rows,cols){const w=mk("div","swbox fwbt");w.appendChild(mk("h4",null,title));
+ if(rows==null){w.appendChild(mk("div","dline k-dim","not readable on this firmware (path not found)"));return w}
+ if(!rows.length){w.appendChild(mk("div","dline k-dim","none configured"));return w}
+ cols=cols||[...new Set(rows.flatMap(r=>Object.keys(r)))].slice(0,8);const s=mk("div","fwbscroll"),t=mk("table","fwbtab"),h=mk("tr");
+ cols.forEach(c=>h.appendChild(mk("th",null,c.replace(/[_-]/g," "))));t.appendChild(h);
+ if(rows.length>100)w.appendChild(mk("div","dline k-dim","first 100 of "+rows.length.toLocaleString()+" shown"));
+ rows.slice(0,100).forEach(r=>{const tr=mk("tr");cols.forEach(c=>{const v=r[c];tr.appendChild(mk("td",c==="notes"&&v?"k-warnt":null,v==null?"":typeof v==="object"?JSON.stringify(v):String(v)))});t.appendChild(tr)});
+ s.appendChild(t);w.appendChild(s);return w}
+function fwbRender(){const r=fwbData,d=r.data,k=d.kpi,b=$("#fwbbody");b.textContent="";
+ const ps=$("#fwb_pol"),cur=d.policy;ps.textContent="";const o0=mk("option",null,"All server policies");o0.value="";ps.appendChild(o0);
+ (d.policies_seen||[]).concat(cur&&!(d.policies_seen||[]).includes(cur)?[cur]:[]).forEach(p=>{const o=mk("option",null,p);o.value=p;ps.appendChild(o)});ps.value=cur||"";
+ const sum=mk("div","dsum"),tile=(v,l,kk,ti)=>{const x=mk("div",kk?"k-"+kk:"");x.appendChild(mk("b",null,v==null?"—":String(v)));x.appendChild(mk("span",null,l));if(ti)x.title=ti;sum.appendChild(x)};
+ tile(k.attacks.toLocaleString(),"attacks");tile(k.blocked_pct==null?"—":k.blocked_pct+"%","blocked",k.blocked_pct!=null&&k.blocked_pct<50?"warn":"",k.blocked.toLocaleString()+" blocked");
+ tile(k.alert_only.toLocaleString(),"logged only",k.alert_only?"warn":"","alert action: not blocked");tile(k.clients.toLocaleString(),"attacking clients");
+ tile(k.hosts,"hosts attacked");tile(k.ml,"ML anomalies",k.ml?"warn":"");tile(k.api,"API violations",k.api?"warn":"");tile(k.bot,"bot events");
+ tile(k.high_threat,"high threat",k.high_threat?"bad":"");b.appendChild(sum);
+ if(d.log_note&&!k.attacks){const nb=mk("div","fwbpad");nb.appendChild(mk("div","swbox dline k-warn",d.log_note));b.appendChild(nb)}
+ // insights
+ const ib=mk("div","swbox fwbins");ib.appendChild(mk("h4",null,"Insights · what stands out in this range"));
+ if(!d.insights.length)ib.appendChild(mk("div","dline k-good","Nothing unusual: no spike, no dominant attacker, no monitor-mode policy hit, no false-positive pattern."));
+ d.insights.forEach(i=>{const x=mk("div","swr");x.appendChild(mk("span","dpill k-"+(i.severity==="high"?"bad":i.severity==="medium"?"warn":""),i.severity));
+  x.appendChild(mk("b",null,i.title));x.appendChild(mk("span","swd",i.detail));ib.appendChild(x)});b.appendChild(mk("div","fwbpad")).appendChild(ib);
+ // trends
+ const g2=mk("div","swg2 fwbpad");g2.appendChild(swLine("Attacks per "+d.bucket,d.series.attacks,"",0,640));g2.appendChild(swLine("Blocked share per "+d.bucket,d.series.blocked_pct,"%",100,640));b.appendChild(g2);
+ // breakdowns
+ b.appendChild(mk("h3","dsec","Attack breakdown"));const g3=mk("div","swg3 fwbpad");
+ g3.appendChild(fwbTop("By protection category",d.by_category));g3.appendChild(fwbTop("By action",d.by_action));
+ g3.appendChild(fwbTop("OWASP Top 10",d.by_owasp,"no OWASP mapping in these logs"));g3.appendChild(fwbTop("OWASP API Top 10",d.by_owasp_api||[],"no OWASP API mapping in these logs"));g3.appendChild(fwbTop("Top attack types",d.by_type));
+ g3.appendChild(fwbTop("Top signatures",d.by_signature,"no signature hits"));g3.appendChild(fwbTop("Threat level",d.by_threat,"no threat level in these logs"));b.appendChild(g3);
+ b.appendChild(mk("h3","dsec","Who and where"));const g4=mk("div","swg3 fwbpad");
+ g4.appendChild(fwbTop("Top clients",d.by_client));g4.appendChild(fwbTop("Countries",d.by_country,"no country in these logs"));g4.appendChild(fwbTop("Server policies",d.by_policy));
+ g4.appendChild(fwbTop("Hosts",d.by_host));g4.appendChild(fwbTop("User agents",d.by_agent||[],"no user agent in these logs"));g4.appendChild(fwbTop("TLS fingerprints (JA4)",d.by_ja4||[],"no JA4 in these logs"));g4.appendChild(fwbTop("URLs",d.by_url));g4.appendChild(fwbTop("HTTP methods",d.by_method));b.appendChild(g4);
+ // ML / API / bot
+ const sec=(t,n)=>b.appendChild(mk("h3","dsec",t+" · "+n.toLocaleString()+" event"+(n===1?"":"s")));
+ sec("Machine learning · anomaly detection",d.ml.events);const g5=mk("div","swg3 fwbpad");
+ g5.appendChild(fwbTop("Anomalies by URL",d.ml.by_url,"no ML anomaly in this range"));g5.appendChild(fwbTop("Anomaly types",d.ml.by_type,"—"));
+ g5.appendChild(fwbTop("Parameters / match types",d.ml.by_parameter,"—"));g5.appendChild(fwbTable("ML policies (configuration)",d.config.ml_policies));b.appendChild(g5);
+ sec("API protection · ML and schema",d.api.events);const g6=mk("div","swg3 fwbpad");
+ g6.appendChild(fwbTop("Violations by endpoint",d.api.by_endpoint,"no API violation in this range"));g6.appendChild(fwbTop("Violation types",d.api.by_type,"—"));
+ g6.appendChild(fwbTop("Schema properties (missing / not allowed)",d.api.by_property||[],"no property named in the messages"));g6.appendChild(fwbTop("OWASP API Top 10 (API events)",d.api.by_owasp_api||[],"—"));
+ g6.appendChild(fwbTable("API learning (ML) policies",d.config.api_learning_policies));g6.appendChild(fwbTable("API protection policies",d.config.api_protection_policies));b.appendChild(g6);
+ b.appendChild(mk("div","fwbpad")).appendChild(fwbMlPanel());
+ sec("Bots",d.bot.events);const g7=mk("div","swg3 fwbpad");g7.appendChild(fwbTop("Bot detections",d.bot.by_type,"no bot event in this range"));
+ g7.appendChild(fwbTop("Bot clients",d.bot.by_client,"—"));g7.appendChild(fwbTable("Bot policies",d.config.bot_policies));b.appendChild(g7);
+ b.appendChild(mk("h3","dsec","Server policies"));const g8=mk("div","fwbpad");g8.appendChild(fwbTable("Mode, protection profile, pool",d.config.server_policies,["policy","mode","protection_profile","server_pool","notes"]));b.appendChild(g8);
+ // data straight from the GUI API (API discovery, ML models ...)
+ b.appendChild(mk("h3","dsec","From the FortiWeb GUI API"));const gx=mk("div","swbox fwbpad fwbgui");
+ gx.appendChild(mk("div","dline k-dim","API discovery results and ML model status are not in the documented API. Open that page in the FortiWeb GUI with the browser's developer tools (F12 → Network → Fetch/XHR), copy the request path that starts with /api/v2.0/, and load it here (read-only GET). Send me the path and it becomes part of this dashboard."));
+ const row=mk("div","fwbrow"),inp=mk("input");inp.id="fwb_path";inp.value=fwbPath;inp.placeholder="/api/v2.0/…";const btn=mk("button",null,"Load");btn.onclick=fwbGui;row.appendChild(inp);row.appendChild(btn);gx.appendChild(row);
+ gx.appendChild(mk("div",null)).id="fwb_gui";b.appendChild(mk("div","fwbpad")).appendChild(gx);
+ b.appendChild(mk("div","dline k-dim fwbfoot","Source: "+d.log_path+" · "+d.rows_read.toLocaleString()+" entries read, "+d.time_parsed.toLocaleString()+" with a time"+(d.log_note?" · "+d.log_note:"")+(d.config_not_read.length?" · not readable on this firmware: "+d.config_not_read.join(", "):"")))}
+async function fwbGui(){const p=$("#fwb_path").value.trim(),out=$("#fwb_gui");out.textContent="";if(!p)return;fwbPath=p;try{localStorage.setItem("fwb_path",p)}catch(e){}
+ out.appendChild(mk("div","dline k-dim","Reading…"));const r=await api("/api/raw",{id:fwbSid,query:p});out.textContent="";
+ if(!r.ok){out.appendChild(mk("div","dline k-warn",r.error||"no answer"));return}
+ let rows=r.data;const find=x=>Array.isArray(x)?x:x&&typeof x==="object"?(Object.values(x).find(v=>Array.isArray(v)&&v.length&&typeof v[0]==="object")||[x]):[];rows=find(rows).filter(x=>x&&typeof x==="object");
+ out.appendChild(mk("div","dline",rows.length.toLocaleString()+" row(s) from "+p));fwbRows(out,rows)}
+function fwbRows(out,rows){rows=(rows||[]).filter(x=>x&&typeof x==="object");if(!rows.length){out.appendChild(mk("div","dline k-dim","no rows"));return}
+ const cols=[...new Set(rows.flatMap(x=>Object.keys(x)))],num=cols.filter(c=>rows.some(x=>typeof x[c]==="number")),str=cols.filter(c=>!num.includes(c)&&rows.some(x=>typeof x[c]==="string"));
+ const g=mk("div","swg3");
+ // a few charts picked from the data: counts by the low-cardinality text columns, and the largest values of the first number column
+ str.filter(c=>{const n=new Set(rows.map(x=>x[c])).size;return n>1&&n<=20&&n<rows.length}).slice(0,3).forEach(c=>{const cnt={};rows.forEach(x=>{const v=String(x[c]??"");cnt[v]=(cnt[v]||0)+1});
+  const top=Object.entries(cnt).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([name,count])=>({name,count,pct:Math.round(1000*count/rows.length)/10}));g.appendChild(fwbTop("Count by "+c.replace(/[_-]/g," "),top))});
+ if(num.length&&str.length){const uniq=c=>new Set(rows.map(x=>x[c])).size,one=str.find(c=>uniq(c)===rows.length),
+   labs=one?[one]:str.filter(c=>uniq(c)>1).sort((a,b)=>uniq(b)-uniq(a)).slice(0,2).reverse(),v=num[0];
+  const top=rows.filter(x=>typeof x[v]==="number").sort((a,b)=>b[v]-a[v]).slice(0,10).map(x=>({name:labs.map(c=>String(x[c]??"")).join(" "),count:x[v],pct:0}));
+  g.appendChild(swList("Highest "+v.replace(/[_-]/g," ")+" by "+labs.join(" + ").replace(/[_-]/g," "),top,x=>swMeter(x.name,x.count,top[0].count||1,x.count.toLocaleString(),"",x.name+": "+x.count),"—"))}
+ if(g.children.length)out.appendChild(g);out.appendChild(fwbTable("Rows",rows))}
+let fwbMlSel="",fwbMlBusy=false;
+function fwbMlPanel(){const w=mk("div","swbox");w.appendChild(mk("h4",null,"ML based API protection · learned domains, schema and events"));
+ const row=mk("div","fwbrow"),sel=mk("select");sel.id="fwb_mlsel";const o0=mk("option",null,"Loading the learned domains…");o0.value="";sel.appendChild(o0);row.appendChild(sel);
+ [["Overview","overview"],["Schema","schema"],["Event log","eventlog"],["Learned URLs","urls"],["Policies","rules"]].forEach(([tx,v])=>{const b=mk("button",null,tx);b.onclick=()=>fwbMl(v);row.appendChild(b)});
+ w.appendChild(row);const out=mk("div");out.id="fwb_mlout";w.appendChild(out);setTimeout(()=>fwbMl("rules",true),0);return w}
+function fwbMlOverview(out,d){const NM={endpoints:"API endpoints",running:"Models running",collecting:"Collecting samples",discarded:"Models discarded"},
+  lab=s=>NM[s]||s.replace(/[._-]+/g," ").replace(/\b\w/g,c=>c.toUpperCase());
+ if(d.kpis.length){const s=mk("div","dsum fwbk");d.kpis.slice(0,10).forEach(k=>{const x=mk("div",/discard/i.test(k.name)&&k.value?"k-warn":/collect/i.test(k.name)&&k.value?"k-warn":"");
+  x.appendChild(mk("b",null,(+k.value).toLocaleString()));x.appendChild(mk("span",null,lab(k.name)));s.appendChild(x)});out.appendChild(s)}
+ if(d.insights.length){const ib=mk("div","fwbmli");d.insights.forEach(i=>{const x=mk("div","swr");x.appendChild(mk("span","dpill k-"+(i.severity==="medium"?"warn":i.severity==="high"?"bad":""),i.severity));
+  x.appendChild(mk("b",null,i.title));if(i.detail)x.appendChild(mk("span","swd",i.detail));ib.appendChild(x)});out.appendChild(ib)}
+ Object.values(d.groups||{}).forEach(g=>{out.appendChild(mk("h4","fwbmlh",g.title+" · "+Object.entries(g.totals).map(([n,v])=>n+" "+(+v).toLocaleString()).join(", ")));
+  const ns_=Object.keys(g.series).length,w=mk("div",ns_<=2?"swg2":"swg4");Object.entries(g.series).forEach(([n,pts])=>w.appendChild(swLine(n,pts,"",0,ns_<=2?640:300)));out.appendChild(w)});
+ const tops=Object.values(d.tops||{});if(tops.length){const g=mk("div","swg3 fwbmlg");tops.forEach(x=>g.appendChild(fwbTop(x.title,x.rows,"none in this period")));out.appendChild(g)}
+ Object.entries(d.lists||{}).forEach(([name,rows])=>{out.appendChild(mk("h4","fwbmlh",lab(name)));fwbRows(out,[].concat(rows))})}
+// the GUI's API View: the learned schema (YAML / JSON) on the left, the endpoints Swagger-style on the right
+function fwbSchemaView(out,d){const eps=d.endpoints,bar=mk("div","fwbrow fwbsbar");
+ const f=mk("input","fwbflt");f.placeholder="Filter endpoints: path, method, parameter, field…";bar.appendChild(f);
+ const exp=mk("button",null,"Expand all"),col=mk("button",null,"Collapse all"),dl=mk("button",null,"⤓ Export "+(d.format==="yaml"?"YAML":"JSON"));
+ bar.appendChild(exp);bar.appendChild(col);bar.appendChild(dl);out.appendChild(bar);
+ dl.onclick=()=>{const b=new Blob([d.text],{type:"text/plain"}),a=mk("a");a.href=URL.createObjectURL(b);a.download=(d.domain||"api")+"."+(d.format==="yaml"?"yaml":"json");document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},500)};
+ const g=mk("div","fwbapiv"),left=mk("pre","fwbyaml"),right=mk("div","fwbapis");g.appendChild(left);g.appendChild(right);out.appendChild(g);
+ // YAML / JSON with colours (keys, strings, numbers); every line is a span so an endpoint can scroll to it
+ const lines=d.text.split("\n"),pathLine={};let curPath=null;
+ lines.forEach((l,i)=>{const row=mk("div","yl"),m=l.match(/^(\s*)(- )?("?[^":]+"?)(:)(.*)$/);
+  if(m){row.appendChild(document.createTextNode(m[1]+(m[2]||"")));const k=mk("span",/^\s{0,4}\/|^\s*"\//.test(m[1]+m[3])&&m[3].replace(/"/g,"").startsWith("/")?"yk yp":"yk",m[3]);row.appendChild(k);row.appendChild(document.createTextNode(":"));
+   const v=m[5];if(v.trim())row.appendChild(mk("span",/^\s*['"]/.test(v)?"ys":/^\s*-?\d/.test(v)?"yn":/^\s*(\[\]|\{\})/.test(v)?"yb":"yv",v));
+   const key=m[3].replace(/"/g,"");if(key.startsWith("/")){curPath=key;pathLine[key]=row}}
+  else row.textContent=l||" ";left.appendChild(row)});
+ // header like the GUI
+ const h=mk("div","fwbapih");const t1=mk("h3",null,d.domain||d.title||"API");if(d.openapi)t1.appendChild(mk("span","fwbver",d.openapi));h.appendChild(t1);
+ if(d.description)h.appendChild(mk("div","dline k-dim",d.description));h.appendChild(mk("div","dline",eps.length+" endpoint(s) · "+d.by_method.map(x=>x.name+" "+x.count).join(" · ")));right.appendChild(h);
+ const list=mk("div");right.appendChild(list);const cards=[];
+ const tbl=(cols,rows)=>{const t=mk("table","fwbtab");const hr=mk("tr");cols.forEach(c=>hr.appendChild(mk("th",null,c[1])));t.appendChild(hr);
+  rows.forEach(r=>{const tr=mk("tr");cols.forEach(c=>tr.appendChild(mk("td",null,typeof c[0]==="function"?c[0](r):String(r[c[0]]??""))));t.appendChild(tr)});return t};
+ eps.forEach(e=>{const c=mk("details","fwbop m-"+e.method.toLowerCase()),s=mk("summary");s.appendChild(mk("span","fwbmb",e.method));s.appendChild(mk("span","fwbpath",e.path));
+  const fl=e.flags;if(fl){if(fl.auth!=="required")s.appendChild(mk("span","dpill"+(fl.data?" k-bad":""),"no auth"));if(/collect/i.test(fl.status))s.appendChild(mk("span","dpill k-warn","collecting"));
+   if(fl.zombie)s.appendChild(mk("span","dpill","zombie"));if(fl.excessive_data)s.appendChild(mk("span","dpill k-bad","excessive data"));if(fl.data)s.appendChild(mk("span","dpill fwbow",fl.data))}
+  c.appendChild(s);const b=mk("div","fwbopb"),x=e.detail||{};
+  b.appendChild(mk("div","dline k-dim",[e.url_id!==""&&e.url_id!=null?"url_id "+e.url_id:"",fl?"model: "+fl.status+" · authentication "+fl.auth:"",x.summary||""].filter(Boolean).join(" · ")));
+  b.appendChild(mk("h5",null,"Parameters"));b.appendChild((x.params||[]).length?tbl([["in","in"],["name","name"],["type","type"],[r=>r.required?"yes":"","required"]],x.params):mk("div","dline k-dim","none"));
+  b.appendChild(mk("h5",null,"Request body"+((x.body_types||[]).length?" · "+x.body_types.join(", "):"")));
+  b.appendChild((x.body||[]).length?tbl([["name","field"],["type","type"],[r=>r.required?"yes":"","required"],["format","format / pattern"]],x.body):mk("div","dline k-dim",(x.body_types||[]).length?"schema learned without fields ({})":"no body"));
+  b.appendChild(mk("h5",null,"Responses"));(x.responses||[]).forEach(r=>{b.appendChild(mk("div","dline",r.code+(r.description?" · "+r.description:"")+(r.fields.length?" · fields: "+r.fields.map(f=>f.name+(f.type?" ("+f.type+")":"")).join(", "):"")))});
+  c.appendChild(b);c.addEventListener("toggle",()=>{if(c.open&&pathLine[e.path]){left.scrollTop=pathLine[e.path].offsetTop-left.offsetTop-8;
+   left.querySelectorAll(".yhl").forEach(z=>z.classList.remove("yhl"));pathLine[e.path].classList.add("yhl")}});
+  list.appendChild(c);cards.push([c,JSON.stringify(e).toLowerCase()])});
+ f.oninput=()=>{const q=f.value.toLowerCase();cards.forEach(([c,s])=>{c.style.display=!q||s.includes(q)?"":"none"})};
+ exp.onclick=()=>cards.forEach(([c])=>{if(c.style.display!=="none")c.open=true});col.onclick=()=>cards.forEach(([c])=>c.open=false)}
+function fwbMlPick(){const s=$("#fwb_mlsel");try{return s&&s.value?JSON.parse(s.value):{}}catch(e){return{}}}
+async function fwbMl(view,init){const out=$("#fwb_mlout"),sel=$("#fwb_mlsel");if(!out)return;const v=fwbMlPick();
+ const need=view==="schema"||view==="eventlog"||view==="overview"||(view==="urls"&&!init);
+ if(need&&!(view==="urls"?v.rule_id!=null&&v.rule_id!=="":v.domain)){out.textContent="";
+  out.appendChild(mk("div","dline k-warn",fwbMlBusy?"The learned domains are still loading from FortiWeb: wait for the list above.":"Pick a learned domain in the list first."));return}
+ if(init)fwbMlBusy=true;out.textContent="";const wait=mk("div","dline k-dim","Reading "+({rules:"the API learning policies",urls:"the learned URLs",overview:"the overview",schema:"the learned schema",eventlog:"the event log"}[view]||view)+" from FortiWeb…");out.appendChild(wait);
+ const t0=Date.now(),tick=setInterval(()=>{wait.textContent=wait.textContent.replace(/ \(\d+ s\)$/,"")+" ("+Math.round((Date.now()-t0)/1000)+" s)"},1000);
+ let r;try{r=await api("/api/fwbml",{id:fwbSid,view,domain:v.domain,policy:v.policy,rule_id:view==="urls"||view==="schema"?v.rule_id:undefined})}catch(e){r={ok:false,error:String(e)}}clearInterval(tick);if(init)fwbMlBusy=false;out.textContent="";
+ if(!r||!r.ok){const er=(r&&r.error)||"no answer";out.appendChild(mk("div","dline k-warn","Could not read "+view+": "+er));
+  if(/40[13]/.test(er))out.appendChild(mk("div","dline k-dim","HTTP 401 / 403: the administrator the console logs in with may lack read access to API Protection, or FortiWeb accepts this GUI path only from a GUI session."));
+  if(init){sel.textContent="";const o=mk("option",null,"(learned domains not readable: see the message below)");o.value="";sel.appendChild(o)}return}
+ if(view==="rules"||(view==="urls"&&init)){const ds=r.data.domains||[];
+  if(!ds.length&&view==="rules"&&init){fwbMl("urls",true);return}   // no domain in the policy list: try the learned URLs
+  sel.textContent="";if(!ds.length)sel.appendChild(mk("option",null,"(no domain field found: see the rows below)"));
+  ds.forEach(d=>{const o=mk("option",null,d.domain+(d.policy?" · "+d.policy:"")+(d.paths!=null&&d.paths!==""?" · "+(+d.paths).toLocaleString()+" API paths":""));o.value=JSON.stringify({domain:d.domain,policy:d.policy,rule_id:d.rule_id});sel.appendChild(o)});
+  if(!fwbMlSel)try{fwbMlSel=localStorage.getItem("fwb_mlsel")||""}catch(e){}
+  if(fwbMlSel&&[...sel.options].some(o=>o.value===fwbMlSel))sel.value=fwbMlSel;
+  sel.onchange=()=>{fwbMlSel=sel.value;try{localStorage.setItem("fwb_mlsel",sel.value)}catch(e){}fwbMl("overview")};
+  if(init&&ds.length){fwbMl("overview");return}}
+ (r.summary||[]).forEach(s=>out.appendChild(mk("div","dline",s)));
+ if(view==="overview"){fwbMlOverview(out,r.data);return}
+ if(view==="schema"&&r.data.endpoints){fwbSchemaView(out,r.data);return}
+ if(view==="schema"){const x=r.data.schema_raw;out.appendChild(mk("pre","fwbpre",typeof x==="string"?x.slice(0,20000):JSON.stringify(x,null,1).slice(0,20000)));return}
+ if(view==="urls"&&r.data.inventory){fwbMlInventory(out,r.data.inventory);return}
+ fwbRows(out,view==="urls"?r.data.urls:view==="rules"?r.data.policies:r.data.events)}
+// the GUI's Tree View, rebuilt from the learned paths: one level per path segment, endpoint counts and flags per branch
+function fwbPathTree(eps){const root={k:{},e:[]};eps.forEach(e=>{let n=root;e.path.split("/").filter(Boolean).forEach(s=>{n=n.k[s]=n.k[s]||{k:{},e:[]}});n.e.push(e)});
+ const all=n=>n.e.concat(...Object.values(n.k).map(all)),w=mk("div","swbox fwbtree");w.appendChild(mk("h4",null,"Path tree · "+eps.length+" endpoint(s)"));
+ const badge=(es,el)=>{const z=es.filter(e=>e.zombie).length,c=es.filter(e=>/collect|sampl/i.test(e.status)).length,na=es.filter(e=>e.auth!=="required"&&e.data).length;
+  el.appendChild(mk("span","fwbtc",es.length+" endpoint"+(es.length>1?"s":"")));if(na)el.appendChild(mk("span","dpill k-bad",na+" sensitive, no auth"));
+  if(c)el.appendChild(mk("span","dpill k-warn",c+" collecting"));if(z)el.appendChild(mk("span","dpill",z+" zombie"))};
+ const draw=(n,name,depth,par)=>{const kids=Object.keys(n.k).sort();
+  if(depth>0){const d=mk("details");if(depth<2)d.open=true;const sm=mk("summary");sm.appendChild(mk("b",null,"/"+name));badge(all(n),sm);d.appendChild(sm);par.appendChild(d);par=d}
+  n.e.forEach(e=>{const x=mk("div","fwbleaf");x.appendChild(mk("span","fwbm",e.method));x.appendChild(mk("span",null,e.status));
+   if(e.auth!=="required")x.appendChild(mk("span","dpill"+(e.data?" k-bad":""),"no auth"));if(e.data)x.appendChild(mk("span","swd",e.data));if(e.zombie)x.appendChild(mk("span","dpill","zombie"));par.appendChild(x)});
+  kids.forEach(k=>draw(n.k[k],k,depth+1,par))};
+ draw(root,"",0,w);return w}
+function fwbMlInventory(out,iv){const k=iv.kpi,s=mk("div","dsum fwbk"),tile=(v,l,kk,ti)=>{const x=mk("div",kk?"k-"+kk:"");x.appendChild(mk("b",null,(+v).toLocaleString()));x.appendChild(mk("span",null,l));if(ti)x.title=ti;s.appendChild(x)};
+ tile(k.endpoints,"learned endpoints");tile(k.running,"model running");tile(k.collecting,"collecting samples",k.collecting?"warn":"");tile(k.zombie,"zombie APIs",k.zombie?"warn":"","learned endpoints that no longer get traffic");
+ tile(k.auth_required,"need authentication");tile(k.sensitive_no_auth,"sensitive data, no auth",k.sensitive_no_auth?"bad":"");tile(k.excessive_data,"excessive data exposure",k.excessive_data?"bad":"");out.appendChild(s);
+ if(iv.insights.length){const ib=mk("div","fwbmli");iv.insights.forEach(i=>{const x=mk("div","swr");x.appendChild(mk("span","dpill k-"+(i.severity==="high"?"bad":i.severity==="medium"?"warn":""),i.severity));
+  x.appendChild(mk("b",null,i.title));if(i.owasp)x.appendChild(mk("span","dpill fwbow",i.owasp));if(i.detail)x.appendChild(mk("span","swd",i.detail));ib.appendChild(x)});out.appendChild(ib)}
+ const g=mk("div","swg3 fwbmlg");g.appendChild(fwbTop("Model status",iv.by_status));g.appendChild(fwbTop("Methods",iv.by_method));g.appendChild(fwbTop("Authentication",iv.by_auth));
+ g.appendChild(fwbTop("Data categories (endpoints)",iv.by_category,"no data category learned"));out.appendChild(g);
+ out.appendChild(fwbPathTree(iv.endpoints));
+ const f=mk("input","fwbflt");f.placeholder="Filter endpoints: path, method, status, data category…";const tb=mk("div"),rows=iv.endpoints.map(e=>({path:e.path,method:e.method,status:e.status,auth:e.auth,zombie:e.zombie?"yes":"",excessive_data:e.excessive_data?"yes":"",data:e.data,dlp:e.dlp,action:e.action,severity:e.severity}));
+ f.oninput=()=>{tb.textContent="";const q=f.value.toLowerCase();tb.appendChild(fwbTable("Learned endpoints",rows.filter(e=>!q||JSON.stringify(e).toLowerCase().includes(q))))};out.appendChild(f);out.appendChild(tb);f.oninput()}
+function fwbAsk(){if(!fwbData)return;const ml=fwbMlPick();aiSrcSet({kind:"fwbstats",id:fwbSid,range:fwbData.data.range,policy:fwbData.data.policy,ml_domain:ml.domain||"",ml_policy:ml.policy||"",ml_rule_id:ml.rule_id==null?"":String(ml.rule_id),name:(devices.find(d=>d.id===fwbSid)||{}).name||"FortiWeb"});
+ aiToggle(true);aiAsk("chat","Using these FortiWeb statistics: give a short security assessment of this range. 1. What stands out and why (most important first, with the numbers). 2. For each insight, whether it is a real attack, a likely false positive or a configuration gap, and the evidence. 3. ML anomaly detection and API protection: what the events show, whether models / schemas may need relearning or updating; if the learned endpoint inventory of a domain is included, go through its findings by OWASP API Security Top 10 (2023) category; if the learned API schema of a domain is included, review it (sensitive endpoints, endpoints without parameters learned, unexpected methods such as DELETE / PUT, inconsistent paths). 4. Concrete next steps in the FortiWeb GUI (which menu, which setting).","Assess the FortiWeb statistics")}
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&fwbOpen&&!e._ai&&$("#aicard").hidden)fwbToggle(false)});
 /* vendor advisories headline */
 let advData=null,advSel=-1,advT=null;const ADV_V=["f5","paloalto","fortigate"];
 async function advPoll(){clearTimeout(advT);
@@ -13129,6 +15486,7 @@ function advPanel(){const r=advData,p=$("#advpanel"),g=advSel>=0?(r.results||[])
   if(g.error)h+='<div class="abox">'+esc(g.error)+'</div>';
   else if(!(g.items||[]).length)h+='<div class="abox"><span class="aok">✓ No published '+esc(r.min)+'-or-higher advisory (or exploited issue) affects '+esc(g.version)+'.</span></div>';
   else{h+='<div class="abox"><b>Advice:</b> '+esc(g.advice?g.advice.text:"")+'<br><span class="adim">This is the lowest release the published advisories show as fixed, not a vendor recommendation. Check </span><a href="'+esc(g.help.url)+'" target="_blank" rel="noopener noreferrer">'+esc(g.help.text)+'</a><span class="adim"> before you pick the release, and read each advisory: some only apply when a feature is in use (GlobalProtect, management interface reachable, APM…).</span></div>';
+   h+='<div class="abox"><b>Configuration:</b> <span class="adim">does each issue need a feature this unit uses? Reads the configuration (read-only), then asks the AI assistant.</span><div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">'+(g.ids||[]).map((id,k)=>'<button onclick="advCfg('+advSel+','+k+')">Check '+esc((g.devices||[])[k]||"device")+' against its configuration (AI)</button>').join("")+'</div></div>';
    h+='<table><thead><tr><th>Severity</th><th>Advisory</th><th>Issue</th><th>Fixed in (your train)</th><th>Exploited</th><th>Published</th></tr></thead><tbody>';
    g.items.forEach(x=>{h+='<tr><td class="nw"><span class="apill '+(x.sev==="critical"?"a-c":x.sev==="high"?"a-h":"a-m")+'">'+esc(x.sev)+(x.score!=null?' '+esc(x.score):'')+'</span></td><td class="nw"><a href="'+esc(x.url)+'" target="_blank" rel="noopener noreferrer">'+esc(x.id)+'</a></td><td>'+esc(x.title)+(x.note?' <span class="adim">('+esc(x.note)+')</span>':'')+'</td><td class="nw">'+esc(x.fix||"no fix listed")+'</td><td>'+(x.kev?'<span class="apill a-k">yes</span>':'')+'</td><td class="nw">'+esc(x.date)+'</td></tr>'});
    h+='</tbody></table>'}}
@@ -13137,15 +15495,23 @@ function advPanel(){const r=advData,p=$("#advpanel"),g=advSel>=0?(r.results||[])
  Object.entries(r.errors||{}).forEach(([k,v])=>{h+='<span style="color:var(--bad)">⚠ '+esc(k)+': '+esc(v)+'</span><br>'});
  h+='Only whole public lists are downloaded (Palo Alto, NVD, CVE.org, CISA); device versions are matched here and never sent out.</div>';
  p.innerHTML=h}
+async function advCfg(i,k){const g=((advData||{}).results||[])[i];if(!g||!g.ids||!g.ids[k])return;const id=g.ids[k],nm=(g.devices||[])[k]||"device";
+ const lbl="Advisories vs configuration · "+nm;setBusy(lbl);
+ const r=await api("/api/run",{id,check:"advcfg",params:{}});if(r&&typeof r==="object")r._dev=id;show(r,lbl);
+ lastCtx.device=nm;   // the output is from this unit, not from the device selected on the left
+ if(!r||!r.ok||!r.ai_question)return;
+ if(!((r.data||{}).advisories||[]).length)return;   // nothing to judge
+ aiToggle(true);aiAsk("chat",r.ai_question,"Check the "+g.label+" "+g.version+" advisories against the configuration of "+nm)}
 async function advSet(b){const r=await api("/api/adv",b);if(!r.ok){alert(r.error);return}setTimeout(advPoll,400)}
 setTimeout(advPoll,2500);
 /* iRule code pop-up */
 let irCode="";
+const IRULE_Q="Explain this iRule for an F5 engineer, quoting line numbers: 1. its purpose in one or two sentences; 2. each event (when ...) in the order it fires and what it does (hosts, URIs, headers, pools, redirects, responses, data groups, tables, variables); 3. the resulting traffic flow as short if -> then steps; 4. problems: bugs, unhandled cases, security risks (header or log injection, open redirect, trusting client headers), performance (regex or class match per request, loops, heavy logging); 5. concrete improvements with corrected code where useful. Do not invent behaviour that is not in the code; if it depends on a data group, pool or iRule you cannot see, say so.";
 function irClose(){$("#irpop").hidden=true}
 async function irulePop(id,name){let p=$("#irpop");
  if(!p){p=mk("div");p.id="irpop";p.setAttribute("role","dialog");p.setAttribute("aria-modal","true");document.body.appendChild(p);
   p.addEventListener("click",e=>{if(e.target===p)irClose()})}
- irCode="";p.innerHTML='<div class="irbox"><div class="irhead"><h3></h3><button id="ircopy" disabled>Copy</button><button class="themebtn" onclick="irClose()" title="Close (Esc)" aria-label="Close">✕</button></div><div class="irmsg">Reading the iRule…</div></div>';
+ irCode="";p.innerHTML='<div class="irbox"><div class="irhead"><h3></h3><button id="ircopy" disabled>Copy</button><button id="irai" class="irai" disabled title="Explain this iRule with the AI assistant">✦ Explain with AI</button><button class="themebtn" onclick="irClose()" title="Close (Esc)" aria-label="Close">✕</button></div><div class="irmsg">Reading the iRule…</div></div>';
  p.querySelector("h3").textContent=name;p.hidden=false;
  let r;try{r=await api("/api/f5irule",{id,name})}catch(e){r={ok:false,error:String(e)}}
  if(p.hidden||p.querySelector("h3").textContent!==name)return;   // closed, or another iRule opened meanwhile
@@ -13153,7 +15519,8 @@ async function irulePop(id,name){let p=$("#irpop");
  if(!r||!r.ok){msg.textContent="⚠ "+((r&&r.error)||"could not read the iRule");return}
  irCode=r.code;const ls=r.code.replace(/\r/g,"").replace(/\n+$/,"").split("\n");const h=p.querySelector("h3");h.textContent=r.name+" ";h.appendChild(mk("span",null,"· "+r.device+" · "+ls.length+" lines"));
  const c=mk("div","ircode");if(!r.code.trim())c.appendChild(mk("div",null,"(empty iRule)"));else ls.forEach(l=>c.appendChild(mk("div",null,l||" ")));
- msg.replaceWith(c);const b=$("#ircopy");b.disabled=false;
+ msg.replaceWith(c);const b=$("#ircopy");b.disabled=false;const ai=$("#irai");ai.disabled=!r.code.trim();
+ ai.onclick=()=>{irClose();aiSrcSet({kind:"irule",id,name:r.name,device:r.device});aiToggle(true);aiAsk("chat",IRULE_Q,"Explain iRule "+r.name)};
  b.onclick=async()=>{try{await navigator.clipboard.writeText(irCode);b.textContent="Copied"}catch(e){const t=document.createElement("textarea");t.value=irCode;document.body.appendChild(t);t.select();document.execCommand("copy");t.remove();b.textContent="Copied"}setTimeout(()=>b.textContent="Copy",1500)}}
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("#irpop")&&!$("#irpop").hidden){irClose();e.stopImmediatePropagation()}},true);
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&dashOpen&&!e._ai&&$("#aicard").hidden)dashToggle(false)});
@@ -13650,7 +16017,7 @@ def do_monitor_set(b):
 DASH = {"on": True, "interval": 1200, "busy": False, "next": 0.0, "last": "", "took": 0, "devices": {}, "hist": {},
         "seen": {}, "prev_ha": {}, "lock": threading.Lock()}
 DASH_INTERVALS = (300, 600, 1200, 1800, 3600)
-DASH_VENDORS = ("f5", "paloalto", "fortigate")
+DASH_VENDORS = ("f5", "paloalto", "fortigate", "solarwinds")
 DASH_HIST = 72   # passes kept for the sparklines (24 hours at 20 minutes)
 
 
@@ -13779,7 +16146,140 @@ def dash_ha_fg(sess):
 DASH_HA = {"f5": dash_ha_f5, "paloalto": dash_ha_pan, "fortigate": dash_ha_fg}
 
 
+# SolarWinds on the dashboard: one network-wide panel per Orion server, plus each firewall / F5 card gets the health
+# Orion reports for that unit (matched by management IP, else by name). Trends come from Orion's own history
+# (hourly averages over all nodes, last 24 h); if this Orion rejects the history query, the console's own refreshes
+# are charted instead.
+SW_TREND_Q = {
+    "cpu": ("SELECT DATETRUNC('hour', c.DateTime) AS T, AVG(c.AvgLoad) AS A, AVG(c.AvgPercentMemoryUsed) AS B "
+            "FROM Orion.CPULoad c WHERE c.DateTime > ADDDAY(-1, GETDATE()) GROUP BY DATETRUNC('hour', c.DateTime)",
+            "SELECT MIN(c.DateTime) AS T, AVG(c.AvgLoad) AS A, AVG(c.AvgPercentMemoryUsed) AS B FROM Orion.CPULoad c "
+            "WHERE c.DateTime > ADDDAY(-1, GETDATE()) GROUP BY DAY(c.DateTime), HOUR(c.DateTime)"),
+    "rt": ("SELECT DATETRUNC('hour', r.DateTime) AS T, AVG(r.AvgResponseTime) AS A, AVG(r.PercentLoss) AS B "
+           "FROM Orion.ResponseTime r WHERE r.DateTime > ADDDAY(-1, GETDATE()) GROUP BY DATETRUNC('hour', r.DateTime)",
+           "SELECT MIN(r.DateTime) AS T, AVG(r.AvgResponseTime) AS A, AVG(r.PercentLoss) AS B FROM Orion.ResponseTime r "
+           "WHERE r.DateTime > ADDDAY(-1, GETDATE()) GROUP BY DAY(r.DateTime), HOUR(r.DateTime)")}
+
+
+def dash_sw_trend(sess):
+    """Hourly averages over all nodes for the last 24 h -> {cpu, mem, rt, loss: [[label, value], ...]} (Orion history)."""
+    out = {}
+    for key, (ka, kb) in (("cpu", ("cpu", "mem")), ("rt", ("rt", "loss"))):
+        rows, _ = sw_first(sess, SW_TREND_Q[key])
+        rows = sorted((r for r in rows if r.get("T")), key=lambda r: str(r["T"]))[-25:]
+        out[ka] = [[sw_dt(r["T"])[5:16], sw_num(r.get("A"), 1)] for r in rows]   # "11-19 15:00"
+        out[kb] = [[sw_dt(r["T"])[5:16], sw_num(r.get("B"), 2)] for r in rows]
+    return out
+
+
+SW_DEV_KINDS = (("f5", re.compile(r"\bF5\b|BIG-?IP", re.I)),
+                ("paloalto", re.compile(r"palo\s*alto|\bPA-\d|\bPAN-?OS\b", re.I)),
+                ("fortigate", re.compile(r"fortinet|forti\s*gate|fortios", re.I)),
+                ("firewall", re.compile(r"check\s*point|\bASA\b|adaptive security|firepower|\bFTD\b|\bSRX\d*|sonicwall|"
+                                        r"sophos|watchguard|forcepoint|stonesoft|barracuda", re.I)))
+
+
+def sw_dev_kind(n):
+    """f5 / paloalto / fortigate / firewall from the Orion node's vendor and machine type ('' = something else)."""
+    text = "%s | %s" % (n.get("vendor") or "", n.get("model") or "")
+    return next((k for k, rx in SW_DEV_KINDS if rx.search(text)), "")
+
+
+def dash_sw(sid, sess):
+    t0, errs = time.time(), []
+    nodes = sw_nodes_read(sess)
+    try:
+        ifs = sw_iface_rows(sess, sw_ifaces_read(sess), {n["_id"]: n["node"] for n in nodes})
+    except SwError as e:
+        ifs = None
+        errs.append("interfaces: %s" % e)
+    try:
+        al = sw_alerts_read(sess)
+    except SwError as e:
+        al = None
+        errs.append("active alerts: %s" % e)
+    try:
+        trend, tsrc = dash_sw_trend(sess), "Orion history, hourly average over all nodes (server time)"
+    except (SwError, urllib.error.URLError, OSError) as e:
+        trend, tsrc = None, ""
+        errs.append("24 h history: %s" % str(getattr(e, "reason", e))[:160])
+    order = {"bad": 0, "warn": 1, "ok": 2, "admin": 3}
+
+    def by_status(rows):
+        c = collections.Counter((r["status"], r["_cls"]) for r in rows)
+        return [{"status": s, "cls": k, "count": n} for (s, k), n in sorted(c.items(), key=lambda x: (order.get(x[0][1], 1), -x[1]))]
+    managed = [n for n in nodes if n["_cls"] != "admin"]
+    up = sum(1 for n in managed if n["_cls"] == "ok")
+    ifs_l, al_l = ifs or [], al or []
+    kpi = {"nodes": len(nodes), "up": up, "down": sum(1 for n in nodes if n["_cls"] == "bad"),
+           "warn": sum(1 for n in nodes if n["_cls"] == "warn"), "unmanaged": len(nodes) - len(managed),
+           "availability": round(100.0 * up / len(managed), 1) if managed else None,
+           "ifaces": len(ifs_l), "if_down": sum(1 for r in ifs_l if r["_cls"] == "bad"),
+           "if_hot": sum(1 for r in ifs_l if r["_util"] >= 80),
+           "alerts": len(al_l), "critical": sum(1 for a in al_l if a["_rank"] <= 1),
+           "unack": sum(1 for a in al_l if a["acknowledged"] == "no")}
+    num_ = lambda x: x if isinstance(x, (int, float)) else -1
+    att = sorted([n for n in nodes if n["issue"]], key=lambda n: (order.get(n["_cls"], 1), -num_(n["cpu_%"])))
+    pick = lambda n: {k: n.get(k, "") for k in ("node", "ip", "status", "issue", "cpu_%", "memory_%", "response_ms", "packet_loss_%")}
+    out = {"id": sid, "device": sess.get("name") or sess.get("host"), "vendor": "solarwinds", "host": sess.get("host"),
+           "sw": {"kpi": kpi, "node_status": by_status(nodes), "if_status": by_status(ifs_l) if ifs is not None else None,
+                  "attention": [dict(pick(n), cls=n["_cls"]) for n in att[:12]], "attention_total": len(att),
+                  "alerts": [{k: a[k] for k in ("severity", "alert", "object", "node", "age", "acknowledged")} for a in al_l[:12]]
+                  if al is not None else None,
+                  "busiest": [{"node": r["node"], "interface": r["interface"], "util": r["_util"], "in": r["in_util_%"],
+                               "out": r["out_util_%"], "speed": r["speed"], "cls": r["_cls"]}
+                              for r in sorted([r for r in ifs_l if r["_cls"] != "admin"], key=lambda r: -r["_util"])[:10]],
+                  "if_down": [{"node": r["node"], "interface": r["interface"], "since": r["last_change"]}
+                              for r in sorted([r for r in ifs_l if r["_cls"] == "bad"], key=lambda r: str(r["last_change"]), reverse=True)[:15]],
+                  "top_cpu": [pick(n) for n in sorted([n for n in managed if n["cpu_%"] != ""], key=lambda n: -n["cpu_%"])[:8]],
+                  "slowest": [pick(n) for n in sorted([n for n in managed if n["response_ms"] != "" and n["_cls"] == "ok"],
+                                                      key=lambda n: -n["response_ms"])[:8]],
+                  "trend": trend, "trend_src": tsrc}}
+    # own history of the headline numbers, charted when Orion's history is not readable
+    h = DASH["hist"].setdefault(sid, collections.deque(maxlen=DASH_HIST))
+    h.append({"t": time.strftime("%H:%M"), "availability": kpi["availability"], "alerts": kpi["alerts"], "if_down": kpi["if_down"],
+              "cpu": round(sum(n["cpu_%"] for n in managed if n["cpu_%"] != "") / max(1, sum(1 for n in managed if n["cpu_%"] != "")), 1)})
+    out["sw"]["hist"] = list(h)
+    # per-node summary, used to add Orion's view to the firewall / F5 cards
+    al_by, if_by = collections.defaultdict(list), collections.defaultdict(list)
+    for a in al_l:
+        if a["_node"] is not None:
+            al_by[a["_node"]].append(a)
+    for r in ifs_l:
+        if_by[r["_node"]].append(r)
+    idx, net = {}, []
+    for n in nodes:
+        na, ni = al_by.get(n["_id"], []), if_by.get(n["_id"], [])
+        busy = max(ni, key=lambda r: r["_util"]) if ni else None
+        s = {"source": out["device"], "node": n["node"], "status": n["status"], "cls": n["_cls"], "cpu": n["cpu_%"],
+             "mem": n["memory_%"], "rt": n["response_ms"], "loss": n["packet_loss_%"], "alerts": len(na),
+             "worst": na[0]["severity"] if na else "", "if_down": sum(1 for r in ni if r["_cls"] == "bad"),
+             "busiest": "%s %s%%" % (busy["interface"], busy["_util"]) if busy and busy["_util"] else ""}
+        for k in (str(n["ip"]).strip().lower(), str(n["node"]).strip().lower()):
+            if k:
+                idx.setdefault(k, s)
+        kind = sw_dev_kind(n)
+        if kind:   # an F5 / firewall Orion monitors: shown on the dashboard even when it is not connected here
+            net.append(dict(s, kind=kind, ip=n["ip"], make=n["vendor"], model=n["model"], version=n["version"],
+                            last_boot=n["last_boot"], issue=n["issue"],
+                            if_n={c: sum(1 for r in ni if r["_cls"] == c) for c in ("ok", "bad", "warn", "admin")},
+                            if_busy=[{"interface": r["interface"], "util": r["_util"], "in": r["in_util_%"],
+                                      "out": r["out_util_%"], "speed": r["speed"]}
+                                     for r in sorted([r for r in ni if r["_cls"] != "admin"], key=lambda r: -r["_util"])[:4]],
+                            if_down_names=[r["interface"] for r in ni if r["_cls"] == "bad"][:12],
+                            alert_list=[{k: a[k] for k in ("severity", "alert", "object", "age", "acknowledged")} for a in na[:3]]))
+    out["_idx"], out["_net"] = idx, net
+    out["sw"]["kpi"]["net_devices"] = len(net)
+    kind = "bad" if kpi["down"] or kpi["critical"] or kpi["if_down"] else "warn" if kpi["warn"] or kpi["alerts"] or att else ""
+    out["sw"]["kind"] = kind
+    out.update(errors=errs, time=time.strftime("%H:%M:%S"), ms=int((time.time() - t0) * 1000))
+    audit(sess, "dashboard refresh (nodes, interfaces, alerts, 24 h trend)%s" % (": " + "; ".join(errs)[:150] if errs else ""))
+    return out
+
+
 def dash_device(sid, sess):
+    if sess["vendor"] == "solarwinds":
+        return dash_sw(sid, sess)
     t0, errs = time.time(), []
     out = {"id": sid, "device": sess.get("name") or sess.get("host"), "vendor": sess["vendor"], "host": sess.get("host"),
            "res": None, "ifaces": None, "ha": None}
@@ -13848,8 +16348,31 @@ def dash_tick():
 
 def do_dash_get(query):
     dash_tick()
-    order = {"paloalto": 0, "fortigate": 1, "f5": 2}
+    order = {"solarwinds": -1, "paloalto": 0, "fortigate": 1, "f5": 2}
     devs = sorted(DASH["devices"].values(), key=lambda d: (order.get(d.get("vendor"), 9), str(d.get("device")).lower()))
+    idx = [d.get("_idx") or {} for d in devs if d.get("vendor") == "solarwinds"]
+    shown, conn_keys = [], set()
+    for d in devs:
+        d = {k: x for k, x in d.items() if k not in ("_idx", "_net")}
+        if d.get("vendor") != "solarwinds":
+            keys = [str(d.get("host") or "").strip().lower(), str(d.get("device") or "").strip().lower()]
+            conn_keys.update(k for k in keys if k)
+            if idx:
+                d["orion"] = next((ix[k] for ix in idx for k in keys if k and k in ix), {"missing": True})
+        shown.append(d)
+    # F5s and firewalls Orion monitors that are not connected in this console: a card built from Orion's data alone
+    rank = {"bad": 0, "warn": 1, "ok": 2, "admin": 3}
+    obs, seen = [], set()
+    for sw in (d for d in devs if d.get("vendor") == "solarwinds"):
+        for o in sw.get("_net") or []:
+            keys = {str(o["ip"]).strip().lower(), str(o["node"]).strip().lower()} - {""}
+            if keys & conn_keys or keys & seen:
+                continue
+            seen.update(keys)
+            obs.append({"id": "orion:%s:%s" % (sw["id"], o["ip"] or o["node"]), "device": o["node"] or o["ip"],
+                        "vendor": o["kind"], "host": o["ip"], "observed": True, "orion": o, "time": sw.get("time")})
+    obs.sort(key=lambda d: (order.get(d["vendor"], 9), rank.get(d["orion"]["cls"], 1), str(d["device"]).lower()))
+    devs = shown + obs
     return {"ok": True, "on": DASH["on"], "interval": DASH["interval"], "busy": DASH["busy"], "last": DASH["last"],
             "took": DASH["took"], "next_in": max(0, int(DASH["next"] - time.time())) if DASH["on"] else None,
             "devices": devs}
@@ -13871,6 +16394,138 @@ def do_dash_set(b):
         DASH["next"] = 0.0
     dash_tick()
     return {"ok": True, "on": DASH["on"], "interval": DASH["interval"]}
+
+
+# ---- Dashboard for the AI: the last refresh as one compact object (chat context, and the agent's 'dashboard' tool) ----
+def dash_health(d):
+    """bad / warn / ok of one dashboard card (same rules as the page)."""
+    if d.get("observed"):
+        o = d["orion"]
+        return ("bad" if o["cls"] == "bad" or o.get("if_down") or re.search(r"(?i)critical|serious", o.get("worst") or "")
+                else "warn" if o["cls"] == "warn" or o.get("alerts") or o.get("issue") else "ok")
+    k = 0
+    res, ha = d.get("res") or {}, d.get("ha") or {}
+    k = max(k, 2 if res.get("kind") == "bad" else 1 if res.get("kind") == "info" else 0)
+    if any(i.get("cls") == "bad" for i in d.get("ifaces") or []):
+        k = 2
+    k = max(k, 2 if ha.get("cls") == "bad" else 1 if ha.get("cls") == "warn" else 0)
+    if d.get("errors"):
+        k = max(k, 1)
+    return ("ok", "warn", "bad")[k]
+
+
+def dash_series(pts):
+    vals = [p[1] for p in pts or [] if isinstance(p[1], (int, float))]
+    if not vals:
+        return None
+    return {"last": vals[-1], "min": min(vals), "max": max(vals), "avg": round(sum(vals) / len(vals), 2),
+            "max_at": next(p[0] for p in pts if p[1] == max(vals)), "hourly": pts}
+
+
+def dash_snapshot(device=""):
+    """What the dashboard shows now, problems first. device = only cards / Orion servers whose name or IP contains it."""
+    r = do_dash_get({})
+    want = str(device or "").strip().lower()
+    hit = lambda d: not want or want in str(d.get("device") or "").lower() or want in str(d.get("host") or "").lower()
+    sw_out, devs = [], []
+    for d in r["devices"]:
+        if d.get("vendor") == "solarwinds":
+            s = d.get("sw")
+            if not s:
+                sw_out.append({"server": d.get("device"), "errors": d.get("errors")})
+                continue
+            tr = s.get("trend")
+            trend = ({"source": s.get("trend_src"), **{k: dash_series(tr.get(k)) for k in ("cpu", "mem", "rt", "loss")}}
+                     if tr else {"source": "this console's refreshes (Orion history not readable)",
+                                 **{k: dash_series([[h["t"], h.get(k)] for h in s.get("hist") or []])
+                                    for k in ("availability", "alerts", "if_down", "cpu")}})
+            trend = {("avg_cpu_%" if k == "cpu" else "avg_memory_%" if k == "mem" else "avg_response_ms" if k == "rt"
+                      else "avg_packet_loss_%" if k == "loss" else k): x for k, x in trend.items()}
+            sw_out.append({"server": d.get("device"), "read": d.get("time"), "kpi": s["kpi"],
+                           "nodes_by_status": s["node_status"], "interfaces_by_status": s["if_status"],
+                           "needs_attention": s["attention"], "needs_attention_total": s["attention_total"],
+                           "active_alerts": s["alerts"], "busiest_interfaces": s["busiest"], "interfaces_down": s["if_down"],
+                           "highest_cpu": s["top_cpu"], "slowest_response": s["slowest"], "trend_24h": trend,
+                           "errors": d.get("errors") or []})
+            continue
+        if not hit(d):
+            continue
+        x = {"device": d.get("device"), "vendor": d.get("vendor"), "host": d.get("host"), "health": dash_health(d)}
+        if d.get("observed"):
+            o = d["orion"]
+            x.update(connected=False, note="seen only in SolarWinds (not connected in the console): Orion's data only, "
+                                           "no HA / sessions / configuration",
+                     solarwinds={k: o.get(k) for k in ("source", "node", "status", "issue", "make", "model", "version",
+                                                       "last_boot", "cpu", "mem", "rt", "loss", "alerts", "worst",
+                                                       "if_n", "if_down_names", "if_busy", "alert_list")})
+        else:
+            res, ifs, ha = d.get("res"), d.get("ifaces"), d.get("ha")
+            x.update(connected=True, read=d.get("time"))
+            x["high_availability"] = {k: ha.get(k) for k in ("mode", "state", "sync", "changed", "lines") if ha.get(k)} if ha else "not read"
+            if res:
+                x["resources"] = [dict({"name": t["label"], "value": t["value"], "unit": "%" if t["fmt"] == "pct" else ""},
+                                       **({"detail": t["sub"]} if t.get("sub") else {}),
+                                       **({"recent_refreshes": [v for v in t["spark"] if v is not None][-12:]}
+                                          if t.get("spark") else {}))
+                                  for t in res.get("tiles") or []]
+                x["findings"] = [f.get("issue") for f in res.get("findings") or []]
+            else:
+                x["resources"] = "not read"
+            if ifs is not None:
+                cnt = collections.Counter(i["cls"] for i in ifs)
+                x["interfaces"] = {"up": cnt.get("good", 0), "disabled": cnt.get("admin", 0),
+                                   "never_up_unused": cnt.get("idle", 0),
+                                   "down_after_being_up": [dict({"name": i["name"]}, **({"errors": i["errors"]} if i.get("errors") else {}))
+                                                           for i in ifs if i["cls"] == "bad"],
+                                   "with_errors": [{"name": i["name"], "errors": i["errors"]}
+                                                   for i in ifs if i.get("errors") and i["cls"] != "bad"][:10]}
+            else:
+                x["interfaces"] = "not read"
+            o = d.get("orion")
+            if o:
+                x["solarwinds_view"] = "no Orion node with this address or name" if o.get("missing") else \
+                    {k: o.get(k) for k in ("source", "node", "status", "cpu", "mem", "rt", "loss", "alerts", "worst",
+                                           "if_down", "busiest")}
+            if d.get("errors"):
+                x["could_not_read"] = d["errors"]
+        devs.append(x)
+    rank = {"bad": 0, "warn": 1, "ok": 2}
+    devs.sort(key=lambda x: (rank[x["health"]], not x["connected"], str(x["device"]).lower()))
+    cnt = collections.Counter(x["health"] for x in devs)
+    head = {"refreshed": r["last"] or "never", "auto_refresh": ("every %d min" % (r["interval"] // 60)) if r["on"] else "off",
+            "refreshing_now": r["busy"], "devices": len(devs), "critical": cnt.get("bad", 0), "warning": cnt.get("warn", 0),
+            "healthy": cnt.get("ok", 0), "connected": sum(1 for x in devs if x["connected"]),
+            "seen_only_in_solarwinds": sum(1 for x in devs if not x["connected"])}
+    summary = ["Dashboard refreshed %s (auto refresh %s): %d device(s), %d critical, %d warning%s." % (
+        head["refreshed"], head["auto_refresh"], head["devices"], head["critical"], head["warning"],
+        ", %d seen only in SolarWinds" % head["seen_only_in_solarwinds"] if head["seen_only_in_solarwinds"] else "")]
+    for s in sw_out:
+        k = s.get("kpi")
+        if k:
+            summary.append("%s: %s%% of managed nodes up, %d down, %d warning, %d interface(s) down, %d active alert(s) "
+                           "(%d critical / serious)." % (s["server"], k["availability"], k["down"], k["warn"], k["if_down"],
+                                                         k["alerts"], k["critical"]))
+    if want:
+        summary.append("Filtered to devices matching '%s'." % device)
+    return {"ok": True, "status": 200, "request": "operations dashboard snapshot", "summary": summary,
+            "data": {"dashboard": head, "solarwinds": sw_out, "devices": devs}}
+
+
+def dash_ensure(wait=150):
+    """Make sure the dashboard has data for the AI: run a first refresh if it never ran, wait for one in progress."""
+    with LOCK:
+        items = [(sid, s) for sid, s in SESSIONS.items() if s.get("vendor") in DASH_VENDORS]
+    if not items:
+        raise ValueError("no firewall, F5 or SolarWinds is connected, so the dashboard has no data")
+    run = False
+    with DASH["lock"]:
+        if not DASH["devices"] and not DASH["busy"]:
+            DASH["busy"], DASH["next"], run = True, time.time() + DASH["interval"], True
+    if run:
+        dash_cycle(items)
+    t0 = time.time()
+    while DASH["busy"] and not DASH["devices"] and time.time() - t0 < wait:
+        time.sleep(1)
 
 
 # ---- Packet capture analysis: a .pcap / .pcapng uploaded in the AI assistant is read here (standard library only) ----
@@ -14431,6 +17086,19 @@ ADV_SINCE = "2016"   # older CVEs are not looked at (no supported release is aff
 ADV_VENDORS = ("paloalto", "fortigate", "f5")
 ADV_LABEL = {"paloalto": "Palo Alto", "fortigate": "FortiGate", "f5": "F5 BIG-IP"}
 ADV_NVD_KEY = {"f5": "BIG-IP", "fortigate": "FortiOS"}
+ADV_CACHE_V = 2   # cache format: 2 = advisories keep their condition text (problem / description / workaround)
+
+
+def adv_lang_text(x):
+    """Text of a [{'lang': 'en', 'value': ...}] list (PAN-OS problem / workaround, CVE descriptions), or a plain string."""
+    if isinstance(x, str):
+        return x.strip()
+    if isinstance(x, list):
+        vals = [str(d.get("value") or "") for d in x if isinstance(d, dict) and str(d.get("lang", "en")).lower()[:2] == "en"]
+        return "\n".join(v.strip() for v in vals if v.strip())
+    return ""
+
+
 ADV_HELP = {   # where the vendor says which release to run (the console computes the lowest release clear of the CVEs)
     "paloalto": ("https://security.paloaltonetworks.com/", "Palo Alto security advisories + PAN-OS release guidance (preferred releases)"),
     "fortigate": ("https://community.fortinet.com/t5/FortiGate/Technical-Tip-Recommended-Release-for-FortiOS/ta-p/227178",
@@ -14522,8 +17190,11 @@ def adv_pan_download():
                 continue
             seen.add(x.get("ID"))
             new += 1
-            recs.append({k: x.get(k) for k in ("ID", "title", "baseSeverity", "baseScore", "version", "affected",
-                                                 "fixed", "date", "updated")})
+            rec = {k: x.get(k) for k in ("ID", "title", "baseSeverity", "baseScore", "version", "affected",
+                                         "fixed", "date", "updated")}
+            for k, n in (("problem", 1500), ("work_around", 700)):   # the 'only if ...' conditions are in this text
+                rec[k] = adv_lang_text(x.get(k))[:n]
+            recs.append(rec)
         if len(d) < 100 or not new:
             break
     if not recs:
@@ -14551,7 +17222,7 @@ def adv_nvd_trim(c):
                                                                        "versionEndIncluding", "versionEndExcluding")])
     desc = next((x.get("value", "") for x in c.get("descriptions") or [] if x.get("lang") == "en"), "")
     return {"id": c.get("id", ""), "published": c.get("published", ""), "mod": c.get("lastModified", ""),
-            "score": adv_nvd_score(c.get("metrics")), "desc": desc[:300], "cpes": cpes}
+            "score": adv_nvd_score(c.get("metrics")), "desc": desc[:1200], "cpes": cpes}
 
 
 def adv_nvd_download(keyword):
@@ -14607,6 +17278,7 @@ def adv_cna_trim(d):
                 if isinstance(o, dict) and o.get("Exploitation"):
                     expl = str(o["Exploitation"])
     return {"aff": aff, "score": score, "title": str(c.get("title") or "")[:200], "expl": expl,
+            "desc": adv_lang_text(c.get("descriptions"))[:1500],
             "sol": " \n".join(str(s.get("value", "")) for s in c.get("solutions") or [] if isinstance(s, dict))[:3000],
             "refs": [r.get("url") for r in c.get("references") or [] if isinstance(r, dict) and r.get("url")][:8]}
 
@@ -14621,7 +17293,7 @@ def adv_cna_topup(feeds, floor):
             c = cna.get(r["id"])
             if r["score"] is not None and r["score"] < floor and r["id"] not in kev and not (c and c.get("score") or 0) >= floor:
                 continue
-            if not c or c.get("nvdmod") != r["mod"]:
+            if not c or c.get("nvdmod") != r["mod"] or "desc" not in c:   # 'desc': records cached before v2
                 want.append(r)
     errs, done = [], [0]
 
@@ -15044,8 +17716,9 @@ def adv_evaluate(items):
         key = (s["vendor"], info.get("version"), bool(info.get("panorama")), tuple(info.get("mods") or ()),
                str(info.get("model") or "").upper()[:5] if s["vendor"] == "paloalto" else "")
         g = groups.setdefault(key, {"vendor": s["vendor"], "label": ADV_LABEL[s["vendor"]], "version": info.get("version", ""),
-                                    "info": info, "devices": []})
+                                    "info": info, "devices": [], "ids": []})
         g["devices"].append(s.get("name") or s.get("host"))
+        g["ids"].append(sid)
     rows_by = {v: adv_records(v, feeds, floor) for v in ADV_VENDORS}
     out = []
     for g in groups.values():
@@ -15086,6 +17759,8 @@ def adv_refresh(items, download):
                     feeds[key] = data
                 stamp[key] = time.strftime("%Y-%m-%d %H:%M")
                 ADV["errors"].pop(label, None)
+            if all(k in stamp for k, _, _ in jobs) and not any(k in ADV["errors"] for _, k, _ in jobs):
+                feeds["v"] = ADV_CACHE_V
             adv_save(feeds)
             ADV["last"] = time.strftime("%Y-%m-%d %H:%M")
             if any(k in ADV["errors"] for _, k, _ in jobs):
@@ -15118,6 +17793,8 @@ def adv_tick():
                 newest = 0
             ADV["next"] = newest + ADV["interval"]
             ADV["last"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest)) if newest else ""
+        if ADV["feeds"].get("v") != ADV_CACHE_V and not ADV.get("vtried"):
+            ADV["vtried"], ADV["next"] = True, 0.0   # cache from an older console: download once in the new format
         download = time.time() >= ADV["next"]
         sig = adv_sig(items)
         if not download and sig == ADV["sig"]:
@@ -15149,6 +17826,377 @@ def do_adv_set(b):
     ADV["sig"] = None
     adv_tick()
     return {"ok": True, "min": ADV["min"]}
+
+
+# ---- Advisories vs configuration: which of the CVEs for a device's version need a feature it actually uses -----------
+# Check "advcfg" (Palo Alto, FortiGate, F5): the CVEs that match the unit's version (as in the advisory bar), each with
+# the sentences of the advisory that say when it applies, the configuration facts those conditions usually depend on
+# (read-only, one pass per device), and a keyword-based "console hint". The AI assistant then decides per CVE:
+# applies / does not apply / can't tell, from that output only.
+ADV_COND_RE = re.compile(r"\b(only|configured|enabled|enable[sd]?|when|if|requires?|required|exposed|access to|"
+                         r"not (?:affected|vulnerable|impacted)|applicable|in use|must)\b", re.I)
+
+
+def adv_condition(text, n=320):
+    """The sentences of an advisory that state when it applies ('only when GlobalProtect is enabled ...')."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    # Fortinet lists every product / version range first ('in Fortinet FortiAnalyzer 7.6.0 through 7.6.5, ...'): shorten
+    text = re.sub(r"(?:(?:Fortinet )?Forti[\w-]+ (?:\d+(?:\.\d+)* (?:through|to) \d+(?:\.\d+)*|\d+(?:\.\d+)*(?: all versions)?)"
+                  r"(?:,? (?:and |or )?(?=Forti|\d))?)+", "[affected versions] ", text)
+    if not text:
+        return ""
+    sents = re.split(r"(?<=[.!?])\s+(?=[A-Z(])", text)
+    keep = [sents[0]] + [s for s in sents[1:] if ADV_COND_RE.search(s)]   # the first sentence names the feature
+    out = " ".join(keep)
+    return out if len(out) <= n else out[:n - 1].rsplit(" ", 1)[0] + "…"
+
+
+def adv_condition_texts(vendor, feeds):
+    """CVE id -> the advisory text the conditions are taken from."""
+    out = {}
+    if vendor == "paloalto":
+        for r in feeds.get("pan") or []:
+            out[r.get("ID")] = "%s %s" % (r.get("problem") or "", r.get("work_around") or "")
+        return out
+    cna = feeds.get("cna") or {}
+    for r in (feeds.get("nvd") or {}).get(vendor) or []:
+        out[r["id"]] = (cna.get(r["id"]) or {}).get("desc") or r.get("desc") or ""
+    return out
+
+
+def adv_facts_pan(sess, info):
+    """Palo Alto features the PAN-OS advisories depend on (candidate configuration, read-only XML API 'get')."""
+    f, notes = collections.OrderedDict(), ["Palo Alto facts are read from the candidate configuration (includes "
+                                           "changes not committed yet)."]
+
+    def get(xp):
+        root = pan_xml(sess, {"type": "config", "action": "get", "xpath": xp}, 60)
+        return root.find("result") if root is not None else None
+    jobs = {"gp_portal": "/config/devices/entry/vsys/entry/global-protect/global-protect-portal",
+            "gp_gateway": "/config/devices/entry/vsys/entry/global-protect/global-protect-gateway",
+            "mgmt_prof": "/config/devices/entry/network/profiles/interface-management-profile",
+            "intf": "/config/devices/entry/network/interface",
+            "dns_proxy": "/config/devices/entry/network/dns-proxy",
+            "ike": "/config/devices/entry/network/ike/gateway",
+            "permitted": "/config/devices/entry/deviceconfig/system/permitted-ip",
+            "authportal": "/config/devices/entry/vsys/entry/captive-portal"}
+    with concurrent.futures.ThreadPoolExecutor(4) as ex:
+        res = dict(zip(jobs, ex.map(lambda xp: get(xp), jobs.values())))
+
+    def entries(r, tag):
+        return [e for e in r.findall(".//%s/entry" % tag)] if r is not None else []
+    f["model"] = info.get("model") or ""
+    f["globalprotect_portals"] = ["%s (%s)" % (e.get("name"), e.findtext(".//local-address/interface") or "?")
+                                  for e in entries(res["gp_portal"], "global-protect-portal")]
+    f["globalprotect_gateways"] = ["%s (%s)" % (e.get("name"), e.findtext(".//local-address/interface") or "?")
+                                   for e in entries(res["gp_gateway"], "global-protect-gateway")]
+    svc = {}
+    for e in entries(res["mgmt_prof"], "interface-management-profile"):
+        svc[e.get("name")] = [t for t in ("https", "http", "ssh", "telnet", "snmp", "response-pages", "userid-service",
+                                          "userid-syslog-listener-ssl", "userid-syslog-listener-udp", "http-ocsp")
+                              if (e.findtext(t) or "").strip() == "yes"]
+    uses = []
+
+    def walk(el, owner):
+        for c in el:
+            own = c.get("name") if c.tag == "entry" and c.get("name") else owner
+            if c.tag == "interface-management-profile" and (c.text or "").strip():
+                uses.append((owner, c.text.strip()))
+            walk(c, own)
+    if res["intf"] is not None:
+        walk(res["intf"], "?")
+    f["data_interfaces_with_management_services"] = [
+        "%s: profile %s (%s)" % (i, p, ", ".join(svc.get(p) or ["no services"])) for i, p in uses
+        if set(svc.get(p) or []) & {"https", "http", "ssh", "telnet"}]
+    f["data_interfaces_with_other_profile_services"] = [
+        "%s: profile %s (%s)" % (i, p, ", ".join(svc.get(p))) for i, p in uses
+        if svc.get(p) and not set(svc.get(p)) & {"https", "http", "ssh", "telnet"}]
+    perm = [e.get("name") for e in entries(res["permitted"], "permitted-ip")]
+    f["management_port_permitted_ips"] = perm or "not restricted (any address that can reach the management port)"
+    f["dns_proxy_objects"] = [e.get("name") for e in entries(res["dns_proxy"], "dns-proxy")
+                              if (e.findtext("enabled") or "yes") != "no"]
+    f["ike_gateways"] = [e.get("name") for e in entries(res["ike"], "gateway")]
+    ap = res["authportal"]
+    f["authentication_portal"] = "configured" if ap is not None and len(list(ap.iter())) > 2 else "not configured"
+    unread = [k for k, r in res.items() if r is None]
+    if unread:
+        notes.append("Not readable (no access or not present): %s." % ", ".join(unread))
+    return f, notes
+
+
+def adv_facts_fg(sess, info):
+    """FortiGate features the FortiOS advisories depend on (cmdb, read-only, root / default VDOM)."""
+    f, notes = collections.OrderedDict(), ["FortiGate facts are from the default VDOM."]
+    paths = {"ssl": "/api/v2/cmdb/vpn.ssl/settings",
+             "intf": "/api/v2/cmdb/system/interface?format=name|allowaccess|ip|role|type|status",
+             "glob": "/api/v2/cmdb/system/global",
+             "p1": "/api/v2/cmdb/vpn.ipsec/phase1-interface?format=name|interface|ike-version",
+             "ha": "/api/v2/cmdb/system/ha?format=mode|group-name",
+             "bgp": "/api/v2/cmdb/router/bgp",
+             "admin": "/api/v2/cmdb/system/admin?format=name|" + "|".join("trusthost%d" % i for i in range(1, 11))}
+
+    def one(p):
+        try:
+            st, ok, d = rest_get(sess, p)
+        except (urllib.error.URLError, OSError):
+            return None
+        return d.get("results") if ok and isinstance(d, dict) else None
+    with concurrent.futures.ThreadPoolExecutor(6) as ex:
+        res = dict(zip(paths, ex.map(one, paths.values())))
+    f["model"] = info.get("model") or ""
+    ssl_ = res["ssl"] if isinstance(res["ssl"], dict) else None
+    if ssl_ is None:
+        f["ssl_vpn"] = "not readable"
+    else:
+        src = [str(x.get("name")) for x in ssl_.get("source-interface") or [] if isinstance(x, dict)]
+        st = str(ssl_.get("status") or "")
+        f["ssl_vpn"] = ("enabled, listening on %s (port %s)" % (", ".join(src), ssl_.get("port", "?"))
+                        if src and st != "disable" else "not enabled (no listening interface)")
+    intf = res["intf"] if isinstance(res["intf"], list) else []
+    acc = lambda i: str(i.get("allowaccess") or "").split()   # noqa: E731
+    ip = lambda i: re.sub(r"^(\S+) (\S+)$", r"\1 \2", str(i.get("ip") or "")).split(" ")[0]   # noqa: E731
+    f["interfaces_with_admin_access"] = ["%s %s (%s)" % (i.get("name"), ip(i), " ".join(x for x in acc(i) if x in
+                                         ("https", "http", "ssh", "telnet", "snmp")))
+                                         for i in intf if set(acc(i)) & {"https", "http", "ssh", "telnet"}]
+    f["interfaces_with_fgfm"] = [i.get("name") for i in intf if "fgfm" in acc(i)]
+    f["interfaces_with_capwap_or_fabric"] = [i.get("name") for i in intf if set(acc(i)) & {"capwap", "fabric"}]
+    if not intf:
+        notes.append("Interfaces not readable.")
+    g = res["glob"] if isinstance(res["glob"], dict) else {}
+    if g:
+        f["admin_ports"] = "HTTPS %s, HTTP %s, SSH %s" % (g.get("admin-sport", "?"), g.get("admin-port", "?"),
+                                                         g.get("admin-ssh-port", "?"))
+        if "admin-forticloud-sso-login" in g:
+            f["forticloud_sso_admin_login"] = g.get("admin-forticloud-sso-login")
+    p1 = res["p1"] if isinstance(res["p1"], list) else None
+    f["ipsec_tunnels"] = ["%s (%s, IKEv%s)" % (x.get("name"), x.get("interface"), x.get("ike-version", "?"))
+                          for x in p1] if p1 is not None else "not readable"
+    ha = res["ha"] if isinstance(res["ha"], dict) else {}
+    f["ha_mode"] = ha.get("mode") or "not readable"
+    bgp = res["bgp"] if isinstance(res["bgp"], dict) else None
+    if bgp is not None:
+        nb = [n for n in bgp.get("neighbor") or [] if isinstance(n, dict)]
+        f["bgp_neighbors"] = ("%d (local AS %s): %s" % (len(nb), bgp.get("as", "?"), ", ".join(
+            "%s AS %s" % (n.get("ip"), n.get("remote-as")) for n in nb[:6]))) if nb else []
+    adm = res["admin"] if isinstance(res["admin"], list) else None
+    if adm is not None:
+        open_ = [a.get("name") for a in adm if all(str(a.get("trusthost%d" % i) or "0.0.0.0 0.0.0.0").split()[0] ==
+                                                   "0.0.0.0" for i in range(1, 11))]
+        f["admins_without_trusted_hosts"] = "%d of %d" % (len(open_), len(adm))
+    return f, notes
+
+
+F5_ADV_PROFILES = ("http", "http2", "client-ssl", "server-ssl", "websocket", "sip", "diameter", "mqtt", "rewrite",
+                   "dns", "ftp", "ntlm", "fix")
+
+
+def adv_facts_f5(sess, info):
+    """BIG-IP features the F5 advisories depend on (read-only REST)."""
+    f, notes = collections.OrderedDict(), []
+    jobs = {"self": "/mgmt/tm/net/self?$select=name,address,allowService,vlan",
+            "allow": "/mgmt/tm/net/self-allow", "httpd": "/mgmt/tm/sys/httpd", "sshd": "/mgmt/tm/sys/sshd",
+            "vs": "/mgmt/tm/ltm/virtual?expandSubcollections=true&$select=fullPath,profilesReference"}
+    if "apm" in (info.get("mods") or []):
+        jobs["apm"] = "/mgmt/tm/apm/profile/access?$select=fullPath"
+    for t in F5_ADV_PROFILES:
+        jobs["p:" + t] = "/mgmt/tm/ltm/profile/%s?$select=fullPath" % t
+
+    def one(p):
+        try:
+            ok, d = f5_get(sess, p)
+        except (urllib.error.URLError, OSError):
+            return None
+        return d if ok else None
+    with concurrent.futures.ThreadPoolExecutor(6) as ex:
+        res = dict(zip(jobs, ex.map(one, jobs.values())))
+    f["provisioned_modules"] = info.get("mods") or "not readable"
+    defaults = [str(x) for x in (res["allow"] or {}).get("defaults") or []]
+    selfs = []
+    for s in (res["self"] or {}).get("items") or []:
+        a = s.get("allowService")
+        a = a if isinstance(a, list) else [a] if a else ["none"]
+        eff = set(defaults) if "default" in a else set()
+        eff |= {x for x in a if x != "default"}
+        ports = "all ports" if "all" in a else ", ".join(sorted(x for x in eff if re.match(r"tcp:(22|443)$", x))) or "neither"
+        selfs.append("%s %s (vlan %s): allow %s -> SSH/HTTPS: %s" % (
+            s.get("name"), re.sub(r"%\d+", "", str(s.get("address") or "")), str(s.get("vlan") or "").rsplit("/", 1)[-1],
+            ",".join(map(str, a)), ports))
+    f["self_ips_port_lockdown"] = selfs or "not readable"
+    if defaults:
+        f["port_lockdown_default_list"] = ", ".join(defaults)
+    f["config_utility_and_rest_allowed_from"] = (res["httpd"] or {}).get("allow") or "not readable"
+    f["ssh_allowed_from"] = (res["sshd"] or {}).get("allow") or "not readable"
+    f["management_port"] = "always serves the Configuration utility, iControl REST and SSH to the addresses above"
+    if "apm" in jobs:
+        f["apm_access_profiles"] = [p.get("fullPath") for p in (res["apm"] or {}).get("items") or []
+                                    if p.get("fullPath") not in ("/Common/access",)]
+    vs = (res["vs"] or {}).get("items") or []
+    vs_prof = {v.get("fullPath"): {p.get("fullPath") for p in ((v.get("profilesReference") or {}).get("items") or [])}
+               for v in vs}
+    used = collections.OrderedDict()
+    for t in F5_ADV_PROFILES:
+        names = {p.get("fullPath") for p in (res.get("p:" + t) or {}).get("items") or []}
+        used[t] = sorted(v for v, ps in vs_prof.items() if ps & names)
+    f["profiles_in_use_on_virtual_servers"] = ["%s: %d VS (%s%s)" % (t, len(v), ", ".join(v[:4]), ", …" if len(v) > 4 else "")
+                                               for t, v in used.items() if v] or "none found"
+    f["profile_types_not_used_by_any_virtual_server"] = [t for t, v in used.items() if not v]
+    if not vs:
+        notes.append("Virtual servers not readable: profile use unknown.")
+    f["_used"] = used if vs else {}   # unknown use: no profile hints
+    return f, notes
+
+
+ADV_FACTS = {"paloalto": adv_facts_pan, "fortigate": adv_facts_fg, "f5": adv_facts_f5}
+
+
+def adv_hint(vendor, text, f):
+    """Keyword rule on an advisory's text + the facts -> (kind, hint). kind: 'applies' / 'not applicable' / '' (facts
+    only: exposure etc. the console cannot see)."""
+    t = text or ""
+    has = lambda p: re.search(p, t, re.I)   # noqa: E731
+    L = lambda x: ", ".join(x) if isinstance(x, list) else str(x)   # noqa: E731
+    if vendor == "paloalto":
+        if has(r"GlobalProtect"):
+            gp = (f.get("globalprotect_portals") or []) + (f.get("globalprotect_gateways") or [])
+            return ("applies", "GlobalProtect configured: " + L(gp)) if gp else \
+                ("not applicable", "No GlobalProtect portal or gateway configured")
+        if has(r"DNS proxy"):
+            d = f.get("dns_proxy_objects") or []
+            return ("applies", "DNS proxy: " + L(d)) if d else ("not applicable", "No DNS proxy configured")
+        if has(r"\bIKE(v[12])?\b|IPsec|IPSec"):
+            d = f.get("ike_gateways") or []
+            return ("applies", "IKE gateways: %d" % len(d)) if d else ("not applicable", "No IKE gateway configured")
+        if has(r"Captive Portal|Authentication Portal"):
+            return ("applies" if f.get("authentication_portal") == "configured" else "not applicable",
+                    "Authentication (captive) portal " + str(f.get("authentication_portal")))
+        if has(r"management (web )?interface|management interface"):
+            return ("", "Management port allowed from: %s; data interfaces with HTTPS/SSH management: %s" % (
+                L(f.get("management_port_permitted_ips")), L(f.get("data_interfaces_with_management_services") or ["none"])))
+    elif vendor == "fortigate":
+        if has(r"SSL[- ]?VPN|sslvpn"):
+            s = str(f.get("ssl_vpn") or "")
+            return (("applies" if s.startswith("enabled") else "not applicable" if s.startswith("not enabled") else ""),
+                    "SSL-VPN " + s)
+        if has(r"FortiCloud SSO|FortiCloud single sign") and f.get("forticloud_sso_admin_login"):
+            x = str(f["forticloud_sso_admin_login"])
+            return ("applies" if x == "enable" else "not applicable", "FortiCloud SSO admin login: " + x)
+        if has(r"\bfgfm\b|FortiGate[- ]to[- ]FortiManager"):
+            d = f.get("interfaces_with_fgfm") or []
+            return ("applies", "FGFM allowed on " + L(d)) if d else ("not applicable", "No interface allows FGFM")
+        if has(r"CAPWAP|Security Fabric"):
+            d = f.get("interfaces_with_capwap_or_fabric") or []
+            return ("applies", "CAPWAP / fabric allowed on " + L(d)) if d else \
+                ("not applicable", "No interface allows CAPWAP / fabric")
+        if has(r"\bIPsec\b|\bIKE"):
+            d = f.get("ipsec_tunnels")
+            return ("", "IPsec tunnels: " + L(d)) if not isinstance(d, list) else \
+                (("applies", "IPsec tunnels: %d" % len(d)) if d else ("not applicable", "No IPsec tunnel configured"))
+        if has(r"\bi?BGP\b") and "bgp_neighbors" in f:
+            d = f["bgp_neighbors"]
+            return ("applies", "BGP neighbors: " + d) if d else ("not applicable", "No BGP neighbor configured")
+        if has(r"\bHA\b|high.availability|FGCP|heartbeat"):
+            m = str(f.get("ha_mode") or "")
+            return ("not applicable" if m == "standalone" else "applies" if m in ("a-p", "a-a") else "", "HA mode: " + m)
+        if has(r"administrative|admin(istration)? (web )?interface|management interface|GUI|REST API|HTTP/HTTPS"):
+            d = f.get("interfaces_with_admin_access") or []
+            return ("", "Admin access on: %s; admins without trusted hosts: %s" % (
+                L(d or ["no interface"]), f.get("admins_without_trusted_hosts", "?")))
+    elif vendor == "f5":
+        used = f.get("_used") or {}
+        m = re.search(r"\b(APM|ASM|AFM|DNS|GTM|PEM|AAM|Advanced WAF|SSL Orchestrator|SSLO|Link Controller|"
+                      r"Access Policy Manager|Advanced Firewall Manager)\b[^.]{0,40}?\bprovisioned", t)
+        mods = f.get("provisioned_modules")
+        if m and isinstance(mods, list):
+            w = m.group(1).upper()
+            mod = next((x for k, x in ADV_F5_TOKENS if k == w or w.startswith(k)), "")
+            if mod:
+                return ("applies", "BIG-IP %s is provisioned" % m.group(1)) if mod in mods else \
+                    ("not applicable", "BIG-IP %s is not provisioned" % m.group(1))
+        for pat, typ, name in ((r"HTTP/2|HTTP2", "http2", "HTTP/2"), (r"\bSIP\b", "sip", "SIP"),
+                               (r"WebSocket", "websocket", "WebSocket"), (r"Diameter", "diameter", "Diameter"),
+                               (r"MQTT", "mqtt", "MQTT"), (r"\bNTLM\b", "ntlm", "NTLM"), (r"\bFTP\b", "ftp", "FTP"),
+                               (r"rewrite profile", "rewrite", "Rewrite"), (r"\bFIX\b", "fix", "FIX"),
+                               (r"Server SSL", "server-ssl", "Server SSL"), (r"Client SSL|SSL profile", "client-ssl", "Client SSL"),
+                               (r"DNS profile|DNS cache|DNS Express", "dns", "DNS"),
+                               (r"HTTP profile|HTTP virtual server", "http", "HTTP")):
+            if has(pat) and typ in used:
+                v = used[typ]
+                return ("applies", "%s profile on %d VS: %s" % (name, len(v), ", ".join(v[:4]))) if v else \
+                    ("not applicable", "No virtual server uses a %s profile" % name)
+        if has(r"access (policy|profile)|\bAPM\b|SAML|Network Access|Portal Access|webtop"):
+            if isinstance(f.get("apm_access_profiles"), list):
+                d = f["apm_access_profiles"]
+                return ("applies", "APM access profiles: " + L(d[:5])) if d else ("not applicable", "No APM access profile")
+        if has(r"Configuration utility|TMUI|iControl|self IP|management port"):
+            return ("", "Mgmt / REST reachable via: management port (allowed from %s); self IPs: %s" % (
+                L(f.get("config_utility_and_rest_allowed_from")), L(f.get("self_ips_port_lockdown"))))
+    return "", ""
+
+
+ADV_CFG_Q = ("For EVERY advisory in the output, decide whether it applies to this device as configured: APPLIES, "
+             "DOES NOT APPLY or CAN'T TELL. Use only the advisory's condition text and the device facts in the output; "
+             "for each one quote the fact that decides it. A 'console hint' is a keyword guess: confirm or correct it. "
+             "If the condition depends on something the facts do not show (for example whether the management interface "
+             "can be reached from the internet, or a feature the facts do not list), answer CAN'T TELL and say exactly "
+             "what to check. Answer with one table: advisory | verdict | reason (APPLIES first, exploited ones first). "
+             "Then say what to do first, and whether the advised upgrade is still needed.")
+
+
+def adv_config(sess, v):
+    """Check 'advcfg': CVEs for this unit's version + their conditions + the configuration facts they depend on."""
+    t0 = time.time()
+    vendor = sess["vendor"]
+    if vendor not in ADV_VENDORS:
+        raise ValueError("advisories are checked for Palo Alto, FortiGate and F5 only")
+    if ADV["feeds"] is None:
+        ADV["feeds"] = adv_load()
+    feeds = ADV["feeds"]
+    have = feeds.get("pan") if vendor == "paloalto" else (feeds.get("nvd") or {}).get(vendor)
+    if not have:
+        raise ValueError("the %s advisory list is not downloaded yet: wait until the advisory bar at the top has "
+                         "finished its check (or press Refresh now there), then run this again" % ADV_LABEL[vendor])
+    if feeds.get("v") != ADV_CACHE_V:
+        raise ValueError("the advisory lists are being downloaded again in the new format (with the condition text): "
+                         "wait until the advisory bar at the top has finished, then run this again")
+    info = adv_device(sess)
+    if not info.get("version"):
+        raise ValueError("could not read the software version of this device")
+    floor = ADV_MIN.get(ADV["min"], 7.0)
+    rows = adv_records(vendor, feeds, floor)
+    a = adv_assess(vendor, info["version"], info, rows,
+                   adv_pan_trains(feeds) if vendor == "paloalto" else adv_recent_trains(rows))
+    facts, notes = ADV_FACTS[vendor](sess, info)
+    texts = adv_condition_texts(vendor, feeds)
+    out, kinds = [], collections.Counter()
+    for h in a["items"]:
+        full = texts.get(h["id"]) or ""
+        kind, hint = adv_hint(vendor, "%s %s" % (h["title"], full), facts)
+        kinds[kind] += 1
+        out.append({"advisory": h["id"], "severity": h["sev"], "score": h["score"], "exploited": "yes" if h["kev"] else "",
+                    "fixed_in": h["fix"] or "no fix listed", "title": h["title"][:120],
+                    "condition": adv_condition(full) or "(no condition text in the advisory)",
+                    "console_hint": ("%s: %s" % (kind.upper(), hint)) if kind else hint})
+    shown = collections.OrderedDict((k, x) for k, x in facts.items() if not k.startswith("_"))
+    adv = (a.get("advice") or {}).get("text") or ""
+    summary = ["%s %s (%s): %d %s-or-higher advisories match this version%s. Console hints: %d likely apply, %d likely "
+               "do not apply, %d need a judgement (exposure, or no keyword rule)." % (
+                   ADV_LABEL[vendor], info["version"], sess.get("name") or sess.get("host"), len(out), ADV["min"],
+                   (" (%d known exploited)" % a["exploited"]) if a["exploited"] else "", kinds["applies"],
+                   kinds["not applicable"], kinds[""])]
+    if adv:
+        summary.append("Version advice: " + adv)
+    if a.get("eol"):
+        summary.append(a["eol"])
+    summary += notes
+    summary.append("Console hints are keyword rules, not a verdict: ask the AI assistant to check every advisory "
+                   "against these facts (button 'Check against my configuration' in the advisory panel), and read "
+                   "the advisory before deciding.")
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
+            "request": "advisory lists (local) + read-only configuration reads",
+            "data": {"device_facts": shown, "advisories": out}, "summary": summary, "ai_question": ADV_CFG_Q,
+            "verdict": {"label": "%d ADVISORIES FOR %s · HINTS: %d APPLY, %d NOT, %d TO JUDGE" % (
+                len(out), info["version"], kinds["applies"], kinds["not applicable"], kinds[""]),
+                "kind": "bad" if kinds["applies"] or a["exploited"] else "warn" if out else "ok"}}
 
 
 # ---- Live update: edits to this file are picked up while the console runs (no restart, nothing to re-enter) ----
