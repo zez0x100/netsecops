@@ -239,6 +239,8 @@ CATALOG = {
                                                P("filter", "Node or interface name (optional)", "dmz", required=False)]},
     ],
     "fortiweb": [
+        {"id": "advcfg", "group": "Security", "label": "Vendor advisories vs this device's configuration (CVEs for its "
+         "version, when each applies, the matching configuration facts; then ask the AI)", "handler": "adv_config"},
         {"id": "status", "group": "Device", "label": "System status (version, serial, HA mode, signature versions)",
          "handler": "fx_generic", "fx": ["/api/v2.0/system/status.systemstatus", "/api/v2.0/system/status"]},
         {"id": "license", "group": "Device", "label": "License and FortiGuard services", "handler": "fx_generic",
@@ -4188,12 +4190,12 @@ def sw_query(sess, swql, params=None, timeout=60):
     raise SwError(st, "SolarWinds answered HTTP %s%s" % (st, ": " + re.sub(r"\s+", " ", str(msg))[:400] if msg else ""))
 
 
-def sw_first(sess, queries, params=None):
+def sw_first(sess, queries, params=None, timeout=60):
     """Run the first query this Orion version accepts (older releases lack some fields) -> (rows, index used)."""
     last = None
     for i, q in enumerate(queries):
         try:
-            return sw_query(sess, q, params), i
+            return sw_query(sess, q, params, timeout), i
         except SwError as e:
             if e.status in (401, 403):
                 raise
@@ -7483,11 +7485,13 @@ def to_epoch(v):
 
 
 LOOKBACK = {"any time": None, "last 15 minutes": 900, "last hour": 3600, "last 6 hours": 21600,
-            "last 12 hours": 43200, "last 24 hours": 86400}
+            "last 12 hours": 43200, "last 24 hours": 86400, "last 3 days": 259200, "last 7 days": 604800,
+            "last 30 days": 2592000}
 
 
 def cutoff_epoch(b):
-    """Epoch of the oldest log entry wanted, from the 'within' field (at most one day back); None = any time."""
+    """Epoch of the oldest log entry wanted, from the 'within' field (up to 30 days back); None = any time.
+    Callers page newest first and stop at their entry / time limits, so a long range may not be reached in full."""
     v = str(b.get("within") or "any time").strip().lower()
     if v not in LOOKBACK:
         raise ValueError("invalid time range")
@@ -7751,10 +7755,10 @@ def f5_ssl_posture(sess, warn_days):
     return findings, inv, notes
 
 
-def f5_ref_get(sess, ref, cache):
+def f5_ref_get(sess, ref, cache, limit=60):
     link = ref.get("link") if isinstance(ref, dict) else None
     u = urllib.parse.urlparse(link or "")
-    if not u.path.startswith("/mgmt/tm/") or len(cache) >= 60:
+    if not u.path.startswith("/mgmt/tm/") or len(cache) >= limit:
         return None
     path = u.path + ("?" + u.query if u.query else "")
     if path not in cache:
@@ -7814,6 +7818,101 @@ def asm_reason(sess, it, cache):
         if name:
             out.append("%s: %s" % (name, sub) if sub else name)
     return "; ".join(out)
+
+
+ASM_ATTACK_LIMIT = 600   # distinct ASM objects (violations, signatures, attack types) resolved per search
+
+
+def asm_refs(x):
+    """References ({'link': ...}) in a value: a dict, a list of dicts, or dicts nesting one reference."""
+    out = []
+    for v in (x if isinstance(x, list) else [x]):
+        if isinstance(v, dict):
+            if v.get("link"):
+                out.append(v)
+            else:
+                out += [w for k, w in v.items() if k.endswith("Reference") and isinstance(w, dict) and w.get("link")]
+    return out
+
+
+def asm_names(sess, x, cache):
+    """Names in a value that is a string, a reference, or a list of either."""
+    out = []
+    for v in (x if isinstance(x, list) else [x]):
+        if isinstance(v, str) and v.strip() and not v.startswith("http"):
+            out.append(v.strip())
+        elif isinstance(v, dict):
+            n = v.get("name") or v.get("title")
+            if not n:
+                for r in asm_refs(v):
+                    d = f5_ref_get(sess, r, cache, ASM_ATTACK_LIMIT)
+                    n = first(d, "name", "title") if d else None
+                    if n:
+                        break
+            if n:
+                out.append(str(n))
+    return out
+
+
+def asm_attack(sess, it, cache):
+    """Attack types, signatures and violation names of a logged request (full record: run asm_enrich first).
+    ASM puts the attack type on the signature object (attackTypeReference) and on some violation definitions; some
+    versions also put attackType(s) on the request or the violation entry itself. All of these are read."""
+    types, sigs, vios, keys = [], [], [], set()
+
+    def add_types(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if re.search(r"attack_?types?(Reference|References|Name|Names)?$", k, re.I):
+                    types.extend(asm_names(sess, v, cache))
+
+    def add_sig(d):
+        if not isinstance(d, dict):
+            return
+        n = first(d, "name", "signatureName", "title")
+        sid = first(d, "signatureId", "sigId", "id")
+        if n:
+            sigs.append("%s (%s)" % (n, sid) if sid and str(sid).isdigit() else str(n))
+        add_types(d)
+
+    add_types(it)
+    for v in it.get("violations") or []:
+        if not isinstance(v, dict):
+            continue
+        keys.update(v.keys())
+        vd = f5_ref_get(sess, v.get("violationReference"), cache, ASM_ATTACK_LIMIT) or {}
+        n = vd.get("title") or vd.get("description") or vd.get("name")
+        if n:
+            vios.append(str(n))
+        add_types(v)
+        add_types(vd)
+        for k, x in v.items():
+            if "signature" not in k.lower():
+                continue
+            if isinstance(x, (int, str)) and str(x).isdigit():   # a bare signature ID: look the signature up
+                p = "/mgmt/tm/asm/signatures?$filter=%s&$top=1" % urllib.parse.quote("signatureId eq %s" % x)
+                if p not in cache and len(cache) < ASM_ATTACK_LIMIT:
+                    ok, d = f5_get(sess, p)
+                    cache[p] = (d.get("items") or [None])[0] if ok and isinstance(d, dict) else None
+                add_sig(cache.get(p))
+                continue
+            for y in (x if isinstance(x, list) else [x]):
+                if not isinstance(y, dict):
+                    continue
+                refs = asm_refs(y)
+                if refs:
+                    for r in refs:
+                        add_sig(f5_ref_get(sess, r, cache, ASM_ATTACK_LIMIT))
+                else:
+                    add_sig(y)
+    dedup = lambda xs: list(collections.OrderedDict.fromkeys(xs))   # noqa: E731
+    return dedup(types), dedup(sigs), dedup(vios), keys
+
+
+def asm_attack_hit(q, info):
+    """Does the attack filter text match an attack type, signature or violation name (case-insensitive)?"""
+    q = q.lower()
+    return any(q in s.lower() for part in info[:3] for s in part)
 
 
 def utc3(ts):
@@ -8202,20 +8301,44 @@ def do_f5_asm(b):
             if hostq and not re.match(r"^[a-z0-9_.*:\-]{1,253}$", hostq):
                 raise ValueError("hostname has characters that are not allowed (letters, digits, . - _ * only)")
             hostq = hostq.replace("*", "")
-            if not parts and not status and not hip and not urlq and not hostq:
-                raise ValueError("enter a client IP, True-Client-IP, hostname or URL path and/or choose a status")
+            attackq = re.sub(r"\s+", " ", str(b.get("attack") or "")).strip()
+            if len(attackq) > 100:
+                raise ValueError("attack type / signature text is too long (max 100 characters)")
+            if not parts and not status and not hip and not urlq and not hostq and not attackq:
+                raise ValueError("enter a client IP, True-Client-IP, hostname, URL path or attack type and/or choose a status")
             flt, top = " and ".join(parts), num(b.get("top"), 1, 200, 50, "max rows")
+            acache, astat = {}, {"enriched": 0, "with_viol": 0, "typed": 0, "keys": set(), "types": collections.Counter()}
+            adiag, ainfo = [], {}   # id(entry) -> asm_attack result (kept off the entry: entries are JSON-dumped elsewhere)
 
             def hostok(i):
                 return (not hostq or hostq in asm_hostname(i).lower()) and asm_status_ok(i, status)
+
+            def attackok(i):   # needs the violations: fetch the full record (bounded), passed requests have none
+                if not attackq:
+                    return True
+                if str(first(i, "requestStatus", "enforcementState") or "").lower() in ASM_STATUS["passed"]:
+                    return False
+                if not i.get("violations") and astat["enriched"] < 1500 and time.time() - t0 < 110:
+                    astat["enriched"] += 1
+                    asm_enrich(sess, i)
+                if not i.get("violations"):
+                    return False
+                info = asm_attack(sess, i, acache)
+                ainfo[id(i)] = info
+                astat["with_viol"] += 1
+                astat["keys"] |= info[3]
+                if info[0]:
+                    astat["typed"] += 1
+                    astat["types"].update(info[0])
+                return asm_attack_hit(attackq, info)
 
             def hit0(i):  # local match (no time test), used to verify device-side filters
                 u = str(first(i, "url", "uri") or "")
                 return (not urlq or urlq.lower() in u.lower()) and (not hip or asm_header_ip(i) == hip) and hostok(i)
 
             def hit(i):  # local match while paging
-                return hit0(i) and asm_recent(i, cutoff)
-        if b.get("mode") != "supportid" and (hip or urlq or hostq or (status and not flt)):
+                return hit0(i) and asm_recent(i, cutoff) and attackok(i)
+        if b.get("mode") != "supportid" and (hip or urlq or hostq or attackq or (status and not flt)):
             # The device's clientIp is Cloudflare's edge; True-Client-IP lives in the request headers and is not
             # reliably filterable server-side, so page through the log (other filters applied) and match locally.
             base = "/mgmt/tm/asm/events/requests?" + ("$filter=%s&" % urllib.parse.quote(flt) if flt else "")
@@ -8230,6 +8353,16 @@ def do_f5_asm(b):
                      for e in ("%s eq '%s'", "contains(%s,'%s')")] if hip else \
                     [("url", e, urlq) for e in ("contains(%s,'%s')", "%s eq '%s'")] if urlq else \
                     [(f, "contains(%s,'%s')", hostq) for f in ("hostname", "host")] if hostq else []
+            if attackq and not status and not flt:
+                # passed requests carry no attack: ask the device for blocked + alerted only when it can filter
+                fb, fa = asm_status_flt(sess, "blocked"), asm_status_flt(sess, "alerted")
+                both = "(%s or %s)" % (fb, fa) if fb and fa else ""
+                if both:
+                    sp, okp, dp = rest_get(sess, "/mgmt/tm/asm/events/requests?$filter=%s&$top=5" % urllib.parse.quote(both))
+                    if okp and isinstance(dp, dict) and all(not asm_status_ok(i, "passed") for i in dp.get("items") or []):
+                        flt = both
+                        base = "/mgmt/tm/asm/events/requests?$filter=%s&" % urllib.parse.quote(flt) + \
+                            ("$orderby=requestDatetime%20desc&" if newest_first else "")
             for field, expr, val in cands:
                 cand = expr % (field, val)
                 cflt = "%s and %s" % (flt, cand) if flt else cand
@@ -8277,11 +8410,11 @@ def do_f5_asm(b):
                         newest.append("%s→%s" % (i.get("clientIp", "?"), v or "none"))
                     if hit(i):
                         items.append(i)
-                    elif loose and urlq == "" and hostok(i) and loose.search(json.dumps(i)):
+                    elif loose and urlq == "" and hostok(i) and loose.search(json.dumps(i)) and attackok(i):
                         items.append(i)
                         loose_hits += 1
                     elif loose and urlq and hip and hostok(i) and loose.search(json.dumps(i)) \
-                            and urlq.lower() in str(first(i, "url", "uri") or "").lower():
+                            and urlq.lower() in str(first(i, "url", "uri") or "").lower() and attackok(i):
                         items.append(i)
                         loose_hits += 1
                 if len(page) < 200 or len(items) >= top:
@@ -8312,8 +8445,25 @@ def do_f5_asm(b):
                             "headers, or the list API omits them. Open one request by support ID to check.")
             flt = ("%s and " % flt if flt else "") + " and ".join(
                 x for x in (("True-Client-IP = %s" % hip) if hip else "", ("URL contains %s" % urlq) if urlq else "",
-                            ("hostname contains %s" % hostq) if hostq else "")
+                            ("hostname contains %s" % hostq) if hostq else "",
+                            ("attack type / signature / violation contains '%s'" % attackq) if attackq else "")
                 if x) + " (scanned %d log entries)" % scanned
+            if attackq:
+                adiag = ["Attack filter '%s': %d scanned request(s) with violations were checked (%d full records "
+                         "fetched); %d carried an attack type." % (attackq, astat["with_viol"], astat["enriched"],
+                                                                   astat["typed"])]
+                if astat["types"]:
+                    adiag.append("Attack types seen in the range: " + ", ".join(
+                        "%s %d" % kv for kv in astat["types"].most_common(12)) + ".")
+                elif astat["with_viol"]:
+                    adiag.append("No attack type could be read from these entries (fields on a violation: %s); the "
+                                 "filter was matched on violation and signature names only." % (
+                                     ", ".join(sorted(astat["keys"]))[:300] or "none"))
+                if capped:
+                    adiag.append("Scan stopped at %d entries / time limit before the start of the range: older "
+                                 "requests were not checked. Narrow it with a hostname, client IP or status." % scanned)
+                if not status and not flt.startswith("("):
+                    adiag.append("Passed requests were skipped (they carry no violations).")
         else:
             path = "/mgmt/tm/asm/events/requests?$filter=%s&$top=%d" % (urllib.parse.quote(flt), top)
             audit(sess, "ASM request log: " + flt)
@@ -8380,17 +8530,26 @@ def do_f5_asm(b):
                         it["supportId"] = sid2
                         filled += 1
             vcache = {}
+            acache2 = acache   # this branch is search mode, where acache is set
             rows = []
             for it in items:
                 r = asm_row(it)
                 r["block_reason"] = asm_reason(sess, it, vcache) if time.time() - t0 < 110 else "(time limit)"
+                info = ainfo.get(id(it)) or (asm_attack(sess, it, acache2) if it.get("violations") and time.time() - t0 < 115
+                                             else ([], [], [], set()))
+                r["attack_type"] = ", ".join(info[0])
+                r["signatures"] = "; ".join(info[1][:6]) + (" (+%d)" % (len(info[1]) - 6) if len(info[1]) > 6 else "")
                 rows.append(r)
             lines = ["%(time)s  %(status)-8s %(client)s  [True-Client-IP %(true_client_ip)s]  %(method)s %(hostname)s%(url)s  (support ID %(support_id)s, "
-                     "rating %(rating)s, HTTP %(response_code)s)  reason: %(block_reason)s" % r for r in rows]
+                     "rating %(rating)s, HTTP %(response_code)s)  reason: %(block_reason)s" % r
+                     + ("  attack type: " + r["attack_type"] if r["attack_type"] else "")
+                     + ("  signatures: " + r["signatures"] if r["signatures"] else "") for r in rows]
+            attack_on = b.get("mode") != "supportid" and bool(str(b.get("attack") or "").strip())
             return {"ok": True, "status": st, "ms": int((time.time() - t0) * 1000), "request": "GET " + path,
-                    "verdict": {"label": "%d REQUEST(S)" % len(rows), "kind": "warn" if rows else "info"},
+                    "verdict": {"label": "%d REQUEST(S)%s" % (len(rows), (" · ATTACK '%s'" % str(b.get("attack")).strip().upper())
+                                                             if attack_on else ""), "kind": "warn" if rows else "info"},
                     "summary": (["Time range: %s (applied to the request time of each entry)." % (b.get("within") or "any time")]
-                                if cutoff else []) + (diag if hip and not rows else [])
+                                if cutoff else []) + (diag if hip and not rows else []) + (adiag if attack_on else [])
                     + (["No support ID found in these entries. Fields the device returned: "
                         + ", ".join(sorted(items[0].keys()))[:500]] if items and not any(r["support_id"] for r in rows)
                        else []),
@@ -10134,7 +10293,7 @@ def cf_window(b):
 
 
 def cf_f5_within(b):
-    """The F5 ASM time range closest to the Cloudflare one (F5 lookups go back at most a day)."""
+    """The F5 ASM time range matching the Cloudflare one (same names up to 30 days; custom from/to -> any time)."""
     w = str(b.get("within") or "").strip().lower()
     return w if not b.get("since") and w in LOOKBACK else "any time"
 
@@ -12827,7 +12986,7 @@ def llm_tools():
              "in the result): every connected firewall / F5 with health, HA state and sync, CPU / memory / sessions, "
              "interfaces down, SolarWinds' view of it; F5s / firewalls SolarWinds monitors but the console is not "
              "connected to; and per Orion server: nodes up %, nodes / interfaces down, active alerts, busiest interfaces, "
-             "highest CPU, slowest nodes and 24-hour trends. Use it FIRST for overall health questions ('what needs "
+             "highest CPU, slowest nodes and trends (range picked on the dashboard, 24 h to 12 months). Use it FIRST for overall health questions ('what needs "
              "attention', 'is anything down', 'which firewall is busiest', 'how was the last 24 h'), then run live "
              "checks for details.",
              {"device": S("optional: only devices whose name or IP contains this (Orion summaries are always included)")})
@@ -12874,9 +13033,14 @@ def llm_tools():
                {"name": S("iRule name, e.g. /Common/my_rule or my_rule")}, ["name"])
             vt("hostname_lookup", "which virtual servers / policies / iRules handle a hostname.",
                {"hostname": S("host name")}, ["hostname"])
-            vt("waf_log_search", "search the ASM / WAF request log by client IP, support ID, hostname, URL or status.",
+            vt("waf_log_search", "search the ASM / WAF request log by client IP, support ID, hostname, URL, status and/or "
+               "attack. 'attack' matches the ASM attack type, signature name or violation name (text contained, e.g. "
+               "'Buffer Overflow', 'SQL-Injection', 'Cross Site Scripting', 'Illegal meta character'); each row shows "
+               "attack_type, signatures and block_reason. Can be used alone (e.g. attack + within).",
                {"ip": S("client IP"), "support_id": S("ASM support ID"), "hostname": S("host"), "url": S("URL path"),
-                "status": S("request status, e.g. blocked"), "within": S("time range", enum=[k for k in LOOKBACK])})
+                "status": S("request status, e.g. blocked"),
+                "attack": S("attack type / signature / violation text, e.g. Buffer Overflow"),
+                "within": S("time range", enum=[k for k in LOOKBACK])})
         if v == "cloudflare":
             vt("lookup", "lookups over all zones the token sees. modes: ip {ip}, host {host, days}, ray {ray}, "
                "whois {ip | host}, events {ip, host, path, ray, action, top}, event_top {by: action|source|rule|ip|host|"
@@ -12947,7 +13111,7 @@ def llm_run_tool(name, a):
     if name == "waf_log_search" and v == "f5":
         return do_f5_asm({"id": sid, "mode": "supportid" if s("support_id") else "search", "support_id": s("support_id"),
                           "ip": s("ip"), "hostname": s("hostname"), "url": s("url"), "status": s("status"),
-                          "within": s("within") or "last 24 hours", "top": "50"})
+                          "attack": s("attack"), "within": s("within") or "last 24 hours", "top": "50"})
     if name == "lookup" and v == "cloudflare":
         args = a.get("args") if isinstance(a.get("args"), dict) else {}
         return do_cf(dict({k: str(x) for k, x in args.items()}, id=sid, mode=s("mode")))
@@ -13751,7 +13915,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 .swp .swh{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.swp .swh b{font-size:15px}
 .swp .swh .dv{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--mint)}.swp .swh .dhost{font-size:12px;color:var(--dim)}.swp .swh .dt{margin-left:auto;font-size:11.5px;color:var(--dim)}
 :is(#dash,#fwbv) .swp .swk{padding:12px 0 0}:is(#dash,#fwbv) .swp .swk div{background:var(--panel2);min-width:118px;padding:8px 14px}:is(#dash,#fwbv) .swp .swk b{font-size:21px}
-.swp h4{margin:0 0 8px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}.swp h4.swsub{margin:14px 0 0;text-transform:none;letter-spacing:0;font-size:11.5px}
+.swp h4{margin:0 0 8px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}.swp h4.swsub{margin:14px 0 0;text-transform:none;letter-spacing:0;font-size:11.5px;display:flex;align-items:center;flex-wrap:wrap;gap:4px}.swp select.swrange{width:auto;padding:2px 6px;font-size:12px;font-weight:600}
 .swg2,.swg4,.swg3{display:grid;gap:12px;margin-top:12px}.swg2{grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr))}
 .swg4{grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));margin-top:8px}.swg3{grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr))}
 .swbox{border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:0;background:var(--panel)}
@@ -14527,7 +14691,7 @@ function renderVerdict(r){const v=$("#verdict");v.innerHTML="";
  if(r.summary&&r.summary.length){const u=document.createElement("ul");u.className="sum";
   r.summary.forEach(x=>{const li=document.createElement("li");li.textContent=x;u.appendChild(li)});v.appendChild(u)}
  (r.downloads||(r.download?[r.download]:[])).forEach(d=>{const a=document.createElement("a");a.className="dl";a.href=d+"?t="+T;a.textContent="⬇ Download "+d.split("/").pop();v.appendChild(a)})}
-const WITHIN=["any time","last 15 minutes","last hour","last 6 hours","last 12 hours","last 24 hours"];
+const WITHIN=["any time","last 15 minutes","last hour","last 6 hours","last 12 hours","last 24 hours","last 3 days","last 7 days","last 30 days"];
 function wsel(id){return sel(id,"Time range (up to 1 day)",WITHIN,"any time")}
 function sel(id,label,opts,def){return '<div><label>'+label+'</label><select id="'+id+'">'+
  opts.map(o=>'<option'+(o===def?' selected':'')+'>'+o+'</option>').join("")+'</select></div>'}
@@ -14544,7 +14708,7 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   '</div><div style="margin-top:8px"><button class="primary" onclick="asmLookup(\'supportid\')">Look up support ID</button></div>'+
   '<div class="grp" style="margin-top:14px">Search requests</div><div class="row3">'+fld("asm_ip","Client IP","203.0.113.7")+
   fld("asm_tci","True-Client-IP","198.51.100.9")+fld("asm_host","Hostname contains","app.example.com")+fld("asm_url","URL path contains","/login")+
-  fld("asm_hn","HTTP header name","X-Request-ID")+fld("asm_hv","Header value contains","abc123")+
+  fld("asm_atk","Attack type / signature / violation contains","Buffer Overflow")+fld("asm_hn","HTTP header name","X-Request-ID")+fld("asm_hv","Header value contains","abc123")+
   sel("asm_st","Status",["","blocked","alerted","passed"],"")+fld("asm_top","Max rows","50","50")+fld("asm_hscan","Entries to scan","1000","1000")+sel("asm_w","Time range",WITHIN,"any time")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="asmLookup(\'search\')">Search requests</button> '+
   '<p class="muted" style="margin:6px 0 0">Fill any combination. Client IP is the address the F5 sees; True-Client-IP is the real client behind Cloudflare. '+
@@ -14592,12 +14756,13 @@ async function adminAudit(){setBusy("admin audit (can take up to a minute)");
 async function appsec(c){const names={waf:"coverage",ssl:"SSL posture"};setBusy(names[c]);
  const r=await api("/api/appsec",{id:cur,check:c,vsys:g("as_vsys"),vdom:g("as_vdom"),days:g("as_days")});show(r,names[c])}
 async function asmLookup(m){
+ if(m==="search"&&g("asm_hn").trim()&&g("asm_atk").trim())return show({ok:false,error:"the attack filter cannot be combined with a header search: clear one of them"},"ASM request search");
  if(m==="search"&&g("asm_hv").trim()&&!g("asm_hn").trim())return show({ok:false,error:"enter the HTTP header name for the header value"},"ASM request search");
  setBusy("ASM request log");
  if(m==="search"&&g("asm_hn").trim()){const r=await api("/api/f5asm",{id:cur,mode:"header",header_name:g("asm_hn"),header_value:g("asm_hv"),
   hostname:g("asm_host"),ip:g("asm_ip"),header_ip:g("asm_tci"),url:g("asm_url"),status:g("asm_st"),top:g("asm_top"),scan:g("asm_hscan"),within:g("asm_w")});
   return show(r,"ASM requests · header "+g("asm_hn"))}
- const r=await api("/api/f5asm",{id:cur,mode:m,support_id:g("asm_sid"),ip:g("asm_ip"),header_ip:g("asm_tci"),hostname:g("asm_host"),url:g("asm_url"),status:m==="tophosts"?g("asm_tst"):g("asm_st"),top:g("asm_top"),scan:g("asm_scan"),within:m==="tophosts"?g("asm_tw"):m==="supportid"?g("asm_sw"):g("asm_w")});
+ const r=await api("/api/f5asm",{id:cur,mode:m,support_id:g("asm_sid"),ip:g("asm_ip"),header_ip:g("asm_tci"),hostname:g("asm_host"),url:g("asm_url"),attack:m==="search"?g("asm_atk"):"",status:m==="tophosts"?g("asm_tst"):g("asm_st"),top:g("asm_top"),scan:g("asm_scan"),within:m==="tophosts"?g("asm_tw"):m==="supportid"?g("asm_sw"):g("asm_w")});
  show(r,m==="supportid"?"support ID lookup":m==="tophosts"?"top hostnames by violations":"ASM request search")}
 const CFW=["last 15 minutes","last hour","last 6 hours","last 12 hours","last 24 hours","last 3 days","last 7 days","last 30 days"];
 const CF_ACT=["","block","managed_challenge","challenge","jschallenge","log","skip","allow","bypass","connection_close"];
@@ -14815,7 +14980,7 @@ let aiHist=[],aiSrc=null;
 function aiSrcSet(s){s=s||null;if(JSON.stringify(s)===JSON.stringify(aiSrc))return;aiSrc=s;aiHist=[];const b=$("#ai_src");b.textContent="";b.hidden=!s;if(!s)return;
  b.appendChild(mk("span",null,"✦"));b.appendChild(mk("b",null,s.kind==="irule"?"Talking about iRule "+s.name+" on "+s.device+" (read from the F5)":s.kind==="fwbstats"?"Talking about the FortiWeb statistics of "+s.name+" (last "+s.range+(s.policy?", "+s.policy:"")+(s.ml_domain?"; ML API: "+s.ml_domain:"")+")":"Talking about the operations dashboard (fresh snapshot with each question)"));
  const x=mk("button",null,"✕");x.title="Stop: talk about the console output again";x.setAttribute("aria-label",x.title);x.onclick=()=>aiSrcSet(null);b.appendChild(x)}
-function dashAsk(){aiSrcSet({kind:"dashboard"});aiToggle(true);aiAsk("chat","Using the dashboard data: what needs attention right now, most urgent first? For each item give the device, the values and the likely cause, then the next check to run. Also say if anything looks wrong in the 24-hour trends.","What needs attention on the dashboard right now?")}
+function dashAsk(){aiSrcSet({kind:"dashboard"});aiToggle(true);aiAsk("chat","Using the dashboard data: what needs attention right now, most urgent first? For each item give the device, the values and the likely cause, then the next check to run. Also say if anything looks wrong in the trends.","What needs attention on the dashboard right now?")}
 async function aiInit(){const r=await api("/api/llm/config",{});if(!r.ok)return;
  $("#ai_url").value=r.url;$("#ai_model").value=r.model||"";aiRoute(r);$("#ai_budget").value=r.budget;
  $("#ai_key").placeholder=r.has_key?"(set · type to replace)":"(none)";if(!r.model)$("#ai_cfg").open=true;aiStatus(r.model);aiWelcome()}
@@ -15109,7 +15274,7 @@ function dashBtn(){if(typeof fwbBtn==="function")fwbBtn();const show=devices.som
 function dashToggle(on){dashOpen=on==null?!dashOpen:!!on;$("#dash").hidden=!dashOpen;document.documentElement.style.overflow=dashOpen?"hidden":"";
  try{localStorage.setItem("dash_open",dashOpen?"1":"")}catch(e){}if(dashOpen)dashLoad()}
 async function dashLoad(){let r;try{r=await api("/api/dash")}catch(e){return}if(!r||!r.ok)return;dashData=r;dashAt=Date.now();dashRender();dashClock();
- if(r.busy&&dashOpen)setTimeout(dashLoad,3000)}
+ if((r.busy||r.sw_busy)&&dashOpen)setTimeout(dashLoad,3000)}
 async function dashSet(b){const r=await api("/api/dash",b);if(!r.ok){alert(r.error);return}dashLoad()}
 function dashSpark(vals){const v=(vals||[]).map(x=>x==null?null:+x);if(v.filter(x=>x!=null).length<2)return null;
  const W=64,H=18,n=v.length,ns="http://www.w3.org/2000/svg",s=document.createElementNS(ns,"svg");s.setAttribute("viewBox","0 0 "+W+" "+H);s.setAttribute("class","dspark");
@@ -15220,7 +15385,12 @@ function swPanel(d){const w=mk("div","swp"),s=d.sw;const h=mk("div","dh swh");h.
   g2.appendChild(swLine("Average response time",tr.rt," ms"));g2.appendChild(swLine("Average packet loss",tr.loss,"%"))}
  else{const hs=(s.hist||[]),P=f=>hs.map(x=>[x.t,x[f]]);g2.appendChild(swLine("Nodes up",P("availability"),"%",100));g2.appendChild(swLine("Active alerts",P("alerts"),""));
   g2.appendChild(swLine("Interfaces down",P("if_down"),""));g2.appendChild(swLine("Average CPU",P("cpu"),"%",100))}
- w.appendChild(mk("h4","swsub","Last 24 hours · "+(tr?s.trend_src:"this console's refreshes (Orion history not readable)")));w.appendChild(g2);
+ const r_=dashData||{},sub=mk("h4","swsub"),rs=document.createElement("select");rs.className="swrange";rs.title="Time range of the Orion history charts";
+ (r_.sw_ranges||[["24h","Last 24 hours"]]).forEach(([k,l])=>{const o=document.createElement("option");o.value=k;o.textContent=l;rs.appendChild(o)});
+ rs.value=r_.sw_range||"24h";rs.onchange=()=>{dashData.sw_busy=true;dashSet({sw_range:rs.value})};sub.appendChild(rs);
+ const per=tr&&tr.bucket==="day"?"daily":"hourly";
+ sub.appendChild(mk("span",null," · "+(r_.sw_busy?"⟳ reading Orion history…":tr?s.trend_src.replace("average",per+" average")+(tr.range!==r_.sw_range?" (still showing "+(tr.label||"last 24 hours")+")":""):"this console's refreshes, last 24 hours at most (Orion history not readable)")));
+ w.appendChild(sub);if(tr&&tr.note)w.appendChild(mk("div","dline k-warn","⚠ "+tr.note));w.appendChild(g2);
  const g3=mk("div","swg3");
  g3.appendChild(swList("Needs attention"+(s.attention_total>s.attention.length?" · "+s.attention.length+" of "+s.attention_total:""),s.attention,r=>{const x=mk("div","swr");
   x.appendChild(mk("span","dpill k-"+(SWK[r.cls]||""),r.status));x.appendChild(mk("b",null,r.node));x.appendChild(mk("span","swd",r.issue));x.title=r.node+" ("+r.ip+") · CPU "+r["cpu_%"]+"% · memory "+r["memory_%"]+"% · response "+r.response_ms+" ms · loss "+r["packet_loss_%"]+"%";return x},"every node is up, CPU and memory below 90%"));
@@ -15451,7 +15621,7 @@ function fwbAsk(){if(!fwbData)return;const ml=fwbMlPick();aiSrcSet({kind:"fwbsta
  aiToggle(true);aiAsk("chat","Using these FortiWeb statistics: give a short security assessment of this range. 1. What stands out and why (most important first, with the numbers). 2. For each insight, whether it is a real attack, a likely false positive or a configuration gap, and the evidence. 3. ML anomaly detection and API protection: what the events show, whether models / schemas may need relearning or updating; if the learned endpoint inventory of a domain is included, go through its findings by OWASP API Security Top 10 (2023) category; if the learned API schema of a domain is included, review it (sensitive endpoints, endpoints without parameters learned, unexpected methods such as DELETE / PUT, inconsistent paths). 4. Concrete next steps in the FortiWeb GUI (which menu, which setting).","Assess the FortiWeb statistics")}
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&fwbOpen&&!e._ai&&$("#aicard").hidden)fwbToggle(false)});
 /* vendor advisories headline */
-let advData=null,advSel=-1,advT=null;const ADV_V=["f5","paloalto","fortigate"];
+let advData=null,advSel=-1,advT=null;const ADV_V=["f5","paloalto","fortigate","fortiweb"];
 async function advPoll(){clearTimeout(advT);
  if(!devices.some(d=>ADV_V.includes(d.vendor))){$("#advbar").hidden=true;$("#advpanel").hidden=true;advSel=-1;advT=setTimeout(advPoll,5000);return}
  let r=null;try{r=await api("/api/adv")}catch(e){}
@@ -15490,7 +15660,7 @@ function advPanel(){const r=advData,p=$("#advpanel"),g=advSel>=0?(r.results||[])
    h+='<table><thead><tr><th>Severity</th><th>Advisory</th><th>Issue</th><th>Fixed in (your train)</th><th>Exploited</th><th>Published</th></tr></thead><tbody>';
    g.items.forEach(x=>{h+='<tr><td class="nw"><span class="apill '+(x.sev==="critical"?"a-c":x.sev==="high"?"a-h":"a-m")+'">'+esc(x.sev)+(x.score!=null?' '+esc(x.score):'')+'</span></td><td class="nw"><a href="'+esc(x.url)+'" target="_blank" rel="noopener noreferrer">'+esc(x.id)+'</a></td><td>'+esc(x.title)+(x.note?' <span class="adim">('+esc(x.note)+')</span>':'')+'</td><td class="nw">'+esc(x.fix||"no fix listed")+'</td><td>'+(x.kev?'<span class="apill a-k">yes</span>':'')+'</td><td class="nw">'+esc(x.date)+'</td></tr>'});
    h+='</tbody></table>'}}
- const src=r.sources||{},nm={pan:"Palo Alto advisories","nvd:f5":"NVD BIG-IP list","nvd:fortigate":"NVD FortiOS list",kev:"CISA exploited list"};
+ const src=r.sources||{},nm={pan:"Palo Alto advisories","nvd:f5":"NVD BIG-IP list","nvd:fortigate":"NVD FortiOS list","nvd:fortiweb":"NVD FortiWeb list",kev:"CISA exploited list"};
  h+='<div class="afoot">Lists: '+Object.keys(nm).map(k=>esc(nm[k])+' '+(src[k]?esc(src[k]):'<i>not downloaded</i>')).join(" · ")+(r.next_in!=null?' · next download in '+Math.round(r.next_in/360)/10+' h':'')+'<br>';
  Object.entries(r.errors||{}).forEach(([k,v])=>{h+='<span style="color:var(--bad)">⚠ '+esc(k)+': '+esc(v)+'</span><br>'});
  h+='Only whole public lists are downloaded (Palo Alto, NVD, CVE.org, CISA); device versions are matched here and never sent out.</div>';
@@ -16148,28 +16318,73 @@ DASH_HA = {"f5": dash_ha_f5, "paloalto": dash_ha_pan, "fortigate": dash_ha_fg}
 
 # SolarWinds on the dashboard: one network-wide panel per Orion server, plus each firewall / F5 card gets the health
 # Orion reports for that unit (matched by management IP, else by name). Trends come from Orion's own history
-# (hourly averages over all nodes, last 24 h); if this Orion rejects the history query, the console's own refreshes
-# are charted instead.
-SW_TREND_Q = {
-    "cpu": ("SELECT DATETRUNC('hour', c.DateTime) AS T, AVG(c.AvgLoad) AS A, AVG(c.AvgPercentMemoryUsed) AS B "
-            "FROM Orion.CPULoad c WHERE c.DateTime > ADDDAY(-1, GETDATE()) GROUP BY DATETRUNC('hour', c.DateTime)",
-            "SELECT MIN(c.DateTime) AS T, AVG(c.AvgLoad) AS A, AVG(c.AvgPercentMemoryUsed) AS B FROM Orion.CPULoad c "
-            "WHERE c.DateTime > ADDDAY(-1, GETDATE()) GROUP BY DAY(c.DateTime), HOUR(c.DateTime)"),
-    "rt": ("SELECT DATETRUNC('hour', r.DateTime) AS T, AVG(r.AvgResponseTime) AS A, AVG(r.PercentLoss) AS B "
-           "FROM Orion.ResponseTime r WHERE r.DateTime > ADDDAY(-1, GETDATE()) GROUP BY DATETRUNC('hour', r.DateTime)",
-           "SELECT MIN(r.DateTime) AS T, AVG(r.AvgResponseTime) AS A, AVG(r.PercentLoss) AS B FROM Orion.ResponseTime r "
-           "WHERE r.DateTime > ADDDAY(-1, GETDATE()) GROUP BY DAY(r.DateTime), HOUR(r.DateTime)")}
+# (averages over all nodes, range picked on the panel: DASH["sw_range"]); if this Orion rejects the history query,
+# the console's own refreshes (last 24 h at most) are charted instead.
+# range key -> (days back, bucket, label). Orion keeps detail ~7 days, hourly ~30 days, daily ~365 days by default
+# (Settings > Polling Settings / Database Settings: retention), so a longer range shows what is still kept.
+SW_RANGES = collections.OrderedDict((
+    ("24h", (1, "hour", "Last 24 hours")), ("7d", (7, "hour", "Last 7 days")), ("30dh", (30, "hour", "Last 30 days (hourly)")),
+    ("30d", (30, "day", "Last 30 days (daily)")), ("90d", (90, "day", "Last 90 days")), ("1y", (365, "day", "Last 12 months"))))
+SW_TREND_SRC = {"cpu": ("Orion.CPULoad", "AvgLoad", "AvgPercentMemoryUsed"),
+                "rt": ("Orion.ResponseTime", "AvgResponseTime", "PercentLoss")}
 
 
-def dash_sw_trend(sess):
-    """Hourly averages over all nodes for the last 24 h -> {cpu, mem, rt, loss: [[label, value], ...]} (Orion history)."""
-    out = {}
+def sw_trend_q(key, days, bucket):
+    """SWQL for one trend (DATETRUNC first; older Orion: group by the date parts)."""
+    ent, a, b = SW_TREND_SRC[key]
+    days = int(days)
+    where = "FROM %s x WHERE x.DateTime > ADDDAY(-%d, GETDATE())" % (ent, days)
+    parts = "YEAR(x.DateTime), MONTH(x.DateTime), DAY(x.DateTime)" + (", HOUR(x.DateTime)" if bucket == "hour" else "")
+    return ("SELECT DATETRUNC('%s', x.DateTime) AS T, AVG(x.%s) AS A, AVG(x.%s) AS B %s GROUP BY DATETRUNC('%s', x.DateTime)"
+            % (bucket, a, b, where, bucket),
+            "SELECT MIN(x.DateTime) AS T, AVG(x.%s) AS A, AVG(x.%s) AS B %s GROUP BY %s" % (a, b, where, parts))
+
+
+def dash_sw_range():
+    r = DASH.get("sw_range") or "24h"   # .get: a DASH handed over by live update from an older version has no key
+    return r if r in SW_RANGES else "24h"
+
+
+def dash_sw_trend(sess, rng=None):
+    """Averages over all nodes per hour / day for the range -> {cpu, mem, rt, loss: [[label, value], ...], range,
+    bucket, first, note} (Orion history)."""
+    rng = rng or dash_sw_range()
+    days, bucket, label = SW_RANGES[rng]
+    out, first = {"range": rng, "bucket": bucket, "label": label}, []
     for key, (ka, kb) in (("cpu", ("cpu", "mem")), ("rt", ("rt", "loss"))):
-        rows, _ = sw_first(sess, SW_TREND_Q[key])
-        rows = sorted((r for r in rows if r.get("T")), key=lambda r: str(r["T"]))[-25:]
-        out[ka] = [[sw_dt(r["T"])[5:16], sw_num(r.get("A"), 1)] for r in rows]   # "11-19 15:00"
-        out[kb] = [[sw_dt(r["T"])[5:16], sw_num(r.get("B"), 2)] for r in rows]
+        rows, _ = sw_first(sess, sw_trend_q(key, days, bucket), timeout=60 if days <= 7 else 180)
+        rows = sorted((r for r in rows if r.get("T")), key=lambda r: str(r["T"]))
+        rows = rows[-(days * (24 if bucket == "hour" else 1) + 1):]
+        cut = (lambda t: sw_dt(t)[5:16]) if bucket == "hour" else (lambda t: str(t)[:10])   # "11-19 15:00" / "2026-11-19"
+        out[ka] = [[cut(r["T"]), sw_num(r.get("A"), 1)] for r in rows]
+        out[kb] = [[cut(r["T"]), sw_num(r.get("B"), 2)] for r in rows]
+        if rows:
+            first.append(str(rows[0]["T"])[:10])
+    if first and days > 1:   # Orion's retention is shorter than the range asked for: say so
+        start = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
+        have = min(first)
+        if have > time.strftime("%Y-%m-%d", time.localtime(time.time() - (days - 1.5) * 86400)):
+            out["note"] = ("Orion has data from %s only (asked from %s): its retention for %s averages is shorter "
+                           "than this range" % (have, start, "hourly" if bucket == "hour" else "daily"))
+    out["first"] = min(first) if first else ""
     return out
+
+
+def dash_sw_retrend(items, rng):
+    """Range changed on the panel: read only the trend queries again and update the last pass's Orion panels."""
+    try:
+        for sid, s in items:
+            d = DASH["devices"].get(sid)
+            if not d or not d.get("sw"):
+                continue
+            try:
+                tr, src = dash_sw_trend(s, rng), "Orion history, average over all nodes (server time)"
+            except (SwError, urllib.error.URLError, OSError) as e:
+                tr, src = None, ""
+                d.setdefault("errors", []).append("history (%s): %s" % (SW_RANGES[rng][2], str(getattr(e, "reason", e))[:160]))
+            d["sw"]["trend"], d["sw"]["trend_src"] = tr, src
+    finally:
+        DASH["sw_busy"] = False
 
 
 SW_DEV_KINDS = (("f5", re.compile(r"\bF5\b|BIG-?IP", re.I)),
@@ -16199,10 +16414,10 @@ def dash_sw(sid, sess):
         al = None
         errs.append("active alerts: %s" % e)
     try:
-        trend, tsrc = dash_sw_trend(sess), "Orion history, hourly average over all nodes (server time)"
+        trend, tsrc = dash_sw_trend(sess), "Orion history, average over all nodes (server time)"
     except (SwError, urllib.error.URLError, OSError) as e:
         trend, tsrc = None, ""
-        errs.append("24 h history: %s" % str(getattr(e, "reason", e))[:160])
+        errs.append("history (%s): %s" % (SW_RANGES[dash_sw_range()][2], str(getattr(e, "reason", e))[:160]))
     order = {"bad": 0, "warn": 1, "ok": 2, "admin": 3}
 
     def by_status(rows):
@@ -16346,8 +16561,28 @@ def dash_tick():
     threading.Thread(target=dash_cycle, args=(items,), daemon=True).start()
 
 
+def dash_sw_sync():
+    """Orion panels whose trend is for another range than the one picked (range changed, or a pass that started
+    before the change): read their trend queries again in the background, one job at a time."""
+    rng = dash_sw_range()
+    with DASH["lock"]:
+        if DASH.get("sw_busy") or DASH["busy"]:
+            return
+        stale = [sid for sid, d in DASH["devices"].items() if d.get("vendor") == "solarwinds" and d.get("sw")
+                 and (d["sw"].get("trend") or {}).get("range", "24h") != rng and d["sw"].get("trend_tried") != rng]
+        with LOCK:
+            items = [(sid, SESSIONS[sid]) for sid in stale if sid in SESSIONS]
+        if not items:
+            return
+        DASH["sw_busy"] = True
+        for sid, _ in items:
+            DASH["devices"][sid]["sw"]["trend_tried"] = rng   # an Orion that rejects the query is not asked again
+    threading.Thread(target=dash_sw_retrend, args=(items, rng), daemon=True).start()
+
+
 def do_dash_get(query):
     dash_tick()
+    dash_sw_sync()
     order = {"solarwinds": -1, "paloalto": 0, "fortigate": 1, "f5": 2}
     devs = sorted(DASH["devices"].values(), key=lambda d: (order.get(d.get("vendor"), 9), str(d.get("device")).lower()))
     idx = [d.get("_idx") or {} for d in devs if d.get("vendor") == "solarwinds"]
@@ -16375,7 +16610,8 @@ def do_dash_get(query):
     devs = shown + obs
     return {"ok": True, "on": DASH["on"], "interval": DASH["interval"], "busy": DASH["busy"], "last": DASH["last"],
             "took": DASH["took"], "next_in": max(0, int(DASH["next"] - time.time())) if DASH["on"] else None,
-            "devices": devs}
+            "sw_range": dash_sw_range(), "sw_busy": bool(DASH.get("sw_busy")),
+            "sw_ranges": [[k, v[2]] for k, v in SW_RANGES.items()], "devices": devs}
 
 
 def do_dash_set(b):
@@ -16390,10 +16626,16 @@ def do_dash_set(b):
             return {"ok": False, "error": "interval must be one of %s seconds" % ", ".join(map(str, DASH_INTERVALS))}
         DASH["interval"] = iv
         DASH["next"] = min(DASH["next"], time.time() + iv)
+    if "sw_range" in b:
+        rng = str(b.get("sw_range") or "")
+        if rng not in SW_RANGES:
+            return {"ok": False, "error": "sw_range must be one of: " + ", ".join(SW_RANGES)}
+        DASH["sw_range"] = rng
+        dash_sw_sync()
     if b.get("now") or b.get("on"):
         DASH["next"] = 0.0
     dash_tick()
-    return {"ok": True, "on": DASH["on"], "interval": DASH["interval"]}
+    return {"ok": True, "on": DASH["on"], "interval": DASH["interval"], "sw_range": dash_sw_range()}
 
 
 # ---- Dashboard for the AI: the last refresh as one compact object (chat context, and the agent's 'dashboard' tool) ----
@@ -16418,8 +16660,13 @@ def dash_series(pts):
     vals = [p[1] for p in pts or [] if isinstance(p[1], (int, float))]
     if not vals:
         return None
+    pts = [p for p in pts if isinstance(p[1], (int, float))]
+    max_at = next(p[0] for p in pts if p[1] == max(vals))
+    if len(pts) > 60:   # long ranges (7 days hourly = 168 points): averages of equal slices, labelled by their start
+        k = -(-len(pts) // 60)
+        pts = [[pts[i][0], round(sum(p[1] for p in pts[i:i + k]) / len(pts[i:i + k]), 2)] for i in range(0, len(pts), k)]
     return {"last": vals[-1], "min": min(vals), "max": max(vals), "avg": round(sum(vals) / len(vals), 2),
-            "max_at": next(p[0] for p in pts if p[1] == max(vals)), "hourly": pts}
+            "max_at": max_at, "points": pts}
 
 
 def dash_snapshot(device=""):
@@ -16435,8 +16682,10 @@ def dash_snapshot(device=""):
                 sw_out.append({"server": d.get("device"), "errors": d.get("errors")})
                 continue
             tr = s.get("trend")
-            trend = ({"source": s.get("trend_src"), **{k: dash_series(tr.get(k)) for k in ("cpu", "mem", "rt", "loss")}}
-                     if tr else {"source": "this console's refreshes (Orion history not readable)",
+            trend = ({"source": s.get("trend_src"), "range": tr.get("label"), "per": tr.get("bucket"),
+                      **({"retention_note": tr["note"]} if tr.get("note") else {}),
+                      **{k: dash_series(tr.get(k)) for k in ("cpu", "mem", "rt", "loss")}}
+                     if tr else {"source": "this console's refreshes (Orion history not readable)", "range": "last 24 hours at most",
                                  **{k: dash_series([[h["t"], h.get(k)] for h in s.get("hist") or []])
                                     for k in ("availability", "alerts", "if_down", "cpu")}})
             trend = {("avg_cpu_%" if k == "cpu" else "avg_memory_%" if k == "mem" else "avg_response_ms" if k == "rt"
@@ -16445,7 +16694,7 @@ def dash_snapshot(device=""):
                            "nodes_by_status": s["node_status"], "interfaces_by_status": s["if_status"],
                            "needs_attention": s["attention"], "needs_attention_total": s["attention_total"],
                            "active_alerts": s["alerts"], "busiest_interfaces": s["busiest"], "interfaces_down": s["if_down"],
-                           "highest_cpu": s["top_cpu"], "slowest_response": s["slowest"], "trend_24h": trend,
+                           "highest_cpu": s["top_cpu"], "slowest_response": s["slowest"], "trend": trend,
                            "errors": d.get("errors") or []})
             continue
         if not hit(d):
@@ -17073,7 +17322,7 @@ def do_pcap_upload(raw, fname):
 # Public lists only, downloaded whole and matched here, so nothing about the devices (versions, models, names) is
 # sent anywhere:
 #   Palo Alto  security.paloaltonetworks.com/json  (every PAN-OS advisory with affected / fixed versions per train)
-#   F5, Forti  NVD keyword lists "BIG-IP" / "FortiOS" (every CVE id, score, NVD version ranges) + the vendor's own
+#   F5, Forti  NVD keyword lists "BIG-IP" / "FortiOS" / "FortiWeb" (every CVE id, score, NVD version ranges) + the vendor's own
 #              CVE record from CVE.org for each (exact affected ranges and fixed versions; NVD ranges are the fallback)
 #   all        CISA Known Exploited Vulnerabilities catalog (actively exploited flag)
 # The download runs every ADV["interval"] seconds while a page is open and devices are connected; the result is kept
@@ -17083,9 +17332,10 @@ ADV = {"busy": False, "stage": "", "next": 0.0, "interval": 43200, "min": "high"
        "feeds": None, "sig": None, "results": [], "lock": threading.Lock()}
 ADV_MIN = {"critical": 9.0, "high": 7.0, "medium": 4.0}
 ADV_SINCE = "2016"   # older CVEs are not looked at (no supported release is affected by them)
-ADV_VENDORS = ("paloalto", "fortigate", "f5")
-ADV_LABEL = {"paloalto": "Palo Alto", "fortigate": "FortiGate", "f5": "F5 BIG-IP"}
-ADV_NVD_KEY = {"f5": "BIG-IP", "fortigate": "FortiOS"}
+ADV_VENDORS = ("paloalto", "fortigate", "fortiweb", "f5")
+ADV_LABEL = {"paloalto": "Palo Alto", "fortigate": "FortiGate", "fortiweb": "FortiWeb", "f5": "F5 BIG-IP"}
+ADV_NVD_KEY = {"f5": "BIG-IP", "fortigate": "FortiOS", "fortiweb": "FortiWeb"}
+ADV_FORTI = {"fortigate": "FortiOS", "fortiweb": "FortiWeb"}   # Fortinet vendors -> product name in CVE records / CPEs
 ADV_CACHE_V = 2   # cache format: 2 = advisories keep their condition text (problem / description / workaround)
 
 
@@ -17103,6 +17353,8 @@ ADV_HELP = {   # where the vendor says which release to run (the console compute
     "paloalto": ("https://security.paloaltonetworks.com/", "Palo Alto security advisories + PAN-OS release guidance (preferred releases)"),
     "fortigate": ("https://community.fortinet.com/t5/FortiGate/Technical-Tip-Recommended-Release-for-FortiOS/ta-p/227178",
                   "Fortinet: Recommended release for FortiOS"),
+    "fortiweb": ("https://www.fortiguard.com/psirt?product=FortiWeb",
+                 "FortiGuard PSIRT advisories for FortiWeb + the FortiWeb release notes (upgrade path)"),
     "f5": ("https://my.f5.com/manage/s/article/K5903", "F5 K5903: BIG-IP software support policy")}
 ADV_F5_TOKENS = (   # words in an F5 product name -> provisioned module (sys provision name)
     ("LOCAL TRAFFIC", "ltm"), ("LTM", "ltm"), ("ACCESS POLICY", "apm"), ("APM", "apm"),
@@ -17377,8 +17629,9 @@ def adv_cna_eval(rec, v, vendor, info):
     for a in rec.get("aff") or []:
         if any(it.get("status") == "affected" and adv_ver(it.get("version")) for it in a.get("versions") or []):
             other = True   # the record has version data (maybe only for other products)
-        if vendor == "fortigate":
-            if "fortinet" not in str(a.get("vendor")).lower() or str(a.get("product")).strip().lower() != "fortios":
+        if vendor in ADV_FORTI:
+            if "fortinet" not in str(a.get("vendor")).lower() or \
+                    str(a.get("product")).strip().lower() != ADV_FORTI[vendor].lower():
                 continue
         elif not ("f5" in str(a.get("vendor")).lower() and adv_f5_prod(a.get("product"), info.get("mods"), rec.get("title"))):
             continue
@@ -17406,7 +17659,8 @@ def adv_cna_eval(rec, v, vendor, info):
         return ("clear" if other else None), ""   # versions given only for other products (e.g. 'APM Clients')
     if not hit:
         return "clear", ""
-    fx = sorted({f for f in fixes if adv_ver(f)} | (set(adv_sol_versions(rec)) if le_hit or not fixes else set()),
+    fx = sorted({f for f in fixes if adv_ver(f)} | (set(adv_sol_versions(rec, ADV_FORTI.get(vendor, "")))
+                                                    if le_hit or not fixes else set()),
                 key=adv_ver)
     same = [f for f in fx if adv_ver(f)[:2] == v[:2] and adv_ver(f) > v]
     if not same and le_hit:
@@ -17414,11 +17668,13 @@ def adv_cna_eval(rec, v, vendor, info):
     return "affected", (same or [f for f in fx if adv_ver(f) > v] or [""])[0]
 
 
-def adv_sol_versions(rec):
-    """Versions named in a record's solution text ('Upgrade to FortiOS version 7.4.13 or above')."""
+def adv_sol_versions(rec, prod="FortiOS"):
+    """Versions named in a record's solution text ('Upgrade to FortiOS version 7.4.13 or above'). For a Fortinet
+    product, lines that name only other Fortinet products are skipped."""
     out = []
     for line in str(rec.get("sol") or "").splitlines():
-        if re.search(r"Forti(?!OS)\w+", line) and "FortiOS" not in line:
+        if prod and prod.startswith("Forti") and prod not in line and \
+                any(w != prod for w in re.findall(r"Forti\w+", line)):
             continue   # a line about another Fortinet product
         out += re.findall(r"\b(\d+\.\d+\.\d+(?:\.\d+)?)\b", line)
     return out
@@ -17427,8 +17683,8 @@ def adv_sol_versions(rec):
 def adv_nvd_eval(rec, v, vendor, info):
     known, hit, fix = False, False, ""
     for vend, prod, ver, si, se, ei, ee in rec.get("cpes") or []:
-        if vendor == "fortigate":
-            if vend != "fortinet" or prod != "fortios":
+        if vendor in ADV_FORTI:
+            if vend != "fortinet" or prod != ADV_FORTI[vendor].lower():
                 continue
         elif vend != "f5" or not adv_f5_prod(prod, info.get("mods")):
             continue
@@ -17578,12 +17834,15 @@ def adv_records(vendor, feeds, floor):
             return adv_nvd_eval(r, v, vendor, info)
 
         refs = (c or {}).get("refs") or []
-        url = next((u for u in refs if ("fortiguard" in u if vendor == "fortigate" else "f5.com" in u)), "") or \
+        url = next((u for u in refs if ("fortiguard" in u if vendor in ADV_FORTI else "f5.com" in u)), "") or \
             "https://nvd.nist.gov/vuln/detail/" + r["id"]
-        fixes = [x[6] for x in r.get("cpes") or [] if x[6]]
+        prod = ADV_FORTI.get(vendor, "").lower()
+        fixes = [x[6] for x in r.get("cpes") or [] if x[6] and (not prod or x[1] == prod)]
         for a in (c or {}).get("aff") or []:
+            if prod and str(a.get("product") or "").strip().lower() != prod:
+                continue   # fixed versions of another Fortinet product named in the same CVE
             fixes += [it["lessThan"] for it in a.get("versions") or [] if it.get("lessThan")]
-        fixes += adv_sol_versions(c or {})
+        fixes += adv_sol_versions(c or {}, ADV_FORTI.get(vendor, ""))
         rows.append({"id": r["id"], "title": (c or {}).get("title") or r["desc"][:140], "score": score, "sev": adv_sev(score),
                      "date": r["published"][:10], "url": url, "kev": r["id"] in kev or (c or {}).get("expl") == "active",
                      "eval": ev, "fixes": fixes})
@@ -17654,6 +17913,12 @@ def adv_assess(vendor, version, info, rows, trains=None):
 
 
 # -- device software versions --
+def adv_fx_version(s):
+    """FortiWeb / FortiADC version text ('FortiWeb-VM v8.0.8,build0123,...', 'v8.0.8', '8.0.8 build123') -> '8.0.8'."""
+    m = re.search(r"(?<![\d.])v?(\d+\.\d+\.\d+)(?![\d.])", str(s or ""))
+    return m.group(1) if m else ""
+
+
 def adv_device(sess):
     """Software version, model and (F5) provisioned modules of a connected unit; cached for 6 hours."""
     sw = sess.get("sw")
@@ -17677,6 +17942,18 @@ def adv_device(sess):
             r = d.get("results") or {}
             info["version"] = str(d.get("version") or "").lstrip("vV")
             info["model"] = " ".join(str(x) for x in (r.get("model_name"), r.get("model_number")) if x)
+    elif v == "fortiweb":
+        fi = dict(sess.get("fx_info") or {})
+        try:   # read again (the unit may have been upgraded since connect); the connect-time values are the fallback
+            st_ = fx_status(sess)
+            for k, ks in (("version", ("version", "firmware_version", "fw_version", "firmwareVersion", "build")),
+                          ("model", ("model", "platform", "hardware"))):
+                x = fx_val(st_, *ks)
+                if x not in (None, ""):
+                    fi[k] = x
+        except (FxError, ValueError, urllib.error.URLError, OSError):
+            pass
+        info["version"], info["model"] = adv_fx_version(fi.get("version")), str(fi.get("model") or "FortiWeb")
     else:
         _, ok, d = pan_op(sess, "<show><system><info/></system></show>")
         s = (((d.get("response") or {}).get("result") or {}).get("system") or {}) if ok and isinstance(d, dict) else {}
@@ -17795,6 +18072,9 @@ def adv_tick():
             ADV["last"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest)) if newest else ""
         if ADV["feeds"].get("v") != ADV_CACHE_V and not ADV.get("vtried"):
             ADV["vtried"], ADV["next"] = True, 0.0   # cache from an older console: download once in the new format
+        missing = sorted(set(ADV_NVD_KEY) - set(ADV["feeds"].get("nvd") or {}))
+        if missing and (ADV["feeds"].get("nvd") or ADV["feeds"].get("pan")) and ADV.get("mtried") != missing:
+            ADV["mtried"], ADV["next"] = missing, 0.0   # a vendor added since the cache was made (FortiWeb): get its list
         download = time.time() >= ADV["next"]
         sig = adv_sig(items)
         if not download and sig == ADV["sig"]:
@@ -17986,6 +18266,64 @@ def adv_facts_fg(sess, info):
     return f, notes
 
 
+def adv_facts_fwb(sess, info):
+    """FortiWeb features the FortiWeb advisories depend on (read-only cmdb GETs; field names read tolerantly, not yet
+    confirmed on every firmware)."""
+    f, notes = collections.OrderedDict(), []
+    paths = {"intf": [FWB + "system/interface", "/api/v2.0/system/network.interface"],
+             "admin": [FWB + "system/admin"],
+             "glob": [FWB + "system/global"],
+             "ha": [FWB + "system/ha"],
+             "pol": [FWB + "server-policy/policy"]}
+
+    def one(ps):
+        try:
+            return fx_first(sess, ps)[0]
+        except (FxError, ValueError, urllib.error.URLError, OSError):
+            return None
+    with concurrent.futures.ThreadPoolExecutor(5) as ex:
+        res = dict(zip(paths, ex.map(one, paths.values())))
+    f["model"] = info.get("model") or ""
+    acc = lambda i: re.split(r"[\s,]+", str(fx_val(i, "allowaccess", "allow-access", "allow_access") or "").lower())  # noqa: E731
+    intf = fx_rows(res["intf"]) if res["intf"] is not None else None
+    if intf is None:
+        f["interfaces_with_admin_access"] = "not readable"
+        notes.append("Interfaces not readable.")
+    else:
+        f["interfaces_with_admin_access"] = [
+            "%s %s (%s)" % (fx_name(i), str(fx_val(i, "ip", "ipv4", "ip-netmask") or "").split("/")[0].split(" ")[0],
+                            " ".join(x for x in acc(i) if x in ("https", "http", "ssh", "telnet", "snmp")))
+            for i in intf if set(acc(i)) & {"https", "http", "ssh", "telnet"}]
+        f["interfaces_with_fwb_manager_access"] = [fx_name(i) for i in intf if
+                                                   set(acc(i)) & {"fwb-manager", "fortiweb-manager", "fwbmanager"}]
+    g = res["glob"] if isinstance(res["glob"], dict) else {}
+    if g:
+        ports = [(lbl, fx_val(g, *ks)) for lbl, ks in (("HTTPS", ("admin-sport", "admin_sport", "https-port")),
+                                                       ("HTTP", ("admin-port", "admin_port", "http-port")),
+                                                       ("SSH", ("admin-ssh-port", "ssh-port")))]
+        if any(x for _, x in ports):
+            f["admin_ports"] = ", ".join("%s %s" % (lbl, x or "?") for lbl, x in ports)
+        sso = [(k, g[k]) for k in g if re.search(r"forticloud.?sso|fortinet.?sso|cloud.?sso", str(k), re.I)]
+        if sso:   # FortiCloud SSO admin login (the 2026 authentication-bypass advisories depend on it)
+            f["forticloud_sso_admin_login"] = ", ".join("%s=%s" % kv for kv in sso)
+    adm = fx_rows(res["admin"]) if res["admin"] is not None else None
+    if adm is not None and adm:
+        def open_(a):   # every trusted-host field empty or 0.0.0.0/0 (any source may log in)
+            th = [str(x) for k, x in a.items() if str(k).lower().startswith("trusthost") and x not in (None, "")]
+            return not th or all(re.match(r"^(0\.0\.0\.0(/0| 0\.0\.0\.0)?|::/0)$", t.strip()) for t in th)
+        f["admins_without_trusted_hosts"] = "%d of %d" % (sum(1 for a in adm if open_(a)), len(adm))
+    ha = fx_rows(res["ha"]) if res["ha"] is not None else []
+    f["ha_mode"] = (fx_val(ha[0], "mode", "ha-mode") if ha else "") or "not readable"
+    pol = fx_rows(res["pol"]) if res["pol"] is not None else None
+    if pol is not None:
+        f["server_policies"] = len(pol)
+        modes = collections.Counter(str(fx_val(p, "deployment-mode", "deployment_mode") or "?") for p in pol)
+        f["deployment_modes"] = ", ".join("%s: %d" % kv for kv in modes.most_common())
+    notes.append("FortiWeb facts are read-only REST GETs; field names are read tolerantly and may differ on some "
+                 "firmware versions ('not readable' = the console could not find them).")
+    return f, notes
+
+
 F5_ADV_PROFILES = ("http", "http2", "client-ssl", "server-ssl", "websocket", "sip", "diameter", "mqtt", "rewrite",
                    "dns", "ftp", "ntlm", "fix")
 
@@ -18046,7 +18384,7 @@ def adv_facts_f5(sess, info):
     return f, notes
 
 
-ADV_FACTS = {"paloalto": adv_facts_pan, "fortigate": adv_facts_fg, "f5": adv_facts_f5}
+ADV_FACTS = {"paloalto": adv_facts_pan, "fortigate": adv_facts_fg, "fortiweb": adv_facts_fwb, "f5": adv_facts_f5}
 
 
 def adv_hint(vendor, text, f):
@@ -18101,6 +18439,26 @@ def adv_hint(vendor, text, f):
             d = f.get("interfaces_with_admin_access") or []
             return ("", "Admin access on: %s; admins without trusted hosts: %s" % (
                 L(d or ["no interface"]), f.get("admins_without_trusted_hosts", "?")))
+    elif vendor == "fortiweb":
+        if has(r"FortiCloud SSO|FortiCloud single sign|FortiCloud account") and f.get("forticloud_sso_admin_login"):
+            x = str(f["forticloud_sso_admin_login"])
+            return ("applies" if re.search(r"=(enable|1|true)\b", x, re.I) else
+                    "not applicable" if re.search(r"=(disable|0|false)\b", x, re.I) else "", "FortiCloud SSO admin login: " + x)
+        if has(r"FortiWeb Manager|fwb-manager"):
+            d = f.get("interfaces_with_fwb_manager_access")
+            if isinstance(d, list):
+                return ("applies", "FortiWeb Manager access on " + L(d)) if d else \
+                    ("not applicable", "No interface allows FortiWeb Manager access")
+        if has(r"\bHA\b|high.availability|heartbeat"):
+            m = str(f.get("ha_mode") or "")
+            return ("not applicable" if m == "standalone" else "" if m in ("", "not readable") else "applies",
+                    "HA mode: " + m)
+        if has(r"administrative|admin(istration)? (web )?interface|management interface|\bGUI\b|\bCLI\b|REST API|"
+               r"HTTP/HTTPS|web interface|authenticated (attacker|user)"):
+            d = f.get("interfaces_with_admin_access")
+            return ("", "Admin access on: %s; admins without trusted hosts: %s" % (
+                L(d if isinstance(d, list) and d else ["no interface"] if isinstance(d, list) else [str(d)]),
+                f.get("admins_without_trusted_hosts", "?")))
     elif vendor == "f5":
         used = f.get("_used") or {}
         m = re.search(r"\b(APM|ASM|AFM|DNS|GTM|PEM|AAM|Advanced WAF|SSL Orchestrator|SSLO|Link Controller|"
@@ -18147,7 +18505,7 @@ def adv_config(sess, v):
     t0 = time.time()
     vendor = sess["vendor"]
     if vendor not in ADV_VENDORS:
-        raise ValueError("advisories are checked for Palo Alto, FortiGate and F5 only")
+        raise ValueError("advisories are checked for Palo Alto, FortiGate, FortiWeb and F5 only")
     if ADV["feeds"] is None:
         ADV["feeds"] = adv_load()
     feeds = ADV["feeds"]

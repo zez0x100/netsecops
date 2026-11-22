@@ -46,6 +46,10 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
 - F5 live connections by client IP (LTM > "Live connections by client IP"): client, virtual server, F5 source
   (self IP / SNAT) and pool member for each connection, read-only (`tmsh show sys connection` through the REST API)
 - F5 ASM/WAF request-log search (incl. by any HTTP header: value, IP, True-Client-IP, hostname, URL, time, support ID, POST body), top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
+  - Attack filter: 'Attack type / signature / violation contains' (e.g. Buffer Overflow, SQL-Injection, Illegal meta character), alone or with the other
+    filters. Each blocked / alerted request's full record is read (up to 1,500 per search, 2 minutes) and its violations and signatures are resolved to
+    the ASM attack type; passed requests are skipped. Every search result now shows attack_type and signatures next to the block reason, and the
+    summary lists the attack types seen in the range and whether the scan reached the start of the range. The AI tool f5_waf_log_search takes 'attack' too
 - FortiGate lookups: Virtual IPs (name / external / mapped IP filter), static routes (IP, gateway, interface filter)
 - PAN-OS lookups: destination / static NAT rules (the Virtual IP equivalent), configured static routes, session list
   with source / destination filter (URL category lookup was already available)
@@ -199,19 +203,20 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
     checksums); a change since the previous refresh is highlighted
 
 - **Vendor advisories (headline under the header)**
-  - One chip per vendor and software version of the connected Palo Alto, FortiGate and F5 units: number of critical /
+  - One chip per vendor and software version of the connected Palo Alto, FortiGate, FortiWeb and F5 units: number of critical /
     high issues that affect that exact version, how many are known to be exploited, and the advised release
     (→ version). Click a chip for the list: severity and score, advisory link, fixed release on your train, exploited
     flag, publication date
   - Sources (public, downloaded whole every 12 hours while the console page is open, or "Refresh now"):
-    Palo Alto's advisory feed (security.paloaltonetworks.com) for PAN-OS; for F5 and FortiOS, the NVD lists of every
-    BIG-IP / FortiOS CVE and each CVE's record from the vendor on CVE.org (affected ranges and fixed versions; NVD's
+    Palo Alto's advisory feed (security.paloaltonetworks.com) for PAN-OS; for F5, FortiOS and FortiWeb, the NVD lists of
+    every BIG-IP / FortiOS / FortiWeb CVE and each CVE's record from the vendor on CVE.org (affected ranges and fixed versions; NVD's
     ranges are used when the vendor record has none); the CISA Known Exploited Vulnerabilities catalog. They are kept
     in `advisory_cache.json` (git-ignored) so a restart does not download them again. The first download takes 2–3
     minutes (NVD allows few requests without an API key)
   - Matching is done in the console: the device versions are never sent anywhere. F5 issues that only concern a
     module that is not provisioned (e.g. APM) are left out; PAN-OS issues limited to Panorama, VM-Series or a hardware
-    series are applied only to matching units
+    series are applied only to matching units; for FortiOS / FortiWeb only that product's entries in a CVE count
+    (a CVE that also names FortiProxy does not turn FortiProxy's fixed versions into FortiOS advice)
   - Advised release = the lowest release, on the current train first, that none of the listed advisories affects. It
     is computed from the advisories, not a vendor recommendation: check the vendor's release guidance (linked in the
     panel) and the advisory details (some need a feature in use, such as GlobalProtect or an exposed management
@@ -223,7 +228,10 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
     hint from keyword rules (likely applies / likely not applicable). Facts read: Palo Alto GlobalProtect portals and
     gateways, management profiles on data interfaces, management permitted IPs, DNS proxy, IKE gateways,
     authentication portal; FortiGate SSL-VPN, admin access / FGFM / CAPWAP per interface, admin ports, FortiCloud SSO
-    admin login, IPsec tunnels, BGP neighbors, HA mode, admins without trusted hosts; F5 provisioned modules, self IP
+    admin login, IPsec tunnels, BGP neighbors, HA mode, admins without trusted hosts; FortiWeb admin access per
+    interface, admin ports, FortiCloud SSO admin login (when the firmware shows it), FortiWeb Manager access, admins
+    without trusted hosts, HA mode, server policies and deployment modes (field names not yet confirmed on every
+    firmware); F5 provisioned modules, self IP
     port lockdown (with the default list), Configuration utility / SSH allow lists, APM access profiles, profile types
     used by virtual servers (HTTP/2, SSL, SIP, WebSocket, …). The button then asks the AI assistant to judge every CVE
     as APPLIES / DOES NOT APPLY / CAN'T TELL with the deciding fact; exposure to the internet cannot be seen by the
@@ -251,8 +259,11 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
   - Raw box: one SWQL `SELECT` query
   - The AI assistant can run these checks too (tools `sw_...`), e.g. "is anything down?" or "is the DMZ uplink busy?"
   - Operations dashboard (▦): a SolarWinds panel at the top with network availability, nodes / interfaces by
-    status, active and unacknowledged alerts, 24-hour trends of average CPU, memory, response time and packet loss
-    (Orion's own history; the console's refreshes if that history is not readable), what needs attention, the
+    status, active and unacknowledged alerts, trends of average CPU, memory, response time and packet loss
+    (Orion's own history, range picked on the panel: 24 hours, 7 days or 30 days per hour; 30 days, 90 days or 12
+    months per day. Orion keeps hourly data about 30 days and daily data about a year by default; when it has less
+    than the range asked for, the panel says from which date it has data. Changing the range re-reads only the history
+    queries. If that history is not readable, the console's own refreshes are charted, 24 hours at most), what needs attention, the
     busiest interfaces, interfaces down, highest CPU and slowest nodes. Each firewall / F5 card also shows what
     SolarWinds reports for that unit (matched by management IP, else by name): status, response time, loss, CPU,
     active alerts, interfaces down, busiest interface. F5s and firewalls that Orion monitors but that are not
@@ -308,7 +319,7 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
   - Values whose field names look like secrets (passwords, keys, PSKs ...) are shown as "(hidden)"
   - The AI assistant can run these checks (tools `fwb_...`, `fad_...`), and "Explain the current output" explains a
     FortiADC Lua script; secrets written in scripts are masked before sending
-  - Not yet: dashboard cards, monitor pop-ups, vendor advisories and the flow trace for FortiWeb / FortiADC
+  - Not yet: dashboard cards, monitor pop-ups and the flow trace for FortiWeb / FortiADC, vendor advisories for FortiADC
 
 - **Look**
   - Light theme by default, dark theme one click away (◐ in the header; the choice is remembered in the browser)
