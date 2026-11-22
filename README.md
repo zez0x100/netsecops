@@ -12,7 +12,7 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
   profiles and hit count; "List all policies" lists every rule
 - PAN-OS / FortiGate flow check: source and destination IP (optional port, protocol; zones on PAN-OS) show which rule
   allows or blocks the flow; on FortiGate the ingress interface is optional and taken from the route to the source
-- Flow trace (one card, shown once a device is connected): one flow (client IP -> destination IP or hostname, port,
+- Flow trace (⇄ button in the header, next to the dashboard ▦; shown once a firewall, F5 or Cloudflare is connected; opens a full-screen view with the form and the result): one flow (client IP -> destination IP or hostname, port,
   protocol) traced through the connected devices it actually crosses. Nothing is tied to device names, vendors or
   a fixed order: the path is found from each device's own configuration, so it fits any mix of FortiGate, Palo Alto
   and F5 (and Cloudflare). Only the devices on the path are shown, each tested with the addresses it sees; a device
@@ -46,6 +46,12 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
 - F5 live connections by client IP (LTM > "Live connections by client IP"): client, virtual server, F5 source
   (self IP / SNAT) and pool member for each connection, read-only (`tmsh show sys connection` through the REST API)
 - F5 ASM/WAF request-log search (incl. by any HTTP header: value, IP, True-Client-IP, hostname, URL, time, support ID, POST body), top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
+  - Security dashboard (button at the top of the ASM section, or check 'Security dashboard' under Security; 1 hour to 7 days):
+    the same layout as the Cloudflare one, from the ASM request log: blocked / alerted / passed over time, events by security
+    policy, top source IPs, True-Client-IPs, hosts, URLs, countries, methods, response codes and violation ratings, and the
+    attack types, violations and signatures (from up to 300 full records of blocked / alerted requests, as the list view leaves
+    them out; the summary says how many). Clicking a policy, list entry or rule filters the dashboard. Reads at most 20,000
+    log entries in about 75 seconds; the summary says when the range was not fully covered
   - Attack filter: 'Attack type / signature / violation contains' (e.g. Buffer Overflow, SQL-Injection, Illegal meta character), alone or with the other
     filters. Each blocked / alerted request's full record is read (up to 1,500 per search, 2 minutes) and its violations and signatures are resolved to
     the ASM attack type; passed requests are skipped. Every search result now shows attack_type and signatures next to the block reason, and the
@@ -164,6 +170,13 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
   - WHOIS for an IP (network, range, owner, country, abuse contact, ASN holder) and a domain (registrar, dates,
     status, name servers, DNSSEC), via RDAP with port-43 WHOIS as fallback; also part of the IP and hostname
     investigations, with findings for domain expiry, registry holds and a missing transfer lock
+  - Security dashboard (Security events card, with a time range from 15 minutes to 30 days): like Security > Analytics >
+    Events: total / mitigated / blocked tiles with change vs the previous period, events over time by action, events by
+    service (managed / custom rules, API Shield, rate limiting, bots ...), top source IPs, hosts, paths, ASNs, user
+    agents, referers, methods, JA3 / JA4 fingerprints, countries and colos, and the custom / managed / rate limiting /
+    HTTP DDoS / sensitive data / bot rules that fired. The card's filters narrow it; clicking a service, list entry, rule
+    or chart column drills down (a 1-minute column lists its events). Fields a plan does not offer (e.g. JA3) are left out
+    and named. The AI assistant can open it too (Cloudflare lookup 'secdash')
   - Traffic dashboard (optional button): headline tiles with change vs the previous period, requests, data
     transfer, status codes, cache status and edge TTFB p50 / p95 / p99 over time, and top paths, countries,
     client IPs, ASNs, hosts and referrers; drawn in the page (no external libraries), with the numbers as tables below.
@@ -319,6 +332,10 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
   - Values whose field names look like secrets (passwords, keys, PSKs ...) are shown as "(hidden)"
   - The AI assistant can run these checks (tools `fwb_...`, `fad_...`), and "Explain the current output" explains a
     FortiADC Lua script; secrets written in scripts are masked before sending
+  - FortiWeb security dashboard ('Security dashboard' on the FortiWeb analytics card, same time range, or the check under
+    Security): the Cloudflare-style layout from the attack log: events by action over time, by protection category
+    (signatures, ML anomaly, ML API protection, bots ...), top source IPs, hosts, URLs, countries, server policies, user
+    agents, methods and JA4, and the attack types, signatures, OWASP Top 10 and severities; click to filter
   - Not yet: dashboard cards, monitor pop-ups and the flow trace for FortiWeb / FortiADC, vendor advisories for FortiADC
 
 - **Look**

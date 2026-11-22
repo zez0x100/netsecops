@@ -89,6 +89,8 @@ def P(name, label, placeholder="", default="", required=True):
 # ----------------------------------------------------------------------------
 CATALOG = {
     "f5": [
+        {"id": "secdash", "group": "Security", "label": "Security dashboard (ASM request log: blocked / alerted over time, by policy, top sources, attack types, violations and signatures)", "handler": "secdash",
+         "params": [P("range", "Time range: 1h, 6h, 24h, 3d or 7d", "24h", "24h", required=False)]},
         {"id": "advcfg", "group": "Security", "label": "Vendor advisories vs this device's configuration (CVEs for its "
          "version, when each applies, the matching configuration facts; then ask the AI)", "handler": "adv_config"},
         {"id": "version", "group": "Device", "label": "Software version", "path": "/mgmt/tm/sys/version"},
@@ -239,6 +241,8 @@ CATALOG = {
                                                P("filter", "Node or interface name (optional)", "dmz", required=False)]},
     ],
     "fortiweb": [
+        {"id": "secdash", "group": "Security", "label": "Security dashboard (attack log: events by action and category, top sources, attack types and signatures)", "handler": "secdash",
+         "params": [P("range", "Time range: 1h, 6h, 24h, 3d or 7d", "24h", "24h", required=False)]},
         {"id": "advcfg", "group": "Security", "label": "Vendor advisories vs this device's configuration (CVEs for its "
          "version, when each applies, the matching configuration facts; then ask the AI)", "handler": "adv_config"},
         {"id": "status", "group": "Device", "label": "System status (version, serial, HA mode, signature versions)",
@@ -5829,7 +5833,7 @@ PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_
                 "pan_resources": pan_resources, "fg_resources": fg_resources,
                 "f5_perf": f5_perf, "f5_vs_top": f5_vs_top, "pan_app_traffic": pan_app_traffic,
                 "pan_snat": pan_snat, "fg_snat": fg_snat, "f5_snat": f5_snat_lookup, "f5_conns": f5_conns,
-                "f5_irules": f5_irules, "adv_config": lambda s_, v_: adv_config(s_, v_),
+                "f5_irules": f5_irules, "adv_config": lambda s_, v_: adv_config(s_, v_), "secdash": lambda s_, v_: secdash_run(s_, v_),
                 "sw_overview": sw_overview, "sw_alerts": sw_alerts, "sw_nodes": sw_nodes, "sw_node_issues": sw_node_issues,
                 "sw_node": sw_node, "sw_iface_issues": sw_iface_issues, "sw_iface_top": sw_iface_top,
                 "fx_generic": fx_generic, "fwb_policies": fwb_policies, "fwb_attacks": fwb_attacks, "fad_vs": fad_vs,
@@ -6196,14 +6200,14 @@ def flow_trace_nat(by, legs, host, port):
             hops.append(flow_hop(NAT_SESS, "Public IP %s" % d, {"ok": True, "verdict": {
                 "label": "INFERRED: public %s -> private %s" % (d, privs[0]), "kind": "warn"}},
                 ["%s is the external IP of FortiGate VIP %s, which maps to the F5 virtual server of %s. Add '%s %s' to "
-                 "the upstream NAT list in the flow trace card to confirm it." % (
+                 "the upstream NAT list in the flow trace view (⇄ in the header) to confirm it." % (
                      privs[0], ", ".join(str(c[1]) for c in cands), host, d, privs[0])]))
             out.append(flow_leg(leg["src"], privs[0], leg["port"], "upstream NAT %s -> %s (inferred)" % (d, privs[0])))
         elif privs:
             hops.append(flow_hop(NAT_SESS, "Public IP %s" % d, {"ok": True, "verdict": {
                 "label": "AMBIGUOUS: public %s may be NAT'ed to %s" % (d, " or ".join(privs[:4])), "kind": "warn"}},
                 ["Several FortiGate VIPs map to the F5 virtual server of %s. Add the right 'public private' pair to the "
-                 "upstream NAT list in the flow trace card." % host]))
+                 "upstream NAT list in the flow trace view (⇄ in the header)." % host]))
             out.append(leg)
         else:
             out.append(leg)   # nothing points to a NAT: the address is passed on unchanged, as before
@@ -8640,6 +8644,281 @@ def do_f5_asm(b):
                 "verdict": {"label": "REQUEST %s (support ID %s)" % (status.upper() or "FOUND", sid), "kind": kind},
                 "data": data}
     except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+
+
+# ---- Security dashboard for F5 ASM and FortiWeb (same layout as the Cloudflare one) ------------------------------
+# Built from the device's own log: FortiWeb attack log, F5 ASM request log. Every event is first normalised to
+# {ts, action, svc, mit, t: {top-list key: value}, r: {rule-list key: [values]}}; secdash_build() then makes the
+# tiles, the chart by action, the breakdown bar, the top lists and the rule lists. Read-only.
+SECDASH_RANGES = {"1h": 1, "6h": 6, "24h": 24, "3d": 72, "7d": 168}
+SECDASH_NA = ("N/A", "n/a", "NA", "-", "None", "none", "null", "unknown")
+
+
+def secdash_step(hours):
+    return ((60, "1 minute") if hours <= 1 else (300, "5 minutes") if hours <= 6 else (900, "15 minutes") if hours <= 24
+            else (3600, "1 hour"))
+
+
+def secdash_filters(b, keys):
+    """Drill-down filters {key: value} from the page; keys limited to the event's fields."""
+    f = b.get("filters") if isinstance(b.get("filters"), dict) else {}
+    out = {}
+    for k, v in f.items():
+        k, v = str(k), str(v if v is not None else "").strip()
+        if not v:
+            continue
+        if k not in keys or len(v) > 300 or "\n" in v:
+            raise ValueError("invalid dashboard filter: %s" % k[:40])
+        out[k] = v
+    return out
+
+
+def secdash_match(e, f):
+    for k, v in f.items():
+        if k == "action":
+            ok = e["action"] == v
+        elif k == "service":
+            ok = e["svc"] == v
+        elif k == "rule":
+            ok = any(v in vals for vals in e["r"].values())
+        else:
+            ok = str(e["t"].get(k) or "") == v
+        if not ok:
+            return False
+    return True
+
+
+def secdash_build(evs, hours, spec, ref=None):
+    """Normalised events -> (dashboard dict, table data)."""
+    step, bucket = secdash_step(hours)
+    ref = ref or time.time()
+    nb = int(hours * 3600 / step)
+    start = ref - nb * step
+    keys = [time.strftime("%m-%d %H:%M" if hours > 24 else "%H:%M", time.localtime(start + (i + 1) * step)) for i in range(nb)]
+    acts = collections.Counter(e["action"] for e in evs)
+    order = spec.get("order") or ()
+    acts_l = sorted(acts, key=lambda a: (order.index(a) if a in order else 99, -acts[a]))
+    ts = {a: [0] * nb for a in acts_l}
+    for e in evs:
+        if e["ts"] and e["ts"] >= start:
+            ts[e["action"]][min(nb - 1, int((e["ts"] - start) / step))] += 1
+    tot = len(evs)
+    mit = sum(1 for e in evs if e["mit"])
+    tiles = [{"label": "Total events", "value": tot, "prev": None, "fmt": "num",
+              "spark": [sum(ts[a][i] for a in acts_l) for i in range(nb)]},
+             {"label": spec.get("mit_label", "Mitigated (blocked)"), "value": mit, "prev": None, "fmt": "num",
+              "spark": [sum(ts[a][i] for a in acts_l if a in spec.get("mit_actions", ())) for i in range(nb)]}]
+    for a in acts_l[:4]:
+        if a.replace("_", " ").lower() == tiles[1]["label"].lower() or len(tiles) >= 5:
+            continue   # already the mitigated tile
+        tiles.append({"label": a.replace("_", " ").capitalize(), "value": acts[a], "prev": None, "fmt": "num", "spark": ts[a]})
+    svc = collections.Counter(e["svc"] for e in evs if e["svc"])
+    pct = lambda c: "%.1f%%" % (100.0 * c / tot) if tot else ""   # noqa: E731
+    tops, data_tops = [], {}
+    for key, title, drill in spec["tops"]:
+        c = collections.Counter(e["t"].get(key) for e in evs if e["t"].get(key) and e["t"][key] not in SECDASH_NA)
+        if c:
+            tops.append([title, [[v, n] for v, n in c.most_common(10)], key if drill else ""])
+            data_tops[re.sub(r"\W+", "_", title.lower()).strip("_")] = [
+                {key: v, "events": n, "share": pct(n)} for v, n in c.most_common(10)]
+    rules, data_rules = [], {}
+    for key, title in spec["rules"]:
+        c = collections.Counter(v for e in evs for v in e["r"].get(key) or [])
+        if c:
+            rules.append([title, [[v, n, v] for v, n in c.most_common(10)]])
+            data_rules[re.sub(r"\W+", "_", title.lower()).strip("_")] = [
+                {"name": v, "events": n, "share": pct(n)} for v, n in c.most_common(10)]
+    dash = {"bucket": bucket, "t": keys, "tiles": tiles, "actions": [[a, ts[a]] for a in acts_l],
+            "services": [[s, n, s] for s, n in svc.most_common(12)], "services_title": spec.get("svc_title", "Events by service"),
+            "tops": tops, "rules": rules, "rules_title": spec.get("rules_title", "Rules that fired")}
+    data = {"headline": {t["label"]: "{:,}".format(t["value"]) for t in tiles},
+            "events_by_action": [{"action": a, "events": acts[a], "share": pct(acts[a])} for a in acts_l],
+            re.sub(r"\W+", "_", dash["services_title"].lower()).strip("_"): [
+                {"name": s, "events": n, "share": pct(n)} for s, n in svc.most_common(12)]}
+    data.update(data_tops)
+    data.update(data_rules)
+    return dash, data
+
+
+FWB_SEC_TOPS = (("ip", "Source IP addresses", True), ("host", "Hosts", True), ("path", "URLs", True),
+                ("country", "Countries", True), ("policy", "Server policies", True), ("ua", "User agents", True),
+                ("method", "HTTP methods", True), ("ja4", "JA4 fingerprints", True))
+FWB_SEC_RULES = (("type", "Attack types"), ("sig", "Signatures"), ("owasp", "OWASP Top 10"), ("sev", "Severity"))
+
+
+def fwb_secdash(sess, b):
+    t0 = time.time()
+    rng = str(b.get("range") or "24h")
+    if rng not in SECDASH_RANGES:
+        raise ValueError("range must be one of: " + ", ".join(SECDASH_RANGES))
+    hours = SECDASH_RANGES[rng]
+    f = secdash_filters(b, {"action", "service", "rule"} | {k for k, _, _ in FWB_SEC_TOPS})
+    raw, used, note = fwb_logs(sess, hours)
+    audit(sess, "FortiWeb security dashboard %s %s" % (rng, json.dumps(f)))
+    now = time.time()
+    rows = [fx_clean(r) for r in raw]
+    tsv = [x for x in (fwb_ts(r) for r in rows) if x]
+    ref = max([now] + tsv) if tsv else now
+    since = ref - hours * 3600
+    g = lambda r, *ks: next((str(r[k]) for k in ks if r.get(k) not in (None, "", "N/A", "n/a")), "")   # noqa: E731
+    evs = []
+    for r in rows:
+        ts = fwb_ts(r)
+        if ts is not None and ts < since:
+            continue
+        act = g(r, "action") or "unknown"
+        sig = (g(r, "signature_id") + " " + g(r, "msg", "sub_type")[:60]).strip() if g(r, "signature_id") else ""
+        typ = " · ".join(x for x in (g(r, "main_type"), g(r, "sub_type")) if x) or g(r, "msg")[:80]
+        evs.append({"ts": ts, "action": act.lower(), "svc": fwb_cat(r), "mit": bool(FWB_BLOCK_RE.search(act)),
+                    "t": {"ip": g(r, "src", "srcip", "src_ip", "client_ip", "original_src"),
+                          "host": g(r, "http_host", "host", "hostname"), "path": g(r, "http_url", "url", "uri").split("?")[0],
+                          "country": g(r, "srccountry", "src_country", "country"), "policy": g(r, "policy"),
+                          "ua": g(r, "http_agent", "user_agent"), "method": g(r, "http_method", "method").upper(),
+                          "ja4": g(r, "ja4")},
+                    "r": {"type": [typ] if typ else [], "sig": [sig] if sig else [],
+                          "owasp": [g(r, "owasp_top10", "owasp_api_top10")] if g(r, "owasp_top10", "owasp_api_top10") else [],
+                          "sev": [g(r, "severity_level", "severity", "threat_level")] if g(r, "severity_level", "severity", "threat_level") else []}})
+    allev = len(evs)
+    evs = [e for e in evs if secdash_match(e, f)]
+    acts = {e["action"] for e in evs}
+    spec = {"order": ("block_ip", "deny", "alert_deny", "redirect", "send_403_forbidden", "erase", "period_block", "alert"),
+            "mit_label": "Mitigated (deny / block / redirect)", "mit_actions": {a for a in acts if FWB_BLOCK_RE.search(a)},
+            "svc_title": "Events by protection category", "tops": FWB_SEC_TOPS, "rules": FWB_SEC_RULES,
+            "rules_title": "Attack types and signatures"}
+    dash, data = secdash_build(evs, hours, spec, ref)
+    dash["ctx"] = {"vendor": "fortiweb", "range": rng, "filters": f}
+    notes = ["FortiWeb attack log (%s), the last %s; %d event(s)%s." % (
+        used.split("?")[0], {"1h": "hour", "6h": "6 hours", "24h": "24 hours", "3d": "3 days", "7d": "7 days"}[rng],
+        len(evs), (" of %d, filtered by %s" % (allev, ", ".join("%s = %s" % kv for kv in f.items()))) if f else ""),
+             "Times are this PC's local time."]
+    if note:
+        notes.append("Coverage: " + note + ": older events in the range are not counted.")
+    mit = sum(1 for e in evs if e["mit"])
+    r = {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "GET " + used,
+         "verdict": {"label": "%s ATTACK EVENTS · %s MITIGATED" % ("{:,}".format(len(evs)), "{:,}".format(mit)),
+                     "kind": "warn" if evs else "ok"}, "summary": notes, "data": data}
+    r["secdash"] = dash
+    return r
+
+
+F5_SEC_TOPS = (("ip", "Source IP addresses", True), ("tci", "True-Client-IP (real client)", True), ("host", "Hosts", True),
+               ("path", "URLs", True), ("country", "Countries", True), ("method", "HTTP methods", True),
+               ("code", "Response codes", True), ("rating", "Violation rating", True), ("ua", "User agents", True))
+F5_SEC_RULES = (("type", "Attack types"), ("vio", "Violations"), ("sig", "Signatures"))
+
+
+def f5_secdash(sess, b):
+    """ASM request log over the range, newest first (bounded); violations / attack types / signatures come from the
+    full record of up to F5_SEC_ENRICH blocked or alerted requests when the list view leaves them out."""
+    t0 = time.time()
+    rng = str(b.get("range") or "24h")
+    if rng not in SECDASH_RANGES:
+        raise ValueError("range must be one of: " + ", ".join(SECDASH_RANGES))
+    hours = SECDASH_RANGES[rng]
+    f = secdash_filters(b, {"action", "service", "rule"} | {k for k, _, _ in F5_SEC_TOPS})
+    cutoff = time.time() - hours * 3600
+    audit(sess, "F5 ASM security dashboard %s %s" % (rng, json.dumps(f)))
+    base = "/mgmt/tm/asm/events/requests?"
+    order = "$orderby=requestDatetime%20desc&"
+    st0, ok0, d0 = rest_get(sess, base + order + "$top=1")
+    if not ok0 or not isinstance(d0, dict):
+        st0, ok0, d0 = rest_get(sess, base + "$top=1")
+        if not ok0 or not isinstance(d0, dict):
+            return {"ok": False, "status": st0, "error": "request log query failed (HTTP %s). Is ASM / Advanced WAF "
+                    "provisioned and does the account have access?" % st0}
+        order = ""
+    items, prev, capped, path = [], None, True, base
+    for skip in range(0, 20000, 500):
+        if time.time() - t0 > 75:
+            break
+        path = base + order + "$top=500" + ("&$skip=%d" % skip if skip else "")
+        st, ok, d = rest_get(sess, path, 60)
+        page = d.get("items", []) if ok and isinstance(d, dict) else []
+        fid = json.dumps(page[0], sort_keys=True) if page else None
+        if skip and fid == prev:
+            capped = False
+            break
+        prev = fid
+        items += [i for i in page if asm_recent(i, cutoff)]
+        if len(page) < 500 or (order and page and not asm_recent(page[-1], cutoff)):
+            capped = False
+            break
+    pcache, acache, enriched = {}, {}, 0
+    status_of = lambda i: str(first(i, "requestStatus", "enforcementState") or "unknown").lower()   # noqa: E731
+    sample = [i for i in items if status_of(i) not in ASM_STATUS["passed"]]
+    with_v = sum(1 for i in sample if i.get("violations"))
+    for i in sample:
+        if i.get("violations") or enriched >= 300 or time.time() - t0 > 105:
+            continue
+        if asm_enrich(sess, i):
+            enriched += 1
+    evs = []
+    for i in items:
+        stt = status_of(i)
+        stt = "blocked" if stt in ASM_STATUS["blocked"] else "alerted" if stt in ASM_STATUS["alerted"] else \
+            "passed" if stt in ASM_STATUS["passed"] else stt
+        pol = f5_ref_name(sess, i.get("requestPolicyReference"), pcache) if i.get("requestPolicyReference") else ""
+        pol = str(pol or first(i, "policyName", "policy") or "")
+        info = asm_attack(sess, i, acache) if i.get("violations") and time.time() - t0 < 110 else ([], [], [], set())
+        ua = next((v for k, v in asm_http(i)[1] if k == "user-agent"), "") if i.get("rawRequest") else ""
+        geo = first(i, "geolocation", "geoLocation", "countryCode", "geoCountry", "clientCountry")
+        evs.append({"ts": to_epoch(first(i, "requestDatetime", "occurrenceTime", "dateTime", "time")), "action": stt,
+                    "svc": pol.split("/")[-1] if pol else "(no policy)", "mit": stt == "blocked",
+                    "t": {"ip": str(i.get("clientIp") or ""), "tci": asm_header_ip(i), "host": asm_hostname(i),
+                          "path": str(first(i, "url", "uri") or "").split("?")[0], "country": str(geo or ""),
+                          "method": str(i.get("method") or "").upper(), "code": str(i.get("responseCode") or ""),
+                          "rating": str(i.get("violationRating") or ""), "ua": ua[:120]},
+                    "r": {"type": info[0], "vio": info[2], "sig": info[1]}})
+    allev = len(evs)
+    evs = [e for e in evs if secdash_match(e, f)]
+    spec = {"order": ("blocked", "alerted", "passed"), "mit_label": "Blocked", "mit_actions": {"blocked"},
+            "svc_title": "Events by security policy", "tops": F5_SEC_TOPS, "rules": F5_SEC_RULES,
+            "rules_title": "Attack types, violations and signatures"}
+    dash, data = secdash_build(evs, hours, spec)
+    dash["ctx"] = {"vendor": "f5", "range": rng, "filters": f}
+    nviol = sum(1 for e in evs if e["action"] != "passed")
+    notes = ["ASM request log, the last %s; %d request(s)%s." % (
+        {"1h": "hour", "6h": "6 hours", "24h": "24 hours", "3d": "3 days", "7d": "7 days"}[rng], len(evs),
+        (" of %d, filtered by %s" % (allev, ", ".join("%s = %s" % kv for kv in f.items()))) if f else ""),
+             "Attack types, violations and signatures: from %d blocked / alerted request(s) with violation details "
+             "(%d full record(s) read)%s." % (with_v + enriched, enriched,
+                                              ", the rest were not read in time" if len(sample) > with_v + enriched else ""),
+             "Times are this PC's local time."]
+    if f.get("rule") and len(sample) > with_v + enriched:
+        notes.append("The attack type / violation / signature filter can only match the %d request(s) whose details were "
+                     "read; choose a shorter range or add another filter for a complete count." % (with_v + enriched))
+    if capped:
+        notes.append("Read %d log entries (limit / time) before reaching the start of the range: older requests are not "
+                     "counted. Choose a shorter range for full coverage." % len(items))
+    if not any(e["t"]["country"] for e in evs):
+        notes.append("No country in these log entries (the logging profile or this TMOS version does not include "
+                     "geolocation in the list view).")
+    r = {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "GET " + path,
+         "verdict": {"label": "%s ASM REQUESTS · %s BLOCKED · %s WITH VIOLATIONS" % (
+             "{:,}".format(len(evs)), "{:,}".format(sum(1 for e in evs if e["mit"])), "{:,}".format(nviol)),
+             "kind": "warn" if nviol else "ok"}, "summary": notes, "data": data}
+    r["secdash"] = dash
+    return r
+
+
+def secdash_run(sess, b):
+    if sess["vendor"] == "fortiweb":
+        return fwb_secdash(sess, b)
+    if sess["vendor"] == "f5":
+        return f5_secdash(sess, b)
+    raise ValueError("the security dashboard is for F5, FortiWeb and Cloudflare")
+
+
+def do_secdash(b):
+    sess = SESSIONS.get(b.get("id"))
+    if not sess or sess["vendor"] not in ("f5", "fortiweb"):
+        return {"ok": False, "error": "select a connected F5 or FortiWeb"}
+    try:
+        return secdash_run(sess, b)
+    except (FxError, ValueError) as e:
         return {"ok": False, "error": str(e)}
     except (urllib.error.URLError, OSError) as e:
         return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
@@ -11890,6 +12169,152 @@ def cf_m_dashboard(sess, b, t0):
     return r
 
 
+# Security dashboard (like Security > Analytics > Events): firewallEventsAdaptiveGroups only. Top lists are
+# (alias, title, data key, dimension, drill-down filter key); optional ones are dropped when the plan / schema lacks them.
+CF_SEC_TOPS = (("ip", "Source IP addresses", "client_ip", "clientIP", "ip"),
+               ("hs", "Hosts", "host", "clientRequestHTTPHost", "host"),
+               ("pa", "Paths", "path", "clientRequestPath", "path"),
+               ("as", "Source ASNs", "asn", "clientAsn", "asn"),
+               ("ua", "User agents", "user_agent", "userAgent", "ua"),
+               ("rf", "Referers", "referer", "clientRefererHost", ""),
+               ("me", "HTTP methods", "method", "clientRequestHTTPMethodName", "method"),
+               ("j3", "JA3 fingerprints", "ja3", "ja3Hash", ""),
+               ("j4", "JA4 fingerprints", "ja4", "ja4", ""),
+               ("cc", "Countries", "country", "clientCountryName", "country"),
+               ("co", "Data centers (colo)", "colo", "edgeColoName", ""))
+CF_SEC_OPT = ("ja3Hash", "ja4", "clientRefererHost", "clientASNDescription", "description", "edgeColoName")
+CF_SEC_RULES = (("rc", "Custom rules", "firewallCustom"), ("rm", "Managed rules", "firewallManaged"),
+                ("rr", "Rate limiting rules", "ratelimit"), ("rd", "HTTP DDoS rules", "l7ddos"),
+                ("rs", "Sensitive data detection", "dlp"), ("rb", "Bot rules", "botManagement"))
+CF_SEC_SRC = {"firewallManaged": "Managed rules", "firewallCustom": "Custom rules", "ratelimit": "Rate limiting rules",
+              "apiShield": "API Shield", "apiShieldTokenValidation": "API Shield · Token Validation",
+              "apiShieldSchemaValidation": "API Shield · Schema Validation", "apiShieldSequenceMitigation": "API Shield · Sequence",
+              "dlp": "Sensitive data detection", "bic": "Browser integrity check", "botManagement": "Bot management",
+              "botFight": "Bot fight mode", "l7ddos": "HTTP DDoS", "hot": "Hotlink protection", "ip": "IP access rules",
+              "iprange": "IP range access rules", "asn": "ASN access rules", "country": "Country access rules",
+              "securitylevel": "Security level", "uablock": "User agent blocking", "zonelockdown": "Zone lockdown",
+              "validation": "Validation", "waf": "WAF (previous)", "firewallRules": "Firewall rules (previous)",
+              "linkMaze": "AI Labyrinth", "firewallManagedCustom": "Managed rules (custom ruleset)"}
+
+
+def cf_m_secdash(sess, b, t0):
+    """Cloudflare-style security events dashboard: events over time by action, events by service, top sources
+    (IP, host, path, ASN, user agent, referer, method, JA3 / JA4, country) and the rules that fired per product."""
+    zones = cf_zones(sess, b.get("zone"))
+    since, until, span = cf_window(b)
+    cur = cf_filters(b, "ev", since, until)
+    s0, s1 = to_epoch(since), to_epoch(until)
+    iso = lambda e: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e))
+    prev = dict(cur, datetime_geq=iso(2 * s0 - s1), datetime_leq=iso(s0 - 1))
+    secs = s1 - s0
+    dim, bucket = (("datetimeMinute", "1 minute") if secs <= 10800 else ("datetimeFiveMinutes", "5 minutes")
+                   if secs <= 86400 else ("datetimeHour", "1 hour") if secs <= 604800 else ("date", "1 day (UTC dates)"))
+    audit(sess, "Cloudflare security dashboard %s" % json.dumps({k: v for k, v in cur.items() if "datetime" not in k}))
+    G, cl, pl = "firewallEventsAdaptiveGroups", cf_lit(cur), cf_lit(prev)
+
+    def sel(f):
+        parts = ["tot:%s(filter:%s,limit:1){count}" % (G, cl),
+                 "ts:%s(filter:%s,limit:10000,orderBy:[%s_ASC]){count dimensions{%s action}}" % (G, cl, dim, dim),
+                 "sv:%s(filter:%s,limit:50,orderBy:[count_DESC]){count dimensions{source}}" % (G, cl)]
+        for alias, _, _, field, _ in CF_SEC_TOPS:
+            if field in CF_SEC_OPT and field not in f:
+                continue
+            extra = " clientASNDescription" if field == "clientAsn" and "clientASNDescription" in f else ""
+            parts.append("%s:%s(filter:%s,limit:10,orderBy:[count_DESC]){count dimensions{%s%s}}" % (alias, G, cl, field, extra))
+        for alias, _, src in CF_SEC_RULES:
+            if cur.get("source") and cur["source"] != src:
+                continue
+            parts.append("%s:%s(filter:%s,limit:10,orderBy:[count_DESC]){count dimensions{ruleId%s}}" % (
+                alias, G, cf_lit(dict(cur, source=src)), " description" if "description" in f else ""))
+        return " ".join(parts)
+    res, dropped = cf_gql_zones(sess, zones, sel, CF_SEC_OPT, chunk=1)
+    # the previous period on its own: it reaches twice as far back, which some plans' retention refuses
+    pres, _ = cf_gql_zones(sess, zones, lambda f: "prev:%s(filter:%s,limit:1){count} pac:%s(filter:%s,limit:50,orderBy:[count_DESC]){count dimensions{action}}" % (G, pl, G, pl), (), chunk=5)
+    no_prev = sum(1 for z in zones if not (pres.get(z["id"], (None, []))[0]))
+    tot = prv = 0
+    ts, pac, sv = collections.defaultdict(collections.Counter), collections.Counter(), collections.Counter()
+    tops, asn_names = collections.defaultdict(collections.Counter), {}
+    rules, rule_desc = collections.defaultdict(collections.Counter), {}
+    for z in zones:
+        zd = res.get(z["id"], (None, []))[0] or {}
+        n = lambda g: int(g.get("count") or 0)   # noqa: E731
+        pz = pres.get(z["id"], (None, []))[0] or {}
+        tot += sum(n(g) for g in zd.get("tot") or [])
+        prv += sum(n(g) for g in pz.get("prev") or [])
+        for g in pz.get("pac") or []:
+            pac[str((g.get("dimensions") or {}).get("action") or "unknown")] += n(g)
+        for g in zd.get("ts") or []:
+            d = g.get("dimensions") or {}
+            ts[str(d.get(dim))][str(d.get("action") or "unknown")] += n(g)
+        for g in zd.get("sv") or []:
+            sv[str((g.get("dimensions") or {}).get("source") or "unknown")] += n(g)
+        for alias, _, _, field, _ in CF_SEC_TOPS:
+            for g in zd.get(alias) or []:
+                d = g.get("dimensions") or {}
+                tops[alias][str(d.get(field) if d.get(field) not in (None, "") else "(none)")] += n(g)
+                if field == "clientAsn" and d.get("clientASNDescription"):
+                    asn_names[str(d.get(field))] = d["clientASNDescription"]
+        for alias, _, _ in CF_SEC_RULES:
+            for g in zd.get(alias) or []:
+                d = g.get("dimensions") or {}
+                rid = str(d.get("ruleId") or "(none)")
+                rules[alias][rid] += n(g)
+                if d.get("description"):
+                    rule_desc[rid] = str(d["description"])
+    keys = sorted(ts)
+    labels = [k if dim == "date" else utc3(k) for k in keys]
+    act_tot = collections.Counter()
+    for k in keys:
+        act_tot.update(ts[k])
+    order = ("block", "managed_challenge", "challenge", "jschallenge", "connection_close", "log", "skip", "allow", "bypass")
+    acts = sorted(act_tot, key=lambda a: (order.index(a) if a in order else 99, -act_tot[a]))
+    mitig = ("block", "managed_challenge", "challenge", "jschallenge", "connection_close", "force_connection_close")
+    m_now, m_prev = sum(act_tot[a] for a in mitig), sum(pac[a] for a in mitig)
+    tiles = [{"label": "Total events", "value": tot, "prev": prv, "fmt": "num", "spark": [sum(ts[k].values()) for k in keys]},
+             {"label": "Mitigated (block / challenge)", "value": m_now, "prev": m_prev, "fmt": "num",
+              "spark": [sum(ts[k][a] for a in mitig) for k in keys]}]
+    for a in acts[:4]:
+        if a not in mitig or a == "block":
+            tiles.append({"label": a.replace("_", " ").capitalize(), "value": act_tot[a], "prev": pac.get(a), "fmt": "num",
+                          "spark": [ts[k][a] for k in keys]})
+    name = lambda alias, field, v: ("AS%s %s" % (v, asn_names.get(v, ""))).strip() if field == "clientAsn" else v  # noqa: E731
+    top_lists = [[title, [[name(alias, field, v), c] for v, c in tops[alias].most_common(10)], drill]
+                 for alias, title, _, field, drill in CF_SEC_TOPS if tops[alias]]
+    rule_lists = [[title, [["%s%s" % (rule_desc.get(r, ""), " (%s)" % r[:12] if rule_desc.get(r) else r), c, r]
+                           for r, c in rules[alias].most_common(10)]] for alias, title, _ in CF_SEC_RULES if rules[alias]]
+    services = [[CF_SEC_SRC.get(s, s), c, s] for s, c in sv.most_common()]
+    dash = {"bucket": bucket, "t": labels, "tiles": tiles,
+            "actions": [[a, [ts[k][a] for k in keys]] for a in acts], "services": services,
+            "tops": top_lists, "rules": rule_lists}
+    pct = lambda c: "%.1f%%" % (100.0 * c / tot) if tot else ""   # noqa: E731
+    chg = lambda v, p: "" if not p else " (%+.1f%% vs previous period)" % (100.0 * (v - p) / p)  # noqa: E731
+    data = {"headline": {t["label"]: "{:,}".format(t["value"]) + chg(t["value"], t["prev"]) for t in tiles},
+            "events_by_action": [{"action": a, "events": act_tot[a], "share": pct(act_tot[a])} for a in acts],
+            "events_by_service": [{"service": s, "source": src, "events": c, "share": pct(c)} for s, c, src in services]}
+    for alias, title, col, field, _ in CF_SEC_TOPS:
+        if tops[alias]:
+            data[re.sub(r"\W+", "_", title.lower()).strip("_")] = [
+                {col: name(alias, field, v), "events": c, "share": pct(c)} for v, c in tops[alias].most_common(10)]
+    for alias, title, _ in CF_SEC_RULES:
+        if rules[alias]:
+            data[re.sub(r"\W+", "_", title.lower()).strip("_")] = [
+                {"rule": rule_desc.get(r, ""), "rule_id": r, "events": c, "share": pct(c)} for r, c in rules[alias].most_common(10)]
+    data["timeline"] = [dict([("time", lbl), ("events", sum(ts[k].values()))] + [(a, ts[k][a]) for a in acts])
+                        for k, lbl in zip(keys, labels)]
+    notes = [cf_scope(sess, zones), "Time range: %s; buckets of %s; changes compare with the previous %s." % (
+        span, bucket, re.sub(r"^last ", "", str(b.get("within") or "period")) if not b.get("since") else "period of the same length"),
+             "Counts are Cloudflare's sample-adjusted estimates, so they can differ slightly from the Cloudflare dashboard."]
+    if no_prev:
+        notes.append("The previous period could not be read for %d zone(s) (older than the plan keeps), so the "
+                     "change arrows leave them out." % no_prev)
+    blocked = act_tot.get("block", 0)
+    r = cf_result(t0, "GraphQL firewallEventsAdaptiveGroups (security dashboard)",
+                  "%s SECURITY EVENTS · %s MITIGATED · %s BLOCKED" % ("{:,}".format(tot), "{:,}".format(m_now), "{:,}".format(blocked)),
+                  "warn" if m_now else "ok" if tot else "info", notes + cf_gql_notes(zones, res, dropped), data)
+    r["secdash"] = dash
+    return r
+
+
 CF_Q_EDGE = "edgeTimeToFirstByteMsP50 edgeTimeToFirstByteMsP95 edgeTimeToFirstByteMsP99"
 CF_Q_ORIGIN = "originResponseDurationMsP50 originResponseDurationMsP95 originResponseDurationMsP99"
 CF_ORIGIN_PHASES = (("originDNSResponseTimeMs", "dns_ms"), ("originTCPHandshakeDurationMs", "tcp_ms"),
@@ -12515,7 +12940,8 @@ def cf_m_trace_client(sess, b, t0):
 CF_MODES = {"events": cf_m_events, "event_top": lambda s, b, t: cf_m_groups(s, b, t, "ev"),
             "traffic": lambda s, b, t: cf_m_groups(s, b, t, "http"), "requests": cf_m_requests, "ray": cf_m_ray,
             "ip": cf_m_ip, "host": cf_m_host, "rules": cf_m_rules, "dns": cf_m_dns, "posture": cf_m_posture,
-            "lb": cf_m_lb, "audit": cf_m_audit, "dashboard": cf_m_dashboard, "url": cf_m_url, "trace": cf_m_trace,
+            "lb": cf_m_lb, "audit": cf_m_audit, "dashboard": cf_m_dashboard, "secdash": cf_m_secdash,
+            "url": cf_m_url, "trace": cf_m_trace,
             "trace_sid": cf_m_trace_sid, "trace_client": cf_m_trace_client, "whois": cf_m_whois}
 
 
@@ -13045,9 +13471,12 @@ def llm_tools():
             vt("lookup", "lookups over all zones the token sees. modes: ip {ip}, host {host, days}, ray {ray}, "
                "whois {ip | host}, events {ip, host, path, ray, action, top}, event_top {by: action|source|rule|ip|host|"
                "path|country|asn, top}, traffic {host, ip, path, status, by, top}, rules {q}, dns {name, content, type}, "
-               "posture {}.",
+               "posture {}, secdash {host, ip, path, action, source, rule, country, asn, within: last 24 hours|last 7 "
+               "days|last 30 days} = security events overview: totals vs previous period, events by action and by "
+               "service, top IPs / hosts / paths / ASNs / user agents / countries, and the rules that fired. Use "
+               "secdash FIRST for 'what is attacking us / what did the WAF do' questions.",
                {"mode": S("lookup", enum=["ip", "host", "ray", "whois", "events", "event_top", "traffic", "rules", "dns",
-                                          "posture"]),
+                                          "posture", "secdash"]),
                 "args": {"type": "object", "description": "arguments of the mode"}}, ["mode"])
     return tools
 
@@ -13582,7 +14011,7 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/api/connect": do_connect, "/api/run": do_run, "/api/ssh": do_ssh, "/api/term/open": do_term_open, "/api/term/read": do_term_read,
                   "/api/term/write": do_term_write, "/api/term/resize": do_term_resize, "/api/term/close": do_term_close,
                   "/api/raw": do_raw, "/api/disconnect": do_disconnect, "/api/vault": do_vault,
-                  "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/natmap": do_nat_map, "/api/vipmap": do_vip_map, "/api/f5host": do_f5_host, "/api/f5irule": do_f5_irule, "/api/fwbstats": do_fwb_stats, "/api/fwbml": do_fwb_ml, "/api/f5logs": do_f5_logs,
+                  "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/secdash": do_secdash, "/api/natmap": do_nat_map, "/api/vipmap": do_vip_map, "/api/f5host": do_f5_host, "/api/f5irule": do_f5_irule, "/api/fwbstats": do_fwb_stats, "/api/fwbml": do_fwb_ml, "/api/f5logs": do_f5_logs,
                   "/api/f5capture": do_f5_capture, "/api/f5file": do_f5_file, "/api/policy": do_policy_search, "/api/profile/save": do_profile_save,
                   "/api/profile/delete": do_profile_delete, 
                   "/api/appsec": do_appsec, "/api/f5asm": do_f5_asm, "/api/panlogs": do_pan_logs,
@@ -13735,7 +14164,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .dleg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
 #pretty .dleg b{color:var(--text);font-weight:600;margin-left:4px}
 #pretty svg .hv{fill:transparent}#pretty svg .hv:hover{fill:#ffffff12}
-#pretty .dtop{display:grid;grid-template-columns:minmax(0,1fr) 30% auto;gap:6px 10px;align-items:center;font-size:12.5px}
+#pretty .secbar{display:flex;height:16px;border-radius:4px;overflow:hidden;margin-top:8px;background:var(--line)}.secbar span{display:block;height:100%;cursor:pointer;min-width:2px}.secleg{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px}.secleg span{cursor:pointer}.secleg i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}.dash h4.dsub{margin:14px 0 6px;font-size:13px}.dash select.secrange{width:auto;padding:2px 6px;font-size:12px;margin-right:8px}.dtop{display:grid;grid-template-columns:minmax(0,1fr) 30% auto;gap:6px 10px;align-items:center;font-size:12.5px}
 #pretty .dtop .dn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#pretty .dtop .dn.lnk{cursor:pointer;color:var(--mint)}
 #pretty .dtop .db{height:6px;border-radius:3px;background:var(--panel2)}#pretty .dtop .db span{display:block;height:6px;border-radius:3px;background:#3987e5}
 #pretty .dtabs{display:flex;gap:6px;flex-wrap:wrap}#pretty .dtabs button.on{border-color:var(--violet);box-shadow:0 0 12px #7C6CFF33;color:var(--mint)}
@@ -13770,7 +14199,7 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 .aimsg .aitbl td{border-top:1px solid #d5d9e0;padding:4px 7px;vertical-align:top;color:#1d1d1f}
 .aimsg .aitbl td.v-bad{color:#c62828;font-weight:700;white-space:nowrap}.aimsg .aitbl td.v-ok{color:#16803c;font-weight:700;white-space:nowrap}.aimsg .aitbl td.v-warn{color:#9a6200;font-weight:700;white-space:nowrap}
 .aiwarn{background:#fff7e6;color:#8a4b00;border:1px solid #f5c26b;border-radius:8px;padding:6px 10px;margin:0 0 8px;font-size:12.5px;line-height:1.4}
-.aimeta{font-size:11.5px;color:#6b7280;margin-top:6px}.aimeta.bad{color:#b42318}.aimeta.lnk{color:#0b7a6a!important;text-decoration:underline}
+.aimeta{font-size:11.5px;color:#6b7280;margin-top:6px}.airestored{text-align:center;font-size:11px;color:#6b7280;margin:6px 0 10px;border-top:1px dashed #d0d5dd;padding-top:6px}.aimeta.bad{color:#b42318}.aimeta.lnk{color:#0b7a6a!important;text-decoration:underline}
 .aistep{font-size:12.5px;display:flex;gap:6px;align-items:center;margin:2px 0 6px;flex-wrap:wrap}.aistep .ok{color:#15803d}.aistep .bad{color:#b42318}.aistep .muted{color:#6b7280}
 #aicard .aistep button{padding:1px 10px;font-size:12px;background:#fff;color:#1d1d1f;border:1px solid #c4c8cf;border-radius:6px;box-shadow:none}
 .aidots{display:inline-flex;gap:5px}.aidots i{width:8px;height:8px;border-radius:50%;background:#6b7280;opacity:.25;animation:aidot 1.2s infinite ease-in-out}
@@ -13847,6 +14276,8 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #advpanel a{color:var(--mint)}#advpanel .afoot{margin-top:10px;color:var(--dim);font-size:12px;line-height:1.5}
 /* ---- Operations dashboard ---- */
 #fwbv{position:fixed;inset:0;z-index:56;background:var(--bg);color:var(--text);overflow:auto;padding-bottom:24px}#fwbv[hidden]{display:none}
+#ftv{position:fixed;inset:0;z-index:57;background:var(--bg);color:var(--text);overflow:auto;padding-bottom:24px}#ftv[hidden]{display:none}
+#ftbody{max-width:1400px;margin:0 auto;padding:16px 20px;display:grid;gap:16px}#ftbody .card{margin:0}
 #fwbv .swbox{background:var(--panel)}.fwbpad{padding:10px 20px 0}#fwbv .swg3.fwbpad,#fwbv .swg2.fwbpad{margin-top:0}
 .fwbscroll{overflow:auto;max-height:340px}.fwbtab{border-collapse:collapse;width:100%;font-size:12px}
 .fwbtab th{text-align:left;color:var(--dim);font-weight:600;border-bottom:1px solid var(--line);padding:4px 8px;white-space:nowrap;position:sticky;top:0;background:var(--panel)}
@@ -14033,11 +14464,12 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 </style>
 <script>try{document.documentElement.dataset.theme=localStorage.getItem("theme")||"light"}catch(e){document.documentElement.dataset.theme="light"}</script>
 </head><body>
-<header><img class="brand" src="/brand-logo?t=__TOKEN__" alt="" onload="this.nextElementSibling.hidden=false" onerror="this.remove()"><span class="bsep" hidden></span><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><button class="themebtn" id="dashbtn" onclick="dashToggle()" title="Operations dashboard: resources, interfaces and HA of all firewalls and F5s" aria-label="Operations dashboard" hidden>▦</button><button class="themebtn" id="monbtn" onclick="monPanel()" title="Device monitor" aria-label="Device monitor" hidden>🔔<span id="monbadge" hidden></span></button><button class="themebtn" onclick="themeToggle()" title="Switch light / dark theme" aria-label="Switch light / dark theme">◐</button></header>
+<header><img class="brand" src="/brand-logo?t=__TOKEN__" alt="" onload="this.nextElementSibling.hidden=false" onerror="this.remove()"><span class="bsep" hidden></span><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><button class="themebtn" id="dashbtn" onclick="dashToggle()" title="Operations dashboard: resources, interfaces and HA of all firewalls and F5s" aria-label="Operations dashboard" hidden>▦</button><button class="themebtn" id="flowbtn" onclick="ftToggle()" title="Flow trace: one flow on every connected device" aria-label="Flow trace" hidden>⇄</button><button class="themebtn" id="monbtn" onclick="monPanel()" title="Device monitor" aria-label="Device monitor" hidden>🔔<span id="monbadge" hidden></span></button><button class="themebtn" onclick="themeToggle()" title="Switch light / dark theme" aria-label="Switch light / dark theme">◐</button></header>
 <div id="advbar" hidden></div><div id="advpanel" hidden></div>
 <div id="dash" hidden><div class="dbar"><h2>▦ Operations dashboard</h2><span class="dmeta" id="dash_meta"></span>
 <label class="dlbl">Refresh every <select id="dash_iv" onchange="dashSet({interval:+this.value})"><option value="300">5 min</option><option value="600">10 min</option><option value="1200">20 min</option><option value="1800">30 min</option><option value="3600">60 min</option></select></label>
 <button onclick="dashSet({now:1})">Refresh now</button><button class="dask" onclick="dashAsk()" title="Ask the AI assistant about everything the dashboard shows">✦ Ask AI</button><button class="themebtn dclose" onclick="dashToggle(false)" title="Close (Esc)" aria-label="Close">✕</button></div><div id="dashbody"></div></div>
+<div id="ftv" hidden><div class="dbar"><h2>⇄ Flow trace · one flow on every connected device</h2><button class="themebtn dclose" onclick="ftToggle(false)" title="Close (Esc)" aria-label="Close">✕</button></div><div id="ftbody"><div id="flowtrace"></div><div id="ftout"></div></div></div>
 <div id="fwbv" hidden><div class="dbar"><h2>🛡 FortiWeb analytics</h2><span class="dmeta" id="fwb_meta"></span>
 <label class="dlbl" id="fwb_devl">FortiWeb <select id="fwb_dev" onchange="fwbSid=this.value;fwbLoad(false)"></select></label>
 <label class="dlbl">Range <select id="fwb_range" onchange="fwbLoad(false)"><option value="1h">1 hour</option><option value="6h">6 hours</option><option value="24h" selected>24 hours</option><option value="3d">3 days</option><option value="7d">7 days</option></select></label>
@@ -14103,7 +14535,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 </div>
 <div id="rpane">
   <div class="panebar"><span>Checks &amp; tools</span><button id="rpane_btn" onclick="paneToggle('r')" title="Collapse this pane: the output moves up" aria-label="Collapse the checks pane">Hide ▴</button></div>
-  <div id="fwbtools"></div><div id="sshtool"></div><div id="terms"></div><div id="flowtrace"></div><div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
+  <div id="fwbtools"></div><div id="sshtool"></div><div id="terms"></div><div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
   <div id="iplookup"></div><div id="f5tools"></div>
   <div class="card" id="main"><h3>Checks</h3><div class="muted">Connect a device to begin.</div></div>
   <div class="card"><h3>Raw read-only query</h3>
@@ -14234,8 +14666,17 @@ function select(id){cur=id;try{sessionStorage.setItem("cur",id||"")}catch(e){}re
 function dev(){return devices.find(d=>d.id===cur)}
 function renderAll(){renderDevs();renderChecks();renderFwb();renderSsh();renderCf();renderAcc();renderAppsec();renderIp();renderF5();const d=dev();
  $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:""}
-function renderFlow(){const box=$("#flowtrace");if(!devices.some(d=>["f5","paloalto","fortigate","cloudflare"].includes(d.vendor))){box.innerHTML="";return}
- if(!$("#ft_dst")){box.innerHTML='<div class="card"><h3>Flow trace · one flow on every connected device</h3><div class="row3">'+
+// Flow trace: its own full-screen view (⇄ beside ▦), not a card under Checks & tools. While it is open the Output card
+// is moved into it (diagram, AI context and "show" keep working) and goes back to its place when it closes.
+let ftOpen=false,ftHome=null;
+function ftToggle(on){ftOpen=on==null?!ftOpen:!!on;$("#ftv").hidden=!ftOpen;const oc=$("#outcard");
+ if(ftOpen){if(!ftHome)ftHome={p:oc.parentNode,n:oc.nextSibling};$("#ftout").appendChild(oc);renderFlow();setTimeout(()=>{const x=$("#ft_dst");if(x&&!x.value)x.focus()},0)}
+ else if(ftHome){ftHome.p.insertBefore(oc,ftHome.n&&ftHome.n.parentNode===ftHome.p?ftHome.n:null);ftHome=null}
+ document.documentElement.style.overflow=ftOpen||(typeof dashOpen!=="undefined"&&dashOpen)||(typeof fwbOpen!=="undefined"&&fwbOpen)?"hidden":""}
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&ftOpen&&!e._ai&&$("#aicard").hidden){ftToggle(false);e._ft=1}});
+function renderFlow(){const box=$("#flowtrace"),ok=devices.some(d=>["f5","paloalto","fortigate","cloudflare"].includes(d.vendor));
+ $("#flowbtn").hidden=!ok;if(!ok){if(ftOpen)ftToggle(false);box.innerHTML="";return}
+ if(!$("#ft_dst")){box.innerHTML='<div class="card"><h3>Trace a flow</h3><div class="row3">'+
   fld("ft_src","Source / client IP","203.0.113.5")+fld("ft_dst","Destination IP or hostname","shop.example.com or 10.5.1.20")+
   fld("ft_port","Destination port (optional)","443")+
   '<div><label>Protocol</label><select id="ft_proto"><option>tcp</option><option>udp</option><option>icmp</option></select></div>'+
@@ -14571,11 +15012,12 @@ function flowDiagram(p){
 function renderOut(){const box=$("#pretty");box.textContent="";if(!last)return;
  if(last.error){box.appendChild(mk("div","bad",last.error));return}
  if(last.path&&Array.isArray(last.path.stages))box.appendChild(flowDiagram(last.path));
- box.classList.toggle("tall",!!(last.dashboard||last.charts||last.acc||last.tiles||last.bars));
+ box.classList.toggle("tall",!!(last.dashboard||last.secdash||last.charts||last.acc||last.tiles||last.bars));
  if(Array.isArray(last.tiles)&&last.tiles.length)box.appendChild(tilesNode(last.tiles));
  if(Array.isArray(last.charts)&&last.charts.length&&last.bars)box.appendChild(chartsNode(last.charts,last.heat));
  if(Array.isArray(last.bars)&&last.bars.length)box.appendChild(barsNode(last.bars));
  if(last.dashboard)box.appendChild(dashNode(last.dashboard));
+ if(last.secdash)box.appendChild(secDashNode(last.secdash));
  if(last.acc)box.appendChild(accNode(last.acc));  // charts first; the tables below are the table view
  if(Array.isArray(last.charts)&&last.charts.length&&!last.bars)box.appendChild(chartsNode(last.charts,last.heat));
  buildSections(last.data).forEach(s=>box.appendChild(secNode(s)));
@@ -14692,7 +15134,7 @@ function renderVerdict(r){const v=$("#verdict");v.innerHTML="";
   r.summary.forEach(x=>{const li=document.createElement("li");li.textContent=x;u.appendChild(li)});v.appendChild(u)}
  (r.downloads||(r.download?[r.download]:[])).forEach(d=>{const a=document.createElement("a");a.className="dl";a.href=d+"?t="+T;a.textContent="⬇ Download "+d.split("/").pop();v.appendChild(a)})}
 const WITHIN=["any time","last 15 minutes","last hour","last 6 hours","last 12 hours","last 24 hours","last 3 days","last 7 days","last 30 days"];
-function wsel(id){return sel(id,"Time range (up to 1 day)",WITHIN,"any time")}
+function wsel(id){return sel(id,"Time range",WITHIN,"any time")}
 function sel(id,label,opts,def){return '<div><label>'+label+'</label><select id="'+id+'">'+
  opts.map(o=>'<option'+(o===def?' selected':'')+'>'+o+'</option>').join("")+'</select></div>'}
 function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if(!d||["cloudflare","solarwinds","fortiweb","fortiadc"].includes(d.vendor))return;const v=d.vendor;
@@ -14704,7 +15146,9 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   '<button onclick="appsec(\'waf\')">'+(v==="f5"?"WAF posture":"Security-profile coverage")+'</button>'+
   (v==="f5"?'<button onclick="appsec(\'ssl\')">SSL / cert posture</button>':'')+'</div>';
  if(v==="f5"){
-  h+='<div class="grp">ASM / Advanced WAF request log</div><div class="row3">'+fld("asm_sid","Support ID (from block page)","1234567890123456789")+wsel("asm_sw")+
+  h+='<div class="grp">ASM / Advanced WAF request log</div><div class="row3">'+sel("asm_dr","Security dashboard: time range",["1h","6h","24h","3d","7d"],"24h")+'</div>'+
+  '<div style="margin-top:8px"><button class="primary" onclick="devSecDash(cur,g(\'asm_dr\'),{})">Security dashboard</button> <span class="muted">blocked / alerted requests over time, by policy, top sources, attack types, violations and signatures</span></div>'+
+  '<div class="row3" style="margin-top:14px">'+fld("asm_sid","Support ID (from block page)","1234567890123456789")+wsel("asm_sw")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="asmLookup(\'supportid\')">Look up support ID</button></div>'+
   '<div class="grp" style="margin-top:14px">Search requests</div><div class="row3">'+fld("asm_ip","Client IP","203.0.113.7")+
   fld("asm_tci","True-Client-IP","198.51.100.9")+fld("asm_host","Hostname contains","app.example.com")+fld("asm_url","URL path contains","/login")+
@@ -14786,14 +15230,15 @@ function renderCf(){const box=$("#cftools");box.innerHTML="";const d=dev();if(!d
   sel("cf_u_st","Edge status",CF_ST,"")+fld("cf_u_cache","Cache status (optional)","miss, dynamic")+fld("cf_u_ip","Client IP (optional)","198.51.100.9")+
   fld("cf_u_n","Slowest requests to list","50","50")+'</div><div style="margin-top:8px"><button class="primary" onclick="cfUrl()">Look up URL timing</button></div>'+
   '<p class="muted" style="margin:8px 0 0">Edge TTFB and origin (e.g. F5) response time: p50 / p95 / p99, a timeline, breakdowns by status, cache, colo and method, and the slowest requests with DNS / TCP / TLS / header timings to the origin. Covers the last 24 hours.</p></div>';
- h+='<div class="card"><h3>Security events · WAF, rate limiting, bots, IP rules</h3><div class="row3">'+
+ h+='<div class="card"><h3>Security events · dashboard, WAF, rate limiting, bots, IP rules</h3><div class="row3">'+
   fld("cf_e_ip","Client IP","198.51.100.9")+fld("cf_e_host","Host (* wildcard)","app.example.com")+fld("cf_e_path","Path contains","/login")+
   fld("cf_e_ray","Ray ID","8d3c1a2b3c4d5e6f")+sel("cf_e_act","Action",CF_ACT,"")+
   '<div><label>Source (security product)</label><input id="cf_e_src" list="cf_srcl" placeholder="firewallManaged"><datalist id="cf_srcl">'+
   ["firewallManaged","firewallCustom","ratelimit","waf","firewallRules","botFight","botManagement","bic","hot","l7ddos","securitylevel","uablock","zonelockdown","ip","iprange","asn","country","validation","apiShield","dlp"].map(x=>'<option value="'+x+'">').join("")+'</datalist></div>'+
   fld("cf_e_rule","Rule ID","")+fld("cf_e_cc","Country (2 letters)","US")+fld("cf_e_asn","ASN","13335")+fld("cf_e_ua","User agent contains","curl")+
-  fld("cf_e_m","Method","POST")+fld("cf_e_n","Max rows","100","100")+'</div><div class="row" style="margin-top:8px;flex-wrap:wrap">'+
-  '<button class="primary" onclick="cfEvents()">Search events</button></div><div class="row3" style="margin-top:8px">'+sel("cf_e_by","Top: group by",CF_EVBY,"action")+fld("cf_e_top","Top N","20","20")+
+  fld("cf_e_m","Method","POST")+fld("cf_e_n","Max rows","100","100")+sel("cf_e_w","Time range",CFW,"last 24 hours")+'</div><div class="row" style="margin-top:8px;flex-wrap:wrap">'+
+  '<button class="primary" onclick="cfSecDash()">Security dashboard</button><button onclick="cfEvents()">Search events</button></div>'+
+  '<p class="muted" style="margin:6px 0 0">Security dashboard: events over time by action, events by service, top sources (IPs, hosts, paths, ASNs, user agents, JA3 / JA4, countries) and the rules that fired, like Security &gt; Analytics &gt; Events. The filters above narrow it; click a chart column or a list entry to drill down.</p><div class="row3" style="margin-top:8px">'+sel("cf_e_by","Top: group by",CF_EVBY,"action")+fld("cf_e_top","Top N","20","20")+
   '</div><div style="margin-top:8px"><button onclick="cfEventTop()">Top events</button> <span class="muted">(same filters; "time" gives a timeline)</span></div></div>';
  h+='<div class="card"><h3>HTTP traffic · requests, status codes, cache, origin errors</h3><div class="row3">'+
   fld("cf_t_host","Host (* wildcard)","app.example.com")+fld("cf_t_ip","Client IP","198.51.100.9")+fld("cf_t_path","Path contains","/api")+
@@ -14822,7 +15267,7 @@ function cfTraceBy(m,label,extra){const f5=devices.find(x=>x.vendor==="f5");
  setBusy(label+(f5?": Cloudflare → F5 "+f5.name+" (can take a few minutes)":": Cloudflare only (no F5 connected)"));
  api("/api/cf",Object.assign({id:cur,mode:m,f5:f5?f5.id:"",window:g("cf_win")},extra)).then(r=>show(r,label))}
 function cfEvF(){return {ip:g("cf_e_ip"),host:g("cf_e_host"),path:g("cf_e_path"),ray:g("cf_e_ray"),action:g("cf_e_act"),source:g("cf_e_src"),
- rule:g("cf_e_rule"),country:g("cf_e_cc"),asn:g("cf_e_asn"),ua:g("cf_e_ua"),method:g("cf_e_m")}}
+ rule:g("cf_e_rule"),country:g("cf_e_cc"),asn:g("cf_e_asn"),ua:g("cf_e_ua"),method:g("cf_e_m"),within:$("#cf_e_w")?g("cf_e_w"):"last 24 hours"}}
 function cfEvents(){cfRun("events","Cloudflare security events",Object.assign(cfEvF(),{top:g("cf_e_n")}))}
 function cfEventTop(){cfRun("event_top","Cloudflare top security events",Object.assign(cfEvF(),{by:g("cf_e_by"),top:g("cf_e_top")}))}
 function cfHtF(){return {host:g("cf_t_host"),ip:g("cf_t_ip"),path:g("cf_t_path"),status:g("cf_t_st"),cache:g("cf_t_cache")}}
@@ -14847,6 +15292,50 @@ function dashPick(label,bucket){const secs=DBUCKET[bucket],t=Date.parse(String(l
  if(!secs||isNaN(t))return;const since=u3(t),until=u3(t+secs*1e3);
  if(secs===60)cfRun("requests","Cloudflare sampled requests · "+since+" → "+until+" (UTC+3)",Object.assign(cfHtF(),dashX,{since,until,top:g("cf_t_n")}));
  else cfDash(Object.assign({},dashX,{since,until}))}
+// Security dashboard (Security > Analytics > Events style); drill-down filters kept until the button is pressed again.
+let secX={};
+const SEC_AC={block:"#d92d20",managed_challenge:"#d95926",challenge:"#c98500",jschallenge:"#e0a800",connection_close:"#912018",force_connection_close:"#912018",log:"#3987e5",skip:"#8f8cb8",allow:"#199e70",bypass:"#6b7280",blocked:"#d92d20",alerted:"#f0a830",passed:"#199e70",alert:"#3987e5",alert_deny:"#d92d20",deny:"#d92d20",block_ip:"#912018",period_block:"#912018",redirect:"#d95926",send_403_forbidden:"#d92d20",erase:"#c98500",captcha:"#c98500"};
+const SEC_SV=["#7c5cff","#3987e5","#f0a830","#d95926","#199e70","#d55181","#00a3bf","#8f8cb8","#c98500","#008300"];
+function cfSecDash(x){secX=x||{};
+ const f=Object.keys(secX).filter(k=>k!=="until").map(k=>k==="since"?secX.since+" → "+secX.until+" (UTC+3)":k+" "+secX[k]);
+ cfRun("secdash","Cloudflare security dashboard"+(f.length?" · "+f.join(" · "):""),Object.assign(cfEvF(),secX))}
+function secDrill(k,v){cfSecDash(Object.assign({},secX,{[k]:v}))}
+// F5 / FortiWeb: the same dashboard from the device's own log; drill-down filters go to /api/secdash.
+async function devSecDash(id,range,filters){secX=filters||{};const dv=devices.find(x=>x.id===id)||{};
+ const f=Object.keys(secX).map(k=>k+" "+secX[k]);const lbl=(dv.vendor==="f5"?"F5 ASM":"FortiWeb")+" security dashboard · "+(dv.name||"")+" · "+range+(f.length?" · "+f.join(" · "):"");
+ setBusy(lbl+(dv.vendor==="f5"?" (reads the ASM request log: up to ~2 minutes)":""));
+ const r=await api("/api/secdash",{id,range,filters:secX});if(r&&typeof r==="object")r._dev=id;show(r,lbl)}
+function secPick(label,bucket){const secs=DBUCKET[bucket],t=Date.parse(String(label).slice(0,16).replace(" ","T")+":00+03:00");
+ if(!secs||isNaN(t))return;const since=u3(t),until=u3(t+secs*1e3);
+ if(secs===60)cfRun("events","Cloudflare security events · "+since+" → "+until+" (UTC+3)",Object.assign(cfEvF(),secX,{since,until,top:g("cf_e_n")}));
+ else cfSecDash(Object.assign({},secX,{since,until}))}
+function secDashNode(d){const w=mk("div","dash");
+ const tiles=mk("div","dtiles");d.tiles.forEach(t=>{const x=mk("div","dtile");x.appendChild(mk("div","dl",t.label));
+  const v=mk("div","dv",t.value==null?"n/a":DFMT[t.fmt](t.value));
+  if(t.value!=null&&t.prev){const c=100*(t.value-t.prev)/t.prev;v.appendChild(mk("span","dc",(c>=0?"↗ ":"↘ ")+Math.abs(c).toFixed(1)+"%"))}
+  x.appendChild(v);const sp=mk("div");sp.innerHTML=dSpark(t.spark||[]);x.appendChild(sp);tiles.appendChild(x)});w.appendChild(tiles);
+ const ctx=d.ctx||null,drill=ctx?(k,v)=>devSecDash(last&&last._dev||cur,ctx.range,Object.assign({},secX,{[k]:v})):secDrill;
+ const sec=ctx?0:DBUCKET[d.bucket],pk=sec?{pick:l=>secPick(l,d.bucket),pickTip:sec===60?"Click: the events in this minute":"Click: zoom in to this "+d.bucket}:{};
+ const hint=mk("div","muted",(ctx?"":"↗ / ↘ = change vs the previous period of the same length · ")+"buckets: "+d.bucket+" · hover a chart for values"+
+  (sec?", click a column to "+(sec===60?"list its events":"zoom in"):"")+" · click a "+(ctx?"category, ":"service, ")+"top-list entry or rule to filter by it");
+ if(ctx){const rs=mk("select","secrange");[["1h","Last hour"],["6h","Last 6 hours"],["24h","Last 24 hours"],["3d","Last 3 days"],["7d","Last 7 days"]].forEach(([v,l])=>{const o=mk("option",null,l);o.value=v;rs.appendChild(o)});
+  rs.value=ctx.range;rs.title="Time range";rs.onchange=()=>devSecDash(last&&last._dev||cur,rs.value,secX);hint.insertBefore(rs,hint.firstChild)}
+ if(Object.keys(secX).length){const c=mk("span","lnk"," · clear filters");c.style.cursor="pointer";c.style.color="var(--mint)";c.onclick=()=>ctx?devSecDash(last&&last._dev||cur,ctx.range,{}):cfSecDash();hint.appendChild(c)}
+ w.appendChild(hint);
+ if(d.services.length){const card=mk("div","dcard");card.appendChild(mk("div","sec",d.services_title||"Events by service"));
+  const tot=d.services.reduce((a,s)=>a+s[1],0)||1,bar=mk("div","secbar"),leg=mk("div","secleg");
+  d.services.forEach(([nm,c,src],i)=>{const col=SEC_SV[i%SEC_SV.length],seg=mk("span");seg.style.width=(100*c/tot)+"%";seg.style.background=col;
+   seg.title=nm+": "+dNum(c)+" ("+(100*c/tot).toFixed(1)+"%) · click to filter";seg.onclick=()=>drill(ctx?"service":"source",src);bar.appendChild(seg);
+   const l=mk("span","lnk");l.innerHTML='<i style="background:'+col+'"></i>'+esc(nm)+' <b>'+dNum(c)+'</b>';l.title="Filter the dashboard to "+nm;l.onclick=()=>drill(ctx?"service":"source",src);leg.appendChild(l)});
+  card.appendChild(leg);card.appendChild(bar);w.appendChild(card)}
+ const grid=mk("div","dgrid");
+ grid.appendChild(dChart("Events summary · by action",d.t,d.actions.map(([k,v])=>({name:k,color:SEC_AC[k]||DOTHER,vals:v})),Object.assign({stack:true,w:1500,h:250},pk)));
+ w.appendChild(grid);
+ if(d.tops.length){w.appendChild(mk("h4","dsub","Top events by source"));const tg=mk("div","dgrid tops");
+  d.tops.forEach(([t,rows,k])=>tg.appendChild(dTop(t,rows,k?['Filter the dashboard to this',n=>drill(k,k==='asn'?((String(n).match(/^AS(\d+)/)||[])[1]||n):n)]:null)));w.appendChild(tg)}
+ if(d.rules.length){w.appendChild(mk("h4","dsub",d.rules_title||"Rules that fired"));const rg=mk("div","dgrid tops");
+  d.rules.forEach(([t,rows])=>rg.appendChild(dTop(t,rows,["Filter the dashboard to this",(n,row)=>drill("rule",row[2])])));w.appendChild(rg)}
+ return w}
 function cfUrl(){cfRun("url","Cloudflare URL response time",{url:g("cf_u_url"),match:g("cf_u_match"),status:g("cf_u_st"),cache:g("cf_u_cache"),ip:g("cf_u_ip"),top:g("cf_u_n")})}
 function chartsNode(list,heat){const grid=mk("div","dgrid");grid.style.marginBottom="16px";
  grid.style.gridTemplateColumns="repeat(auto-fill,minmax(min(100%,520px),1fr))";  // a lone chart keeps a column's width instead of stretching
@@ -14886,7 +15375,7 @@ function dSpark(vals){const W=160,H=30,n=vals.length,m=Math.max(...vals,0)||1;if
  const pts=vals.map((v,i)=>(i*(W/(n-1))).toFixed(1)+","+(H-2-(v/m)*(H-4)).toFixed(1)).join(" ");
  return '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" style="height:30px" aria-hidden="true"><polyline points="'+pts+'" fill="none" stroke="#3987e5" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>'}
 function dChart(title,labels,series,o){
- const W=640,H=220,L=60,R=8,T=8,B=24,pw=W-L-R,ph=H-T-B,n=labels.length,fmt=o.fmt||dNum,sl=dShort(labels);
+ const W=o.w||640,H=o.h||220,L=60,R=8,T=8,B=24,pw=W-L-R,ph=H-T-B,n=labels.length,fmt=o.fmt||dNum,sl=dShort(labels);
  const card=mk("div","dcard");card.appendChild(mk("div","sec",title));
  if(series.length>1){const lg=mk("div","dleg");series.forEach(s=>{const x=mk("span");const sw=mk("i");sw.style.background=s.color;
   x.appendChild(sw);x.appendChild(document.createTextNode(s.name));
@@ -14913,11 +15402,11 @@ function dChart(title,labels,series,o){
  const box=mk("div");box.innerHTML=s+'</svg>';card.appendChild(box);
  if(o.pick)box.querySelectorAll("rect.hv").forEach(r=>r.onclick=()=>o.pick(labels[+r.dataset.i]));
  return card}
-function dTop(title,rows){const card=mk("div","dcard");card.appendChild(mk("div","sec",title));
- const g=mk("div","dtop"),m=Math.max(...rows.map(r=>r[1]),1),act=DTOP_ACT[title];
- rows.forEach(([name,v])=>{const ok=act&&name!==""&&name!=null&&!/^(unknown|none|null)$/i.test(name);
+function dTop(title,rows,act){const card=mk("div","dcard");card.appendChild(mk("div","sec",title));
+ const g=mk("div","dtop"),m=Math.max(...rows.map(r=>r[1]),1);act=act||DTOP_ACT[title];
+ rows.forEach(row=>{const [name,v]=row,ok=act&&name!==""&&name!=null&&!/^\(?(unknown|none|null)\)?$/i.test(name);
   const nm=mk("div","dn"+(ok?" lnk":""),name);nm.title=ok?act[0]+": "+name:name;
-  if(ok)nm.onclick=()=>act[1](name);
+  if(ok)nm.onclick=()=>act[1](name,row);
   const bar=mk("div","db"),fill=mk("span");fill.style.width=(100*v/m).toFixed(1)+"%";bar.appendChild(fill);
   g.appendChild(nm);g.appendChild(bar);g.appendChild(mk("div","dvv",dNum(v)))});card.appendChild(g);return card}
 function dashNode(d){const w=mk("div","dash");
@@ -14975,15 +15464,32 @@ function tilesNode(list){const w=mk("div","dtiles");w.style.marginBottom="12px";
   if(t.sub)x.appendChild(mk("div","dl",t.sub));
   if(t.spark&&t.spark.length>1){const sp=mk("div");sp.innerHTML=dSpark(t.spark);x.appendChild(sp)}w.appendChild(x)});return w}
 // ---- AI assistant (local LLM): explain / chat about the current output, or let the model run read-only checks ----
-let aiHist=[],aiSrc=null;
+let aiHist=[],aiSrc=null,aiLogRec=[];
+// The chat survives page reloads (live update) in this browser tab only: sessionStorage, gone when the tab is closed.
+// Saved: the bubbles (with the checks the AI ran, for "show"), the model context (aiHist) and what it talks about (aiSrc).
+function aiSlim(r){if(!r)return null;const o={};["model","ms","trimmed","usage","warning","plain"].forEach(k=>{if(r[k]!=null)o[k]=r[k]});
+ if(r.sent)o.sent=String(r.sent).slice(0,60000);if(r.raw)o.raw=String(r.raw).slice(0,20000);
+ if(r.steps)o.steps=r.steps.map(x=>({call:x.call,ok:x.ok,verdict:x.verdict,error:x.error,result:x.result}));return o}
+function aiPersist(){let d={v:1,src:aiSrc,hist:aiHist,msgs:aiLogRec};
+ for(let pass=0;pass<5;pass++){let j;try{j=JSON.stringify(d)}catch(e){return}
+  if(j.length<2500000){try{sessionStorage.setItem("ai_chat",j);return}catch(e){}}
+  d=JSON.parse(j);   // too big for the browser: drop check results, then the copies of sent data, then the oldest bubbles
+  if(pass===0)d.msgs.forEach(m=>{if(m.r&&m.r.steps)m.r.steps.forEach(x=>delete x.result)});
+  else if(pass===1)d.msgs.forEach(m=>{if(m.r){delete m.r.sent;delete m.r.raw}});else d.msgs=d.msgs.slice(-Math.ceil(d.msgs.length/2))}
+ try{sessionStorage.removeItem("ai_chat")}catch(e){}}
+function aiRestore(){let d=null;try{d=JSON.parse(sessionStorage.getItem("ai_chat")||"null")}catch(e){}
+ if(!d||d.v!==1||!Array.isArray(d.msgs)||!d.msgs.length)return;
+ if(d.src)aiSrcSet(d.src);aiHist=Array.isArray(d.hist)?d.hist:[];aiLogRec=[];$("#ai_log").innerHTML="";
+ d.msgs.forEach(m=>aiAdd(m.k,m.t,m.r||undefined));
+ $("#ai_log").appendChild(mk("div","airestored","restored after the page reload · kept until this tab is closed"));aiScroll()}
 // what the AI talks about instead of the output on screen: {kind:"dashboard"} or {kind:"irule",id,name,device}; null = the output
-function aiSrcSet(s){s=s||null;if(JSON.stringify(s)===JSON.stringify(aiSrc))return;aiSrc=s;aiHist=[];const b=$("#ai_src");b.textContent="";b.hidden=!s;if(!s)return;
+function aiSrcSet(s){s=s||null;if(JSON.stringify(s)===JSON.stringify(aiSrc))return;aiSrc=s;aiHist=[];setTimeout(aiPersist,0);const b=$("#ai_src");b.textContent="";b.hidden=!s;if(!s)return;
  b.appendChild(mk("span",null,"✦"));b.appendChild(mk("b",null,s.kind==="irule"?"Talking about iRule "+s.name+" on "+s.device+" (read from the F5)":s.kind==="fwbstats"?"Talking about the FortiWeb statistics of "+s.name+" (last "+s.range+(s.policy?", "+s.policy:"")+(s.ml_domain?"; ML API: "+s.ml_domain:"")+")":"Talking about the operations dashboard (fresh snapshot with each question)"));
  const x=mk("button",null,"✕");x.title="Stop: talk about the console output again";x.setAttribute("aria-label",x.title);x.onclick=()=>aiSrcSet(null);b.appendChild(x)}
 function dashAsk(){aiSrcSet({kind:"dashboard"});aiToggle(true);aiAsk("chat","Using the dashboard data: what needs attention right now, most urgent first? For each item give the device, the values and the likely cause, then the next check to run. Also say if anything looks wrong in the trends.","What needs attention on the dashboard right now?")}
 async function aiInit(){const r=await api("/api/llm/config",{});if(!r.ok)return;
  $("#ai_url").value=r.url;$("#ai_model").value=r.model||"";aiRoute(r);$("#ai_budget").value=r.budget;
- $("#ai_key").placeholder=r.has_key?"(set · type to replace)":"(none)";if(!r.model)$("#ai_cfg").open=true;aiStatus(r.model);aiWelcome()}
+ $("#ai_key").placeholder=r.has_key?"(set · type to replace)":"(none)";if(!r.model)$("#ai_cfg").open=true;aiStatus(r.model);aiRestore();aiWelcome()}
 function aiRoute(r){if(r&&r.route)$("#ai_route").textContent="Data goes to: "+r.route+" · approved servers: "+(r.approved||[]).join(", ")+" or this PC"}
 function aiStatus(m){$("#ai_sub").textContent=m?"online · "+m:"local LLM · no model set";$("#ai_by").textContent=m||"local LLM";$("#ai_av").classList.toggle("off",!m)}
 function aiCfg(){const c=$("#ai_cfg");c.open=!c.open;if(c.open)$("#aicard .aibody").scrollTop=0}
@@ -15022,7 +15528,8 @@ function aiMd(t){const out=[];let inCode=false,code=[],list=null,tbl=null;
  if(inCode)out.push("<pre>"+esc(code.join("\n"))+"</pre>");endList();endTbl();return out.join("")}
 function aiRow(kind,d){const row=mk("div","airow "+(kind==="user"?"user":"bot"));if(kind!=="user")row.appendChild(mk("span","aiav","✦"));row.appendChild(d);return row}
 function aiAdd(kind,text,r){const box=$("#ai_log"),d=mk("div","aimsg "+kind);
- if(kind==="bot"&&r&&r.welcome)d.innerHTML=aiMd(text);
+ if(!(r&&r.welcome)){aiLogRec.push({k:kind,t:String(text==null?"":text),r:kind==="bot"?aiSlim(r):null});setTimeout(aiPersist,0)}
+ if(kind==="bot"&&r&&(r.welcome||r.plain))d.innerHTML=aiMd(text);
  else if(kind==="bot"){d.innerHTML=aiMd(text);
   (r.steps||[]).forEach(s=>{const x=mk("div","aistep");x.appendChild(mk("span",s.ok?"ok":"bad",s.ok?"✓":"✕"));
    x.appendChild(mk("code",null,s.call));if(s.verdict||s.error)x.appendChild(mk("span","muted",s.verdict||s.error));
@@ -15047,13 +15554,13 @@ function aiScroll(){const sc=$("#aicard .aibody");sc.scrollTop=sc.scrollHeight}
 function aiToggle(force){const c=$("#aicard"),open=force==null?c.hidden:!!force;c.hidden=!open;$("#aifab").classList.toggle("on",open);
  try{localStorage.setItem("ai_open",open?"1":"")}catch(e){}if(open)setTimeout(()=>$("#ai_q").focus(),0)}
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#aicard").hidden){aiToggle(false);e._ai=1}});
-function aiClear(){aiHist=[];$("#ai_log").innerHTML="";aiWelcome()}
+function aiClear(){aiHist=[];aiLogRec=[];$("#ai_log").innerHTML="";aiPersist();aiWelcome()}
 async function aiAsk(mode,qx,sx){const q=qx||g("ai_q").trim();
  if(mode!=="explain"&&!q)return aiAdd("err","Type a question first.");
  if(mode!=="agent"&&!last&&!aiSrc)return aiAdd("err","Run a check first: there is no output to talk about yet.");
  if(mode==="agent"&&!devices.length)return aiAdd("err","Connect a device first: the checks run on the connected devices.");
  if(!await aiSave(false))return;
- if(mode==="explain"){aiHist=[];$("#ai_log").innerHTML=""}
+ if(mode==="explain"){aiHist=[];aiLogRec=[];$("#ai_log").innerHTML=""}
  const shown=sx||q||"Explain the current output ("+(lastCtx.label||"output")+")";
  aiAdd("user",shown+(mode==="agent"?"  · may run read-only checks on the connected devices":mode==="chat"?"  · answers from the output on screen only":""));
  $("#ai_q").value="";
@@ -15066,7 +15573,7 @@ async function aiAsk(mode,qx,sx){const q=qx||g("ai_q").trim();
  catch(e){r={ok:false,error:"no answer from the console: "+e.message+" (is netops_console.py still running?)"}}
  finally{clearInterval(iv);wrow.remove();card.classList.remove("busy");btns.forEach(b=>b.disabled=false)}
  if(!r.ok)return aiAdd("err",r.error||"error");
- aiAdd("bot",r.answer,r);aiHist.push({role:"user",content:shown},{role:"assistant",content:r.answer})}
+ aiAdd("bot",r.answer,r);aiHist.push({role:"user",content:shown},{role:"assistant",content:r.answer});aiPersist()}
 // Packet capture: the file goes to the console (memory only), which sends back a summary; that summary becomes the
 // current output, so Explain / Ask / Ask & run checks all work on it. The model never gets the packets themselves.
 const PCAP_Q="Analyse this packet capture (a summary the console made from the capture file). Say: 1) what traffic it shows "+
@@ -15089,7 +15596,8 @@ async function aiPcap(f){if(!f)return;aiToggle(true);
  d.innerHTML=aiMd("Capture **"+f.name+"** read: "+(s[0]||"")+".\n\n"+(s.length>1?"Found:\n"+s.slice(1,7).map(x=>"- "+x).join("\n")+(s.length>7?"\n- and "+(s.length-7)+" more in the Output panel":""):"No obvious problems found.")+
   "\n\nThe full summary is in the Output panel. Ask me anything about it, or:");
  const b=mk("button",null,"Analyse this capture");b.style.marginTop="8px";b.onclick=()=>aiAsk("chat",PCAP_Q,"Analyse the capture "+f.name);
- d.appendChild(b);$("#ai_log").appendChild(aiRow("bot",d));aiScroll()}
+ d.appendChild(b);$("#ai_log").appendChild(aiRow("bot",d));aiScroll();
+ aiLogRec.push({k:"bot",t:"Capture **"+f.name+"** was read here (summary: "+(s[0]||"")+"). After a page reload attach it again to ask about it.",r:{plain:true}});aiPersist()}
 document.addEventListener("dragover",e=>{if(e.target.closest&&e.target.closest("#aicard"))e.preventDefault()});
 document.addEventListener("drop",e=>{if(!(e.target.closest&&e.target.closest("#aicard")))return;e.preventDefault();
  const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];if(f)aiPcap(f)});
@@ -15271,7 +15779,7 @@ try{if(localStorage.getItem("pane_l"))paneToggle("l",true);if(localStorage.getIt
 let dashOpen=false,dashData=null,dashAt=0;const DASH_V={paloalto:"Palo Alto",fortigate:"FortiGate",f5:"F5 BIG-IP",firewall:"Firewall"};
 let dashObs=true;try{dashObs=localStorage.getItem("dash_obs")!=="0"}catch(e){}
 function dashBtn(){if(typeof fwbBtn==="function")fwbBtn();const show=devices.some(d=>["f5","paloalto","fortigate","solarwinds"].includes(d.vendor));$("#dashbtn").hidden=!show;if(!show&&dashOpen)dashToggle(false)}
-function dashToggle(on){dashOpen=on==null?!dashOpen:!!on;$("#dash").hidden=!dashOpen;document.documentElement.style.overflow=dashOpen?"hidden":"";
+function dashToggle(on){dashOpen=on==null?!dashOpen:!!on;$("#dash").hidden=!dashOpen;document.documentElement.style.overflow=dashOpen||ftOpen||(typeof fwbOpen!=="undefined"&&fwbOpen)?"hidden":"";
  try{localStorage.setItem("dash_open",dashOpen?"1":"")}catch(e){}if(dashOpen)dashLoad()}
 async function dashLoad(){let r;try{r=await api("/api/dash")}catch(e){return}if(!r||!r.ok)return;dashData=r;dashAt=Date.now();dashRender();dashClock();
  if((r.busy||r.sw_busy)&&dashOpen)setTimeout(dashLoad,3000)}
@@ -15440,10 +15948,11 @@ function renderFwb(){const box=$("#fwbtools");if(!box)return;box.textContent="";
  const row=mk("div","fwbcrow"),sel=mk("select");sel.setAttribute("aria-label","Time range");let saved="24h";try{saved=localStorage.getItem("fwb_range")||"24h"}catch(e){}
  [["1h","Last hour"],["6h","Last 6 hours"],["24h","Last 24 hours"],["3d","Last 3 days"],["7d","Last 7 days"]].forEach(([v,l])=>{const o=mk("option",null,l);o.value=v;sel.appendChild(o)});
  sel.value=saved;const b=mk("button","primary","Open analytics");b.onclick=()=>fwbOpenFor(d.id,sel.value);row.appendChild(sel);row.appendChild(b);
+ const sb=mk("button",null,"Security dashboard");sb.title="Cloudflare-style security dashboard from the attack log (same time range)";sb.onclick=()=>devSecDash(d.id,sel.value,{});row.appendChild(sb);
  c.appendChild(row);box.appendChild(c)}
 function fwbOpenFor(id,range){fwbSid=id;try{localStorage.setItem("fwb_range",range)}catch(e){}fwbToggle(true)}
 function fwbBtn(){if(!devices.some(d=>d.vendor==="fortiweb")&&fwbOpen)fwbToggle(false)}
-function fwbToggle(on){fwbOpen=on==null?!fwbOpen:!!on;$("#fwbv").hidden=!fwbOpen;document.documentElement.style.overflow=fwbOpen||dashOpen?"hidden":"";
+function fwbToggle(on){fwbOpen=on==null?!fwbOpen:!!on;$("#fwbv").hidden=!fwbOpen;document.documentElement.style.overflow=fwbOpen||dashOpen||ftOpen?"hidden":"";
  if(fwbOpen){const f=devices.filter(d=>d.vendor==="fortiweb"),s=$("#fwb_dev");s.textContent="";f.forEach(d=>{const o=mk("option",null,d.name);o.value=d.id;s.appendChild(o)});
   if(!f.some(d=>d.id===fwbSid))fwbSid=(f[0]||{}).id||"";s.value=fwbSid;$("#fwb_devl").hidden=f.length<2;
   try{const r=localStorage.getItem("fwb_range");if(r)$("#fwb_range").value=r;fwbPath=localStorage.getItem("fwb_path")||""}catch(e){}
@@ -15619,7 +16128,7 @@ function fwbMlInventory(out,iv){const k=iv.kpi,s=mk("div","dsum fwbk"),tile=(v,l
  f.oninput=()=>{tb.textContent="";const q=f.value.toLowerCase();tb.appendChild(fwbTable("Learned endpoints",rows.filter(e=>!q||JSON.stringify(e).toLowerCase().includes(q))))};out.appendChild(f);out.appendChild(tb);f.oninput()}
 function fwbAsk(){if(!fwbData)return;const ml=fwbMlPick();aiSrcSet({kind:"fwbstats",id:fwbSid,range:fwbData.data.range,policy:fwbData.data.policy,ml_domain:ml.domain||"",ml_policy:ml.policy||"",ml_rule_id:ml.rule_id==null?"":String(ml.rule_id),name:(devices.find(d=>d.id===fwbSid)||{}).name||"FortiWeb"});
  aiToggle(true);aiAsk("chat","Using these FortiWeb statistics: give a short security assessment of this range. 1. What stands out and why (most important first, with the numbers). 2. For each insight, whether it is a real attack, a likely false positive or a configuration gap, and the evidence. 3. ML anomaly detection and API protection: what the events show, whether models / schemas may need relearning or updating; if the learned endpoint inventory of a domain is included, go through its findings by OWASP API Security Top 10 (2023) category; if the learned API schema of a domain is included, review it (sensitive endpoints, endpoints without parameters learned, unexpected methods such as DELETE / PUT, inconsistent paths). 4. Concrete next steps in the FortiWeb GUI (which menu, which setting).","Assess the FortiWeb statistics")}
-document.addEventListener("keydown",e=>{if(e.key==="Escape"&&fwbOpen&&!e._ai&&$("#aicard").hidden)fwbToggle(false)});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&fwbOpen&&!e._ai&&!e._ft&&$("#aicard").hidden)fwbToggle(false)});
 /* vendor advisories headline */
 let advData=null,advSel=-1,advT=null;const ADV_V=["f5","paloalto","fortigate","fortiweb"];
 async function advPoll(){clearTimeout(advT);
@@ -15693,7 +16202,7 @@ async function irulePop(id,name){let p=$("#irpop");
  ai.onclick=()=>{irClose();aiSrcSet({kind:"irule",id,name:r.name,device:r.device});aiToggle(true);aiAsk("chat",IRULE_Q,"Explain iRule "+r.name)};
  b.onclick=async()=>{try{await navigator.clipboard.writeText(irCode);b.textContent="Copied"}catch(e){const t=document.createElement("textarea");t.value=irCode;document.body.appendChild(t);t.select();document.execCommand("copy");t.remove();b.textContent="Copied"}setTimeout(()=>b.textContent="Copy",1500)}}
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("#irpop")&&!$("#irpop").hidden){irClose();e.stopImmediatePropagation()}},true);
-document.addEventListener("keydown",e=>{if(e.key==="Escape"&&dashOpen&&!e._ai&&$("#aicard").hidden)dashToggle(false)});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&dashOpen&&!e._ai&&!e._ft&&$("#aicard").hidden)dashToggle(false)});
 api("/api/catalog").then(c=>{catalog=c;devicesRestore()});loadProfiles();vaultLoad();aiInit();try{if(localStorage.getItem("ai_open"))aiToggle(true);if(localStorage.getItem("ai_full"))aiFull(true);if(localStorage.getItem("dash_open"))setTimeout(()=>{if(devices.length)dashToggle(true)},2000)}catch(e){}
 </script></body></html>
 """
