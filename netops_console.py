@@ -69,7 +69,13 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xml_escape
 
-TOKEN = secrets.token_urlsafe(24)
+TOKEN = os.environ.pop("NETOPS_TOKEN", "") or secrets.token_urlsafe(24)   # optional: set by a launcher that starts one console per user
+# Optional per-user data folder (NETOPS_HOME) when a launcher runs one console per user (saved logins, profiles, captures, advisory cache);
+# by default everything sits next to this file.
+DATA_DIR = os.environ.get("NETOPS_HOME") or os.path.dirname(os.path.abspath(__file__))
+# "readonly" (set by such a launcher): no SSH, no packet capture, no backup and nothing that needs the confirmation tick-box.
+ROLE = os.environ.get("NETOPS_ROLE", "")
+RO_BLOCKED = ("/api/ssh", "/api/term/open", "/api/term/write", "/api/pancapture", "/api/backup")
 SESSIONS = {}   # id -> session dict (in memory only)
 AUDIT = collections.deque(maxlen=1000)
 LOCK = threading.Lock()
@@ -393,7 +399,7 @@ CATALOG = {
 }
 # contains no secrets; entries marked "hidden" are not listed in the page
 CATALOG_PUBLIC = {v: [c for c in cs if not c.get("hidden")] for v, cs in CATALOG.items()}
-PROFILE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_profiles.json")
+PROFILE_FILE = os.path.join(DATA_DIR, "device_profiles.json")
 
 
 
@@ -924,7 +930,7 @@ if not globals().get("_HOT_RELOADING"):
 
 # ---- Saved logins: credentials encrypted with Windows DPAPI (current user) + a passphrase-derived entropy ---------
 # Without the passphrase, or under another Windows account / on another PC, the file cannot be decrypted.
-VAULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_logins.dat")
+VAULT_FILE = os.path.join(DATA_DIR, "saved_logins.dat")
 VAULT = {"key": None, "logins": None}   # in memory only while unlocked
 VAULT_FIELDS = ("vendor", "name", "host", "port", "insecure", "account", "vdom", "username", "password", "apikey")
 VAULT_LOCK = threading.Lock()
@@ -1466,7 +1472,7 @@ def do_disconnect(b):
 # ----------------------------------------------------------------------------
 # IP lookup (all vendors) + F5 active tools (log search, packet capture)
 # ----------------------------------------------------------------------------
-CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
+CAPTURE_DIR = os.path.join(DATA_DIR, "captures")
 BRAND_DIR = os.path.dirname(os.path.abspath(__file__))
 BRAND_FILES = (("brand_logo.svg", "image/svg+xml"), ("brand_logo.png", "image/png"))
 F5_LOGS = ("ltm", "audit", "apm", "gtm", "tmm", "asm")
@@ -15055,6 +15061,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad json"})
         if not isinstance(body, dict):
             return self._send(400, {"error": "body must be a JSON object"})
+        if ROLE == "readonly" and (self.path in RO_BLOCKED or body.get("ack")):
+            return self._send(403, {"ok": False, "error": "your role is read-only: SSH, packet capture, backups and the tools "
+                                    "behind the confirmation tick-box are for operators"})
         routes = {"/api/connect": do_connect, "/api/run": do_run, "/api/ssh": do_ssh, "/api/term/open": do_term_open, "/api/term/read": do_term_read,
                   "/api/term/write": do_term_write, "/api/term/resize": do_term_resize, "/api/term/close": do_term_close,
                   "/api/raw": do_raw, "/api/disconnect": do_disconnect, "/api/vault": do_vault,
@@ -19307,7 +19316,7 @@ def do_pcap_upload(raw, fname):
 #   all        CISA Known Exploited Vulnerabilities catalog (actively exploited flag)
 # The download runs every ADV["interval"] seconds while a page is open and devices are connected; the result is kept
 # in advisory_cache.json (git-ignored, public data only) so a restart does not download it again.
-ADV_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "advisory_cache.json")
+ADV_CACHE = os.path.join(DATA_DIR, "advisory_cache.json")
 ADV = {"busy": False, "stage": "", "next": 0.0, "interval": 43200, "min": "high", "last": "", "errors": {},
        "feeds": None, "sig": None, "results": [], "lock": threading.Lock()}
 ADV_MIN = {"critical": 9.0, "high": 7.0, "medium": 4.0}
