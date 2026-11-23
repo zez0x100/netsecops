@@ -49,6 +49,7 @@ import gzip
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -78,9 +79,16 @@ HOST_RE = re.compile(r'^[A-Za-z0-9.\-:\[\]]{1,253}$')
 PAN_SAFE_TESTS = {"security-policy-match", "nat-policy-match", "routing", "url"}
 
 
-def P(name, label, placeholder="", default="", required=True):
-    return {"name": name, "label": label, "placeholder": placeholder,
-            "default": default, "required": required}
+def P(name, label, placeholder="", default="", required=True, choices=None):
+    """A check parameter; choices = [(value, text), ...] shows a drop-down list instead of a text box."""
+    p = {"name": name, "label": label, "placeholder": placeholder, "default": default, "required": required}
+    if choices:
+        p["choices"] = [list(c) for c in choices]
+    return p
+
+
+SECDASH_CHOICES = (("1h", "Last hour"), ("6h", "Last 6 hours"), ("24h", "Last 24 hours"), ("3d", "Last 3 days"),
+                   ("7d", "Last 7 days"))
 
 
 # ----------------------------------------------------------------------------
@@ -90,7 +98,7 @@ def P(name, label, placeholder="", default="", required=True):
 CATALOG = {
     "f5": [
         {"id": "secdash", "group": "Security", "label": "Security dashboard (ASM request log: blocked / alerted over time, by policy, top sources, attack types, violations and signatures)", "handler": "secdash",
-         "params": [P("range", "Time range: 1h, 6h, 24h, 3d or 7d", "24h", "24h", required=False)]},
+         "params": [P("range", "Time range", "", "24h", required=False, choices=SECDASH_CHOICES)]},
         {"id": "advcfg", "group": "Security", "label": "Vendor advisories vs this device's configuration (CVEs for its "
          "version, when each applies, the matching configuration facts; then ask the AI)", "handler": "adv_config"},
         {"id": "version", "group": "Device", "label": "Software version", "path": "/mgmt/tm/sys/version"},
@@ -172,6 +180,8 @@ CATALOG = {
                     P("from", "Source zone (optional)", "trust", required=False),
                     P("to", "Destination zone (optional)", "untrust", required=False),
                     P("vsys", "vsys", "vsys1", "vsys1")]},
+        {"id": "ipsec", "group": "VPN", "label": "IPsec tunnels (state, peers, encryption)", "cmd": "<show><vpn><flow></flow></vpn></show>"},
+        {"id": "ikesa", "group": "VPN", "label": "IKE SAs (phase 1 per gateway)", "cmd": "<show><vpn><ike-sa></ike-sa></vpn></show>"},
         {"id": "urlcat", "group": "Policy", "label": "URL category lookup", "cmd": "<test><url>{url}</url></test>",
          "params": [P("url", "URL or domain", "www.example.com/path")]},
     ],
@@ -221,6 +231,10 @@ CATALOG = {
         {"id": "ips", "group": "Reference", "label": "Cloudflare edge IP ranges", "path": "/client/v4/ips"},
     ],
     "solarwinds": [
+        {"id": "insights", "group": "Overview", "label": "NOC attention board: what needs action now (ranked), noisy nodes "
+         "by alarm type, flapping, time to acknowledge / clear, compared with the previous period (alert history)",
+         "handler": "sw_insights", "params": [P("range", "Time range", "", "7d", required=False,
+                                                  choices=(("24h", "Last 24 hours"), ("7d", "Last 7 days"), ("30d", "Last 30 days")))]},
         {"id": "overview", "group": "Overview", "label": "Overview: nodes, interfaces and active alerts by status, "
          "what needs attention", "handler": "sw_overview"},
         {"id": "alerts", "group": "Alerts", "label": "Active alerts (most severe first; optional filter: node, object, "
@@ -242,22 +256,23 @@ CATALOG = {
     ],
     "fortiweb": [
         {"id": "secdash", "group": "Security", "label": "Security dashboard (attack log: events by action and category, top sources, attack types and signatures)", "handler": "secdash",
-         "params": [P("range", "Time range: 1h, 6h, 24h, 3d or 7d", "24h", "24h", required=False)]},
+         "params": [P("range", "Time range", "", "24h", required=False, choices=SECDASH_CHOICES)]},
         {"id": "advcfg", "group": "Security", "label": "Vendor advisories vs this device's configuration (CVEs for its "
          "version, when each applies, the matching configuration facts; then ask the AI)", "handler": "adv_config"},
         {"id": "status", "group": "Device", "label": "System status (version, serial, HA mode, signature versions)",
          "handler": "fx_generic", "fx": ["/api/v2.0/system/status.systemstatus", "/api/v2.0/system/status"]},
         {"id": "license", "group": "Device", "label": "License and FortiGuard services", "handler": "fx_generic",
          "fx": ["/api/v2.0/system/status.licinfo", "/api/v2.0/system/license", "/api/v2.0/system/status.license"]},
-        {"id": "resources", "group": "Resources", "label": "Resources (CPU, memory, disk, connections, throughput)",
-         "handler": "fx_generic", "fx": ["/api/v2.0/system/status.monitor", "/api/v2.0/system/dashboard.sysres",
+        {"id": "resources", "group": "Resources", "label": "Performance dashboard (CPU, memory, log disk, connections, "
+         "requests and throughput)", "handler": "fwb_resources", "fx": ["/api/v2.0/system/status.monitor", "/api/v2.0/system/dashboard.sysres",
                                          "/api/v2.0/system/status.sysres"]},
         {"id": "ha", "group": "HA", "label": "HA status / configuration", "handler": "fx_generic",
          "fx": ["/api/v2.0/system/status.hastatus", "/api/v2.0/system/ha.status", "/api/v2.0/cmdb/system/ha"]},
         {"id": "ifaces", "group": "Network", "label": "Interfaces", "handler": "fx_generic", "key": "interfaces",
          "fx": ["/api/v2.0/system/network.interface", "/api/v2.0/cmdb/system/interface"],
          "params": [P("filter", "Name or IP (optional)", "port1", required=False)]},
-        {"id": "certs", "group": "Device", "label": "Local certificates (subject, issuer, expiry)", "handler": "fx_generic",
+        {"id": "certs", "group": "Device", "label": "Local certificates: name, subject, issuer, expiry and days left (soonest "
+         "first; expired / within 30 days flagged)", "handler": "fwb_certs",
          "key": "certificates", "fx": ["/api/v2.0/system/certificate.local", "/api/v2.0/cmdb/system/certificate.local"],
          "params": [P("filter", "Name or subject (optional)", "shop", required=False)]},
         {"id": "policies", "group": "Server policies", "label": "Server policies: virtual server + IPs, protected "
@@ -282,20 +297,46 @@ CATALOG = {
          "IP reputation ... per profile)", "handler": "fx_generic", "key": "profiles",
          "fx": ["/api/v2.0/cmdb/waf/web-protection-profile.inline-protection"],
          "params": [P("filter", "Profile name (optional)", "shop", required=False)]},
-        {"id": "attacks", "group": "Security", "label": "Attack log search (newest first; client IP, hostname, URL, "
-         "action or any text such as a signature ID)", "handler": "fwb_attacks",
-         "params": [P("ip", "Client IP (optional)", "203.0.113.5", required=False),
-                    P("host", "Hostname (optional)", "shop.example.com", required=False),
-                    P("url", "URL / path (optional)", "/login", required=False),
-                    P("action", "Action (optional), e.g. Alert_Deny", "Alert_Deny", required=False),
-                    P("text", "Any text, e.g. signature ID (optional)", "050140001", required=False),
-                    P("count", "Max rows", "100", "100", required=False)]},
-        {"id": "stats", "group": "Security", "label": "Security statistics and insights (attack log over a time range: "
+        {"id": "owasp", "group": "Security", "label": "OWASP Top 10 compliance (FortiWeb's own evaluation per server policy "
+         "and web protection profile, content routing included: compliance rate, attack signature and required protection "
+         "items fulfilled / unfulfilled per category)", "handler": "fwb_owasp_cfg"},
+        {"id": "owaspatk", "group": "Security", "hidden": True, "label": "OWASP Top 10 from the attack log: attacks per category, blocked or only "
+         "logged (monitor mode / alert), and which server policies let them through (attack log)", "handler": "fwb_owasp",
+         "params": [P("range", "Time range", "", "24h", required=False, choices=SECDASH_CHOICES)]},
+        {"id": "attacks", "group": "Security", "hidden": True, "label": "Attack log search (filters like the FortiWeb GUI: "
+         "action, policy, client IP, host, URL, method, country, attack type, signature, CVE, OWASP, threat level ...; "
+         "a leading - excludes)", "handler": "fwb_attacks",
+         "params": [P(k, l + " (optional)", "", required=False) for k, l, _ in (
+             ("action", "Action", 0), ("policy", "Server policy", 0), ("service", "Service", 0), ("ip", "Client IP", 0),
+             ("dst", "Destination", 0), ("host", "HTTP host", 0), ("url", "URL", 0), ("method", "Method", 0),
+             ("country", "Country", 0), ("main", "Main type", 0), ("sub", "Sub type", 0), ("sig", "Signature ID", 0),
+             ("cve", "CVE ID", 0), ("owasp", "OWASP Top10", 0), ("owaspapi", "OWASP API Top10", 0), ("level", "Threat level", 0),
+             ("risk", "Client risk", 0), ("monitor", "Monitor mode", 0), ("msg", "Message", 0), ("msgid", "Message ID", 0), ("logid", "Log ID", 0),
+             ("code", "Response code", 0),
+             ("text", "Any field", 0))] +
+                   [P("range", "Time range", "", "24h", required=False, choices=(("1h", "Last hour"), ("6h", "Last 6 hours"),
+                      ("24h", "Last 24 hours"), ("3d", "Last 3 days"), ("7d", "Last 7 days"))),
+                    P("count", "Max rows", "200", "200", required=False)]},
+        {"id": "traffic", "group": "Security", "hidden": True, "label": "Traffic log search (filters like the FortiWeb GUI: "
+         "action, policy, client IP, host, URL, method, country, attack type, signature, CVE, OWASP, threat level ...; "
+         "a leading - excludes)", "handler": "fwb_traffic",
+         "params": [P(k, l + " (optional)", "", required=False) for k, l, _ in (
+             ("action", "Action", 0), ("policy", "Server policy", 0), ("service", "Service", 0), ("ip", "Client IP", 0),
+             ("dst", "Destination", 0), ("host", "HTTP host", 0), ("url", "URL", 0), ("method", "Method", 0),
+             ("country", "Country", 0), ("main", "Main type", 0), ("sub", "Sub type", 0), ("sig", "Signature ID", 0),
+             ("cve", "CVE ID", 0), ("owasp", "OWASP Top10", 0), ("owaspapi", "OWASP API Top10", 0), ("level", "Threat level", 0),
+             ("risk", "Client risk", 0), ("monitor", "Monitor mode", 0), ("msg", "Message", 0), ("msgid", "Message ID", 0), ("logid", "Log ID", 0),
+             ("code", "Response code", 0),
+             ("text", "Any field", 0))] +
+                   [P("range", "Time range", "", "24h", required=False, choices=(("1h", "Last hour"), ("6h", "Last 6 hours"),
+                      ("24h", "Last 24 hours"), ("3d", "Last 3 days"), ("7d", "Last 7 days"))),
+                    P("count", "Max rows", "200", "200", required=False)]},
+        {"id": "stats", "group": "Security", "hidden": True, "label": "Security statistics and insights (attack log over a time range: "
          "trend, categories, OWASP Top 10, signatures, clients, countries, ML anomaly, API protection, bots; spikes, "
          "monitor-mode hits, possible false positives). Charts: the \"🛡 FortiWeb analytics\" card above",
          "handler": "fwb_stats", "params": [P("range", "Time range: 1h, 6h, 24h, 3d or 7d", "24h", "24h", required=False),
                                             P("policy", "Server policy (optional)", "pol_shop", required=False)]},
-        {"id": "mlapi", "group": "Security", "label": "ML based API protection: learned domains / URLs (view urls), the "
+        {"id": "mlapi", "group": "Security", "hidden": True, "label": "ML based API protection: learned domains / URLs (view urls), the "
          "learned schema of a domain (view schema: endpoints, methods, parameters) or its event log (view eventlog)",
          "handler": "fwb_mlapi", "params": [P("view", "urls, rules, overview, schema or eventlog", "urls", "urls", required=False),
                                             P("domain", "Domain (for schema / eventlog)", "api.example.com", required=False),
@@ -768,8 +809,8 @@ def term_reap():
 def ssh_request(b):
     """Validated (session, ssh arguments, shown command) from an SSH request, or raises ValueError."""
     sess = SESSIONS.get(b.get("id"))
-    if not sess or sess["vendor"] not in ("f5", "fortigate", "paloalto"):
-        raise ValueError("select a connected F5, FortiGate or Palo Alto")
+    if not sess or sess["vendor"] not in ("f5", "fortigate", "paloalto", "fortiweb"):
+        raise ValueError("select a connected F5, FortiGate, Palo Alto or FortiWeb")
     user = str(b.get("user") or "").strip()
     if not SSH_USER_RE.match(user):
         raise ValueError("enter the SSH user name (letters, digits, . _ - @ \\; up to 64)")
@@ -1138,7 +1179,7 @@ def do_connect(b):
         return {"ok": False, "error": "connection failed: %s" % getattr(e, "reason", e)}
     if not ok:
         return {"ok": False, "error": "device rejected the request (HTTP %s)" % status}
-    if vendor in ("f5", "paloalto") and SSH_USER_RE.match(str(user or "")):
+    if vendor in ("f5", "paloalto", "fortiweb") and SSH_USER_RE.match(str(user or "")):
         sess["user"] = user   # the login name only, as the default for SSH
     sid = secrets.token_hex(6)
     with LOCK:
@@ -4306,7 +4347,8 @@ def sw_ifaces_read(sess, node_id=None):
         iu, ou = sw_num(i.get("InPercentUtil"), 1), sw_num(i.get("OutPercentUtil"), 1)
         err = sum(x for x in (sw_num(i.get("InErrorsToday"), 0), sw_num(i.get("OutErrorsToday"), 0)) if x != "")
         dis = sum(x for x in (sw_num(i.get("InDiscardsToday"), 0), sw_num(i.get("OutDiscardsToday"), 0)) if x != "")
-        out.append({"_node": i.get("NodeID"), "_cls": cls, "_util": max([x for x in (iu, ou) if x != ""] or [0]),
+        util = max([x for x in (iu, ou) if x != ""] or [0])
+        out.append({"_node": i.get("NodeID"), "_cls": cls, "_util": util if util <= 100 else 0, "_util_bad": util if util > 100 else None,
                     "node": "", "interface": i.get("Caption") or "", "status": st, "in_util_%": iu, "out_util_%": ou,
                     "errors_today": int(err), "discards_today": int(dis), "speed": sw_speed(i.get("Speed")),
                     "last_change": sw_dt(i.get("LastChange"))})
@@ -4484,6 +4526,230 @@ def sw_node(sess, v):
     return sw_done(t0, "SWQL Orion.Nodes + Orion.NPM.Interfaces + Orion.AlertActive", data, summary,
                    "%s · %s%s%s" % (nd["node"], nd["status"].upper(), " · %d INTERFACE(S) DOWN" % len(down) if down else "",
                                     " · %d ALERT(S)" % len(al) if al else ""), kind)
+
+
+# ---- SolarWinds NOC attention board: what needs action now, noisy nodes, flapping, response times ---------------
+# Built from the alert history SolarWinds keeps (Orion.AlertHistory: trigger / reset / acknowledge per alert instance),
+# the current period and the previous one of the same length, plus the active alerts. Read-only SWQL.
+SWI_RANGES = {"24h": 24, "7d": 168, "30d": 720}
+SWI_SEVW = {2: 40, 3: 30, 1: 20, 4: 8, 0: 4}          # severity points of the attention score
+SWI_HIST_FROM = (" FROM Orion.AlertHistory ah INNER JOIN Orion.AlertObjects ao ON ah.AlertObjectID = ao.AlertObjectID "
+                 "INNER JOIN Orion.AlertConfigurations ac ON ao.AlertID = ac.AlertID ")
+SWI_HIST_Q = (
+    # grouped on the server: one row per alert instance and event type
+    "SELECT ah.AlertActiveID, ah.AlertObjectID, ah.EventType, MIN(ah.TimeStamp) AS T, COUNT(ah.AlertHistoryID) AS N, "
+    "ao.RelatedNodeId, ao.RelatedNodeCaption, ao.EntityCaption, ac.Name, ac.Severity" + SWI_HIST_FROM +
+    "WHERE ah.TimeStamp >= @start AND ah.EventType IN (0, 1, 2) GROUP BY ah.AlertActiveID, ah.AlertObjectID, ah.EventType, "
+    "ao.RelatedNodeId, ao.RelatedNodeCaption, ao.EntityCaption, ac.Name, ac.Severity",
+    # older Orion without GROUP BY on joined fields: the raw events, grouped here
+    "SELECT TOP 200000 ah.AlertActiveID, ah.AlertObjectID, ah.EventType, ah.TimeStamp AS T, ao.RelatedNodeId, "
+    "ao.RelatedNodeCaption, ao.EntityCaption, ac.Name, ac.Severity" + SWI_HIST_FROM +
+    "WHERE ah.TimeStamp >= @start AND ah.EventType IN (0, 1, 2) ORDER BY ah.TimeStamp DESC")
+SWI_ACTIVE_Q = (
+    "SELECT TOP 2000 aa.AlertObjectID, aa.TriggeredDateTime, aa.Acknowledged, ao.EntityCaption, ao.RelatedNodeId, "
+    "ao.RelatedNodeCaption, ac.Name, ac.Severity" + SW_ALERT_JOIN,
+    "SELECT TOP 2000 aa.TriggeredDateTime, aa.Acknowledged, ao.EntityCaption, ac.Name, ac.Severity" + SW_ALERT_JOIN)
+SWI_CRIT_RE = re.compile(r"critical|criticality|tier|priority|importance|business", re.I)
+
+
+def swi_ts(v):
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)", str(v or ""))
+    return calendar.timegm(tuple(int(x) for x in m.groups()) + (0, 0, 0)) if m else None
+
+
+def swi_dur(sec):
+    if sec is None:
+        return ""
+    sec = max(0, int(sec))
+    return ("%d min" % (sec // 60) if sec < 3600 else "%d h %02d m" % (sec // 3600, sec % 3600 // 60) if sec < 172800
+            else "%d d %d h" % (sec // 86400, sec % 86400 // 3600))
+
+
+def swi_median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    m = len(xs) // 2
+    return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2.0
+
+
+def swi_crit(sess):
+    """{NodeID: (weight 0..1, value)} from a criticality-like custom property, if the nodes have one."""
+    try:
+        rows = sw_query(sess, "SELECT TOP 1 * FROM Orion.NodesCustomProperties", timeout=30)
+    except (SwError, urllib.error.URLError, OSError):
+        return {}, ""
+    cols = [c for c in (rows[0] if rows else {}) if SWI_CRIT_RE.search(c) and c not in ("NodeID", "InstanceType", "Uri")]
+    if not cols:
+        return {}, ""
+    col = cols[0]
+    if not re.match(r"^\w+$", col):
+        return {}, ""
+    try:
+        rows = sw_query(sess, "SELECT NodeID, %s AS C FROM Orion.NodesCustomProperties" % col, timeout=60)
+    except (SwError, urllib.error.URLError, OSError):
+        return {}, ""
+    out = {}
+    for r in rows:
+        v = str(r.get("C") or "").strip()
+        lv = v.lower()
+        w = (1.0 if re.search(r"crit|core|high|tier ?1|^1$|p1|gold", lv) else 0.6 if re.search(r"med|tier ?2|^2$|p2|silver", lv)
+             else 0.25 if v else None)
+        if w is not None:
+            out[r.get("NodeID")] = (w, v)
+    return out, col
+
+
+def sw_insights(sess, v):
+    t0 = time.time()
+    rng = str(v.get("range") or "7d")
+    if rng not in SWI_RANGES:
+        raise ValueError("range must be one of: " + ", ".join(SWI_RANGES))
+    hours = SWI_RANGES[rng]
+    now = time.time()
+    start, pstart = now - hours * 3600, now - 2 * hours * 3600
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(pstart))
+    try:
+        rows, qi = sw_first(sess, SWI_HIST_Q, {"start": iso}, timeout=180)
+    except SwError as e:
+        if e.status in (401, 403):
+            raise
+        return {"ok": False, "status": e.status, "error": "SolarWinds did not return the alert history (%s). The account "
+                "needs read access to Orion.AlertHistory." % e}
+    # one record per alert instance: trigger / acknowledge / reset times
+    inst = {}
+    for r in rows:
+        k = r.get("AlertActiveID")
+        if k is None:
+            continue
+        x = inst.setdefault(k, {"obj": r.get("AlertObjectID"), "node": r.get("RelatedNodeCaption") or r.get("EntityCaption") or "",
+                                "nid": r.get("RelatedNodeId"), "ent": r.get("EntityCaption") or "", "name": r.get("Name") or "",
+                                "sev": sw_int(r.get("Severity")), "trig": None, "ack": None, "reset": None})
+        t, et = swi_ts(r.get("T")), sw_int(r.get("EventType"))
+        key = {0: "trig", 2: "ack", 1: "reset"}.get(et)
+        if key and t is not None and (x[key] is None or t < x[key]):
+            x[key] = t
+    hist_rows = len(rows)
+    try:
+        mrow = sw_query(sess, "SELECT MIN(ah.TimeStamp) AS T FROM Orion.AlertHistory ah", timeout=60)
+        oldest = swi_ts(mrow[0].get("T")) if mrow else None
+    except (SwError, urllib.error.URLError, OSError):
+        oldest = -1   # unknown: no retention note
+    cur = [x for x in inst.values() if x["trig"] and x["trig"] >= start]
+    prev = [x for x in inst.values() if x["trig"] and pstart <= x["trig"] < start]
+    by_obj, prev_obj = collections.defaultdict(list), collections.Counter(x["obj"] for x in prev)
+    for x in cur:
+        by_obj[x["obj"]].append(x)
+    # flapping: an alert on one object that triggers at least 5 times in the period and clears within 30 min most times
+    flap = {}
+    for o, xs in by_obj.items():
+        quick = [x for x in xs if x["reset"] and x["reset"] - x["trig"] <= 1800]
+        if len(xs) >= 5 and len(quick) >= 0.6 * len(xs):
+            flap[o] = len(xs)
+    crit, crit_col = swi_crit(sess)
+    # active alerts, scored
+    try:
+        act, ai = sw_first(sess, SWI_ACTIVE_Q, timeout=60)
+    except SwError:
+        act, ai = [], 0
+    att = []
+    for a in act:
+        sev = sw_int(a.get("Severity"))
+        trig = swi_ts(a.get("TriggeredDateTime"))
+        ack = a.get("Acknowledged") in (True, 1, "1", "true", "True")
+        o = a.get("AlertObjectID")
+        if o is None:   # older Orion: match the object by alert name and entity
+            o = next((k for k, xs in by_obj.items() if xs[0]["name"] == a.get("Name") and xs[0]["ent"] == a.get("EntityCaption")), None)
+        n_rep = len(by_obj.get(o, [])) if o is not None else 0
+        age_h = (now - trig) / 3600.0 if trig else 0
+        cw = crit.get(a.get("RelatedNodeId"))
+        score = SWI_SEVW.get(sev, 4) + min(25, 25 * math.log(1 + age_h, 2) / math.log(49, 2)) + (0 if ack else 15) + \
+            min(15, 3 * max(0, n_rep - 1)) + (10 * cw[0] if cw else 0) + (5 if o in flap else 0)
+        why = [SW_SEV.get(sev, "unknown").lower()]
+        if not ack:
+            why.append("not acknowledged")
+        if o in flap:
+            why.append("flapping · %d times" % flap[o])
+        elif n_rep > 1:
+            why.append("%s time this period" % ({2: "2nd", 3: "3rd"}.get(n_rep, "%dth" % n_rep)))
+        if o is not None and n_rep and not prev_obj.get(o):
+            why.append("new this period")
+        if cw and cw[0] >= 0.6:
+            why.append("%s: %s" % (crit_col, cw[1]))
+        att.append({"score": int(round(min(100, score))), "sev": sev, "node": a.get("RelatedNodeCaption") or a.get("EntityCaption") or "",
+                    "alert": a.get("Name") or "", "object": a.get("EntityCaption") or "", "why": why, "age": swi_dur(now - trig) if trig else "",
+                    "ack": ack, "hot": [w for w in why if w in ("critical", "not acknowledged") or w.startswith("flapping")]})
+    att.sort(key=lambda r: -r["score"])
+    # noisy nodes x alert types (triggers in the period)
+    cnt = collections.Counter((x["node"], x["name"]) for x in cur)
+    node_tot, name_tot = collections.Counter(), collections.Counter()
+    for (n, a), c in cnt.items():
+        node_tot[n] += c
+        name_tot[a] += c
+    cols = [a for a, _ in name_tot.most_common(8)]
+    flap_nodes = {xs[0]["node"] for o, xs in by_obj.items() if o in flap}
+    heat = [{"node": n, "total": t, "flap": n in flap_nodes, "cells": [cnt.get((n, a), 0) for a in cols]}
+            for n, t in node_tot.most_common(15)]
+    flaps = sorted(({"node": xs[0]["node"], "alert": xs[0]["name"], "object": xs[0]["ent"], "times": len(xs),
+                     "median_duration": swi_dur(swi_median([x["reset"] - x["trig"] for x in xs if x["reset"]]))}
+                    for o, xs in by_obj.items() if o in flap), key=lambda r: -r["times"])[:15]
+    # response times per alert type
+    def resp(xs):
+        tta = [x["ack"] - x["trig"] for x in xs if x["ack"] and x["ack"] >= x["trig"]]
+        ttc = [x["reset"] - x["trig"] for x in xs if x["reset"] and x["reset"] >= x["trig"]]
+        return swi_median(tta), swi_median(ttc), sum(1 for x in xs if not x["reset"]), len(tta)
+    by_name = collections.defaultdict(list)
+    for x in cur:
+        by_name[x["name"]].append(x)
+    response = []
+    for a, xs in sorted(by_name.items(), key=lambda kv: -len(kv[1]))[:12]:
+        tta, ttc, still, nack = resp(xs)
+        response.append({"alert": a, "times": len(xs), "acknowledged": nack, "median_ack": swi_dur(tta) or "never",
+                         "median_clear": swi_dur(ttc) or "not cleared", "still_open": still})
+    ca, cc, _, _ = resp(cur)
+    pa, pc, _, _ = resp(prev)
+    oldest_un = None
+    for a in act:
+        if a.get("Acknowledged") in (True, 1, "1", "true", "True"):
+            continue
+        t = swi_ts(a.get("TriggeredDateTime"))
+        if t and (oldest_un is None or t < oldest_un[0]):
+            oldest_un = (t, a.get("RelatedNodeCaption") or a.get("EntityCaption") or "")
+    new_objs = {o for o in by_obj if not prev_obj.get(o)}
+    kpis = [
+        {"label": "Active critical", "value": sum(1 for r in att if r["sev"] == 2), "fmt": "num", "prev": None},
+        {"label": "Alarms triggered", "value": len(cur), "fmt": "num", "prev": len(prev)},
+        {"label": "New this period", "value": len(new_objs), "fmt": "num", "prev": None, "note": "alarm objects not seen in the previous period"},
+        {"label": "Flapping", "value": len(flap), "fmt": "num", "prev": None},
+        {"label": "Oldest unacknowledged", "value": swi_dur(now - oldest_un[0]) if oldest_un else "none", "fmt": "text",
+         "note": oldest_un[1] if oldest_un else ""},
+        {"label": "Median time to acknowledge", "value": swi_dur(ca) or "n/a", "fmt": "text", "sec": ca, "prev_sec": pa},
+        {"label": "Median time to clear", "value": swi_dur(cc) or "n/a", "fmt": "text", "sec": cc, "prev_sec": pc}]
+    span = {"24h": "24 hours", "7d": "7 days", "30d": "30 days"}[rng]
+    notes = ["Alert history of the last %s (%s alarm(s) triggered) compared with the %s before; %d active alert(s) ranked."
+             % (span, "{:,}".format(len(cur)), span, len(act))]
+    if oldest != -1 and (oldest is None or oldest > pstart + 3600):
+        notes.append("SolarWinds history starts %s: the comparison with the previous period is incomplete (retention)."
+                     % (time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(oldest)) if oldest else "empty"))
+    if qi == 1 and hist_rows >= 200000:
+        notes.append("Only the newest 200,000 history events were read; choose a shorter range for full coverage.")
+    notes.append("Attention score: severity, time active, not acknowledged, repeats in the period, flapping%s."
+                 % (", node %s (custom property)" % crit_col if crit_col else
+                    "; add a node custom property such as Criticality to rank core devices first"))
+    notes.append("Flapping = at least 5 triggers in the period on one object, most cleared within 30 minutes. Times are UTC.")
+    ncrit = sum(1 for r in att if r["sev"] == 2)
+    data = {"needs_attention": [{"score": r["score"], "node": r["node"], "alert": r["alert"], "object": r["object"],
+                                 "active_for": r["age"], "why": ", ".join(r["why"])} for r in att[:25]],
+            "noisy_nodes": [dict({"node": h["node"], "alarms": h["total"], "flapping": "yes" if h["flap"] else ""},
+                                 **{c: h["cells"][i] for i, c in enumerate(cols)}) for h in heat],
+            "flapping": flaps, "response_by_alert": response}
+    r = sw_done(t0, "SWQL Orion.AlertHistory (%s, previous period) + Orion.AlertActive" % span, data, notes,
+                "%d NEED ATTENTION · %d CRITICAL · %s ALARMS IN %s" % (len([x for x in att if x["score"] >= 60]), ncrit,
+                                                                       "{:,}".format(len(cur)), span.upper()),
+                "bad" if ncrit else "warn" if att else "ok")
+    r["swins"] = {"range": rng, "attention": att[:10], "kpis": kpis, "heat": {"cols": cols, "rows": heat}, "flapping": flaps[:8],
+                  "response": response, "crit": crit_col}
+    return r
 
 
 def sw_overview(sess, v):
@@ -4768,37 +5034,77 @@ FWB_ATTACK_PATHS = ("/api/v2.0/log/logreport.logaccess.filter?log_type=3&size={n
                     "/api/v2.0/log/logaccess.attack?size={n}", "/api/v2.0/log/attack")
 
 
-def fwb_attacks(sess, vals):
-    """Attack log, newest first, filtered by client IP / hostname / URL / signature or action (filtered here)."""
-    t0 = time.time()
-    n = max(1, min(int(vals.get("count") or 100), 1000))
-    if any(vals.get(k) for k in ("ip", "host", "url", "text", "action")):   # search back through up to 7 days
-        raw, used, _n = fwb_logs(sess, 168, cap=5000)
-    else:
-        d, used = fx_first(sess, [p.format(n=n) for p in FWB_ATTACK_PATHS])
-        raw = fx_rows(d)
-    rows = [fx_clean(r) for r in raw]
-    flt = {k: str(vals.get(k) or "").strip().lower() for k in ("ip", "host", "url", "action", "text")}
+# FortiWeb attack log filters, as in the GUI's filter list: (parameter, label, log fields it matches)
+FWB_LOG_FILTERS = (("action", "Action", ("action",)), ("policy", "Server policy", ("policy",)),
+                   ("service", "Service", ("service", "proto")),
+                   ("ip", "Client IP", ("src", "srcip", "src_ip", "client_ip", "original_src")),
+                   ("dst", "Destination", ("dst", "dstip", "dst_ip", "dest")),
+                   ("host", "HTTP host", ("http_host", "host", "hostname")), ("url", "URL", ("http_url", "url", "uri")),
+                   ("method", "Method", ("http_method", "method")), ("country", "Country", ("srccountry", "src_country", "country")),
+                   ("main", "Main type", ("main_type",)), ("sub", "Sub type", ("sub_type",)),
+                   ("sig", "Signature ID", ("signature_id",)), ("cve", "CVE ID", ("cve_id", "cve")),
+                   ("owasp", "OWASP Top10", ("owasp_top10",)), ("owaspapi", "OWASP API Top10", ("owasp_api_top10",)),
+                   ("level", "Threat level", ("threat_level", "severity_level", "severity")),
+                   ("risk", "Client risk", ("client_risk", "risk_level", "client_risk_level")),
+                   ("monitor", "Monitor mode", ("monitor_mode", "monitor")), ("msg", "Message", ("msg", "message")),
+                   ("msgid", "Message ID", ("msg_id", "message_id")), ("logid", "Log ID", ("log_id", "logid")),
+                   ("code", "Response code", ("http_retcode", "return_code", "status_code", "retcode")),
+                   ("text", "Any field", ()))
+FWB_LOG_RANGES = {"1h": 1, "6h": 6, "24h": 24, "3d": 72, "7d": 168}
 
-    def has(r, keys, want):
-        if not want:
-            return True
-        vals_ = [str(r.get(k) or "") for k in keys if k in r]
-        return any(want in v.lower() for v in (vals_ or [json.dumps(r, default=str)]))
-    out = [r for r in rows if has(r, ("src", "srcip", "src_ip", "client_ip", "original_src"), flt["ip"]) and
-           has(r, ("http_host", "host", "hostname"), flt["host"]) and has(r, ("http_url", "url", "uri"), flt["url"]) and
-           has(r, ("action",), flt["action"]) and has(r, (), flt["text"])]
-    tkey = next((k for k in ("timestamp", "time", "date", "datetime", "log_time") if out and k in out[0]), None)
-    if tkey:
-        out.sort(key=lambda r: (str(r.get("date") or ""), str(r.get(tkey) or "")), reverse=True)
+
+def fwb_traffic(sess, vals):
+    return fwb_attacks(sess, vals, kind="traffic")
+
+
+def fwb_attacks(sess, vals, kind="attack"):
+    """Attack (or traffic) log over a time range, filtered like the FortiWeb GUI (contains; a leading '-' excludes)."""
+    t0 = time.time()
+    n = max(1, min(int(vals.get("count") or 200), 2000))
+    rng = str(vals.get("range") or "24h")
+    hours = FWB_LOG_RANGES.get(rng, 24)
+    raw, used, note = fwb_logs(sess, hours, cap=10000, kind=kind)
+    rows = [fx_clean(r) for r in raw]
+    tsv = [x for x in (fwb_ts(r) for r in rows) if x]
+    since = (max(tsv) if tsv else time.time()) - hours * 3600
+    flt = [(k, lbl, keys, str(vals.get(k) or "").strip().lower()) for k, lbl, keys in FWB_LOG_FILTERS]
+    flt = [f for f in flt if f[3] and f[3] != "-"]
+
+    def ok(r):
+        for k, _, keys, want in flt:
+            neg = want.startswith("-")
+            w = want[1:] if neg else want
+            vs = [str(r.get(x) or "") for x in keys if x in r] if keys else [json.dumps(r, default=str)]
+            hit = any(w in v.lower() for v in vs)
+            if hit == neg:
+                return False
+        return True
+    out = [r for r in rows if (fwb_ts(r) is None or fwb_ts(r) >= since) and ok(r)]
+    out.sort(key=lambda r: fwb_ts(r) or 0, reverse=True)
+    total = len(out)
     out = out[:n]
-    cnt = lambda keys: collections.Counter(next((str(r[k]) for k in keys if r.get(k)), "?") for r in out).most_common(8)
-    summ = ["%d attack log entr%s%s." % (len(out), "y" if len(out) == 1 else "ies",
-                                         " matching " + ", ".join("%s '%s'" % kv for kv in flt.items() if kv[1]) if any(flt.values()) else "")]
-    if out:
+    cnt = lambda keys: collections.Counter(next((str(r[k]) for k in keys if r.get(k)), "?") for r in out).most_common(6)   # noqa: E731
+    span = {"1h": "hour", "6h": "6 hours", "24h": "24 hours", "3d": "3 days", "7d": "7 days"}.get(rng, rng)
+    summ = ["%s %s log entr%s in the last %s%s%s." % (
+        "{:,}".format(total), kind, "y" if total == 1 else "ies", span,
+        " matching " + ", ".join("%s %s'%s'" % (lbl, "not " if w.startswith("-") else "", w.lstrip("-")) for _, lbl, _, w in flt) if flt else "",
+        "; the newest %d shown" % n if total > n else "")]
+    if out and kind == "traffic":
+        summ += ["By action: " + ", ".join("%s %d" % x for x in cnt(("action",))),
+                 "By response code: " + ", ".join("%s %d" % x for x in cnt(("http_retcode", "return_code", "status_code"))),
+                 "By host: " + ", ".join("%s %d" % x for x in cnt(("http_host", "host")))]
+    elif out:
         summ += ["By action: " + ", ".join("%s %d" % x for x in cnt(("action",))),
                  "By attack type: " + ", ".join("%s %d" % x for x in cnt(("main_type", "sub_type", "attack_type", "msg")))]
-    return fx_done(sess, used, {"attacks": out}, summ, t0)
+    if len(raw) >= 10000:
+        summ.append("Read the newest 10,000 log entries; older entries in the range were not searched. Add a filter or a "
+                    "shorter range.")
+    if note:
+        summ.append(note)
+    summ.append("Click a request to open its details; click it again or ✕ to close them. Filters match text they contain; a leading - excludes (e.g. -Alert).")
+    r = fx_done(sess, used, {"traffic" if kind == "traffic" else "attacks": out}, summ, t0)
+    r["fwblog"] = kind
+    return r
 
 
 # -- FortiWeb security analytics: statistics, ML / API / bot views and insights from the attack log + configuration --
@@ -4867,13 +5173,18 @@ FWB_LOG_KEYS = ("action", "src", "srcip", "src_ip", "client_ip", "main_type", "s
                 "signature_id", "date", "time", "timestamp", "eventtime", "policy", "log_id")
 
 
-def fwb_logs(sess, hours, cap=10000):
-    """Attack log rows of the last `hours`, newest first, paging while the firmware pages (stops at `cap`)
+FWB_TRAFFIC_PATHS = ("/api/v2.0/log/logreport.logaccess.filter?log_type=2&size={n}",
+                     "/api/v2.0/log/logreport.logaccess.filter?log_type=2",
+                     "/api/v2.0/log/logreport.logaccess.filter?log_type=traffic&size={n}")
+
+
+def fwb_logs(sess, hours, cap=10000, kind="attack"):
+    """Attack (or traffic) log rows of the last `hours`, newest first, paging while the firmware pages (stops at `cap`)
     -> (rows, path, note). The paging parameter is found by trying (offset styles first) and checking that the
     next page really starts with other entries."""
     size = 1000
     d, used, tried = None, None, []
-    for p_ in [p.format(n=size) for p in FWB_ATTACK_PATHS]:   # the first path whose answer holds log entries
+    for p_ in [p.format(n=size) for p in (FWB_TRAFFIC_PATHS if kind == "traffic" else FWB_ATTACK_PATHS)]:   # the first path whose answer holds log entries
         try:
             d_ = fx_get(sess, p_)
         except FxError as e:
@@ -4890,7 +5201,7 @@ def fwb_logs(sess, hours, cap=10000):
         tried.append("%s (answered without log entries: %s)" % (p_, ", ".join(sorted(map(str, (
             d_ if isinstance(d_, dict) else (r_[0] if r_ else {})).keys())))[:300]))
     if d is None:
-        raise FxError(404, "no attack-log endpoint answered on this firmware; tried: " + "; ".join(tried))
+        raise FxError(404, "no %s-log endpoint answered on this firmware; tried: " % kind + "; ".join(tried))
     rows, note = fx_rows(d), ""
     total = d.get("total") if isinstance(d, dict) and isinstance(d.get("total"), int) else None
     since = time.time() - hours * 3600
@@ -4924,6 +5235,402 @@ def fwb_logs(sess, hours, cap=10000):
     if len(rows) >= cap:
         note = "read the newest %d entries (limit)" % cap
     return rows[:cap], used, note
+
+
+# ---- FortiWeb OWASP Top 10 compliance, from the attack log: per category, how many attacks were blocked and how many
+# only logged (monitor mode / alert action), and which server policies let them through.
+OWASP_2021 = (("A01", "Broken Access Control"), ("A02", "Cryptographic Failures"), ("A03", "Injection"),
+              ("A04", "Insecure Design"), ("A05", "Security Misconfiguration"), ("A06", "Vulnerable and Outdated Components"),
+              ("A07", "Identification and Authentication Failures"), ("A08", "Software and Data Integrity Failures"),
+              ("A09", "Security Logging and Monitoring Failures"), ("A10", "Server-Side Request Forgery"))
+
+
+# ---- FortiWeb OWASP Top 10 compliance, as FortiWeb evaluates it (Dashboard > OWASP Top 10 Compliance): one
+# policy.evaluate per server policy + web protection profile (content-routing profiles included). The answer is parsed
+# loosely (score, categories, fulfilled / unfulfilled items) because its layout is not documented.
+OWC_CAT_RE = re.compile(r"\bA\d{2}:20\d\d\b")
+OWC_ST_RE = re.compile(r"^(un)?fulfill?ed$|^(not[ _-]?)?(met|passed|compliant|satisfied)$|^(failed|missing|pass|fail)$", re.I)
+
+
+def owc_status(v):
+    if isinstance(v, bool):
+        return v
+    t = str(v).strip().lower()
+    if not OWC_ST_RE.match(t):
+        return None
+    return not (t.startswith("un") or t.startswith("not") or t in ("failed", "missing", "fail"))
+
+
+def owc_items(node, group, out):
+    """Fulfilled / unfulfilled items below a category node -> out [(group, label, ok)]."""
+    if isinstance(node, list):
+        for x in node:
+            if isinstance(x, str):
+                out.append((group, x, None))
+            else:
+                owc_items(x, group, out)
+        return
+    if not isinstance(node, dict):
+        return
+    if not any(re.search(r"name|item|title|label", str(k), re.I) for k in node):   # {item: status, ...}
+        pairs = [(k, v if isinstance(v, bool) else owc_status(v)) for k, v in node.items() if isinstance(v, (bool, str))]
+        pairs = [(k, st_) for k, st_ in pairs if st_ is not None and not re.search(r"^(status|result|state)$", str(k), re.I)]
+        if pairs:
+            out += [(group, str(k), st_) for k, st_ in pairs]
+            for k, v in node.items():
+                if isinstance(v, (dict, list)):
+                    owc_items(v, str(k), out)
+            return
+    st = None
+    for k, v in node.items():
+        if isinstance(v, bool):
+            if re.search(r"fulfil|met|pass|compl|satisf|status|result", str(k), re.I):
+                st = v
+        elif isinstance(v, str) and owc_status(v) is not None:
+            st = owc_status(v)
+    if st is not None:
+        lab = next((str(v) for k, v in node.items() if isinstance(v, str) and owc_status(v) is None and
+                    re.search(r"name|item|title|label|protection|signature|desc|key", k, re.I)), "") or \
+            next((str(v) for v in node.values() if isinstance(v, str) and owc_status(v) is None), "?")
+        out.append((group, lab, st))
+        return
+    for k, v in node.items():
+        kl = str(k).lower()
+        if kl in ("fulfilled", "fulfill", "met", "passed") and isinstance(v, list):
+            out += [(group, x if isinstance(x, str) else json.dumps(x)[:80], True) for x in v]
+        elif kl in ("unfulfilled", "unfulfill", "not_met", "failed", "missing") and isinstance(v, list):
+            out += [(group, x if isinstance(x, str) else json.dumps(x)[:80], False) for x in v]
+        elif isinstance(v, (dict, list)):
+            owc_items(v, str(k) if not OWC_CAT_RE.search(str(k)) else group, out)
+
+
+def owc_parse(d):
+    """policy.evaluate answer -> {"score", "max", "cats": [{"name", "desc", "groups": {group: [[label, ok]]}}]}."""
+    score, mx, cats, seen = None, 10.0, [], set()
+
+    def num(v):
+        m = re.match(r"\s*(\d+(?:\.\d+)?)(?:\s*/\s*(\d+(?:\.\d+)?))?", str(v))
+        return (float(m.group(1)), float(m.group(2)) if m.group(2) else None) if m else (None, None)
+
+    def walk(n, depth=0):
+        nonlocal score, mx
+        if isinstance(n, dict):
+            for k, v in n.items():
+                if score is None and re.search(r"score|rate|compliance|grade", str(k), re.I) and not isinstance(v, (dict, list)):
+                    a, b = num(v)
+                    if a is not None:
+                        score, mx = a, b or mx
+                if OWC_CAT_RE.search(str(k)) and isinstance(v, (dict, list)):
+                    cat(str(k), v)
+                    continue
+                walk(v, depth + 1)
+            name = next((str(v) for v in n.values() if isinstance(v, str) and OWC_CAT_RE.search(v) and len(v) < 120), None)
+            if name and name not in seen:
+                cat(name, n)
+        elif isinstance(n, list):
+            for x in n:
+                walk(x, depth + 1)
+
+    def cat(name, node):
+        if name in seen:
+            return
+        seen.add(name)
+        items = []
+        owc_items(node, "Items", items)
+        desc = ""
+        if isinstance(node, dict):
+            desc = max((str(v) for v in node.values() if isinstance(v, str) and len(v) > 60), key=len, default="")
+        groups = collections.OrderedDict()
+        for g, lab, ok in items:
+            if lab and not OWC_CAT_RE.search(lab):
+                groups.setdefault(hum_key(g), []).append([lab, ok])
+        cats.append({"name": name, "desc": desc[:600], "groups": groups,
+                     "ok": sum(1 for g in groups.values() for x in g if x[1]), "total": sum(len(g) for g in groups.values())})
+    walk(d)
+    cats.sort(key=lambda c: c["name"])
+    return {"score": score, "max": mx, "cats": cats}
+
+
+def hum_key(k):
+    k = re.sub(r"[_\-]+", " ", str(k)).strip()
+    return k[:1].upper() + k[1:] if k else "Items"
+
+
+def fwb_owasp_cfg(sess, vals):
+    t0 = time.time()
+    pols = fx_rows(fx_first(sess, [FWB + "server-policy/policy"])[0])
+    names = [fx_name(p) for p in pols]
+    routes = fx_subrows(sess, FWB + "server-policy/policy/http-content-routing-list?mkey=", names)
+    pairs, skipped = [], []
+    for p in pols:
+        n, prof = fx_name(p), fx_val(p, "web-protection-profile")
+        if prof:
+            pairs.append((n, prof, ""))
+        for rr in routes.get(n) or []:
+            rp = fx_val(rr, "web-protection-profile", "waf-profile", "profile")
+            if rp:
+                pairs.append((n, rp, fx_val(rr, "content-routing-policy-name", "content-routing-policy", "name")))
+        if not prof and not any(fx_val(rr, "web-protection-profile") for rr in routes.get(n) or []):
+            skipped.append(n)
+    pairs = list(dict.fromkeys(pairs))[:150]
+    vdom = sess.get("vdom") or "root"
+    audit(sess, "FortiWeb OWASP Top 10 compliance (%d policy / profile pair(s))" % len(pairs))
+
+    def one(x):
+        pol, prof, rt = x
+        path = "/api/v2.0/policy/policy.evaluate?" + urllib.parse.urlencode({"details": 1, "policy": pol, "vdom": vdom, "waf": prof})
+        try:
+            d = fx_get(sess, path, timeout=60)
+        except (FxError, urllib.error.URLError, OSError) as e:
+            return {"policy": pol, "profile": prof, "routing": rt, "error": str(getattr(e, "reason", e))[:200]}, None
+        r = owc_parse(d)
+        return dict({"policy": pol, "profile": prof, "routing": rt}, **r), d
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        res = list(ex.map(one, pairs))
+    rows = [r for r, _ in res]
+    sample = next((d for r, d in res if d is not None), None)
+    ok = [r for r in rows if not r.get("error")]
+    full = sum(1 for r in ok if r.get("score") is not None and r["score"] >= (r.get("max") or 10))
+    part = len(ok) - full
+    errs = [r for r in rows if r.get("error")]
+    notes = ["FortiWeb's own OWASP Top 10 evaluation of %d server policy / web protection profile pair(s) (content routing "
+             "included): %d partially, %d fully compliant." % (len(pairs), part, full)]
+    if skipped:
+        notes.append("Not evaluated (no web protection profile): " + ", ".join(skipped[:20]))
+    if errs:
+        notes.append("%d evaluation(s) failed, e.g. %s: %s" % (len(errs), errs[0]["policy"], errs[0]["error"]))
+    if ok and not any(r["cats"] for r in ok):
+        notes.append("The evaluation answered, but its categories were not recognised: the raw answer of the first one is "
+                     "in the table 'raw first evaluation' (copy it to adjust the parser).")
+    notes.append("Click a policy to see each category's attack signature and required protection items.")
+    data = {"owasp_compliance": [{"policy": r["policy"], "web_protection_profile": r["profile"], "content_routing": r["routing"],
+                                  "compliance_rate": ("%.1f / %.0f" % (r["score"], r["max"])) if r.get("score") is not None else "",
+                                  "unfulfilled": sum(r2[1] is False for c in r.get("cats", []) for g in c["groups"].values() for r2 in g),
+                                  "error": r.get("error", "")} for r in rows],
+            "unfulfilled_items": [{"policy": r["policy"], "profile": r["profile"], "category": c["name"], "group": g, "item": it[0]}
+                                  for r in ok for c in r["cats"] for g, its in c["groups"].items() for it in its if it[1] is False][:500]}
+    if sample is not None and not any(r["cats"] for r in ok):
+        data["raw_first_evaluation"] = json.dumps(sample, default=str)[:20000]
+    out = {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
+           "request": "GET /api/v2.0/policy/policy.evaluate (per policy / profile)",
+           "verdict": {"label": "%d PARTIALLY / %d FULLY COMPLIANT" % (part, full), "kind": "warn" if part else "ok" if ok else "bad"},
+           "summary": notes, "data": data}
+    out["owaspc"] = {"rows": rows, "partial": part, "full": full}
+    return out
+
+
+def fwb_owasp(sess, v):
+    t0 = time.time()
+    rng = str(v.get("range") or "24h")
+    if rng not in SECDASH_RANGES:
+        raise ValueError("range must be one of: " + ", ".join(SECDASH_RANGES))
+    hours = SECDASH_RANGES[rng]
+    raw, used, note = fwb_logs(sess, hours)
+    audit(sess, "FortiWeb OWASP Top 10 compliance %s" % rng)
+    rows = [fx_clean(r) for r in raw]
+    tsv = [x for x in (fwb_ts(r) for r in rows) if x]
+    since = (max(tsv) if tsv else time.time()) - hours * 3600
+    g = lambda r, *ks: next((str(r[k]) for k in ks if r.get(k) not in (None, "", "N/A", "n/a")), "")   # noqa: E731
+    cat = {k: {"n": 0, "blk": 0, "pol": collections.Counter(), "sig": collections.Counter()} for k, _ in OWASP_2021}
+    api, unmapped, total = collections.Counter(), 0, 0
+    gaps = collections.defaultdict(lambda: {"n": 0, "cats": collections.Counter(), "hosts": collections.Counter()})
+    for r in rows:
+        ts = fwb_ts(r)
+        if ts is not None and ts < since:
+            continue
+        total += 1
+        ow, oa = g(r, "owasp_top10"), g(r, "owasp_api_top10")
+        if oa:
+            api[oa] += 1
+        m = re.match(r"\s*(A\d{2})", ow)
+        if not m or m.group(1) not in cat:
+            unmapped += 1
+            continue
+        c = cat[m.group(1)]
+        blocked = bool(FWB_BLOCK_RE.search(g(r, "action")))
+        c["n"] += 1
+        c["blk"] += blocked
+        sig = (g(r, "main_type") + (" · " + g(r, "sub_type") if g(r, "sub_type") else "")).strip(" ·") or g(r, "msg")[:60]
+        if sig:
+            c["sig"][sig] += 1
+        if not blocked:
+            pol = g(r, "policy") or "(no policy)"
+            c["pol"][pol] += 1
+            gaps[pol]["n"] += 1
+            gaps[pol]["cats"][m.group(1)] += 1
+            gaps[pol]["hosts"][g(r, "http_host", "host", "hostname") or "?"] += 1
+    out, n_gap, n_seen = [], 0, 0
+    for k, name in OWASP_2021:
+        c = cat[k]
+        pct = 100.0 * c["blk"] / c["n"] if c["n"] else None
+        status = ("no attacks seen" if not c["n"] else "blocked" if c["blk"] == c["n"] else
+                  "mostly logged only" if pct < 50 else "partly logged only")
+        n_seen += bool(c["n"])
+        n_gap += bool(c["n"] and c["blk"] < c["n"])
+        out.append({"category": "%s:2021 %s" % (k, name), "attacks": c["n"], "blocked": c["blk"],
+                    "logged_only": c["n"] - c["blk"], "blocked_%": round(pct, 1) if pct is not None else "",
+                    "status": status, "let_through_by": ", ".join("%s (%d)" % kv for kv in c["pol"].most_common(3)),
+                    "top_attack_types": ", ".join("%s (%d)" % kv for kv in c["sig"].most_common(3))})
+    pol_rows = [{"server_policy": p, "logged_only_attacks": x["n"],
+                 "owasp_categories": ", ".join("%s (%d)" % kv for kv in x["cats"].most_common()),
+                 "hostnames": ", ".join("%s (%d)" % kv for kv in x["hosts"].most_common(3))}
+                for p, x in sorted(gaps.items(), key=lambda kv: -kv[1]["n"])]
+    span = {"1h": "hour", "6h": "6 hours", "24h": "24 hours", "3d": "3 days", "7d": "7 days"}[rng]
+    notes = ["Attack log of the last %s: %s attack(s), %s mapped to an OWASP Top 10 (2021) category by FortiWeb."
+             % (span, "{:,}".format(total), "{:,}".format(total - unmapped)),
+             "Blocked = deny, block, redirect, reset, captcha or period block. Logged only = the request was allowed "
+             "(alert action or a policy in monitor mode): those are the compliance gaps.",
+             "This shows how attacks that reached FortiWeb were handled; a category with no attacks is not proof that "
+             "it is protected (check the protection profile)."]
+    if note:
+        notes.append(note)
+    data = {"owasp_top_10_2021": out, "server_policies_letting_attacks_through": pol_rows}
+    if api:
+        data["owasp_api_top_10"] = [{"category": k, "attacks": n} for k, n in api.most_common()]
+    label = ("%d OF %d OWASP CATEGORIES WITH ATTACKS LET THROUGH" % (n_gap, n_seen) if n_gap else
+             "ALL %d OWASP CATEGORIES SEEN WERE BLOCKED" % n_seen if n_seen else "NO OWASP-MAPPED ATTACKS IN THE RANGE")
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "GET " + str(used),
+            "verdict": {"label": label, "kind": "bad" if n_gap else "ok"}, "summary": notes, "data": data}
+
+
+# ---- FortiWeb performance dashboard: CPU, memory, disk gauges and connection / throughput figures from the system
+# status endpoints. Field names differ between firmware releases, so metrics are matched by name.
+FWB_RES_PATHS = ("/api/v2.0/system/status.monitor", "/api/v2.0/system/dashboard.sysres", "/api/v2.0/system/status.sysres",
+                 "/api/v2.0/system/status.systemstatus")
+FWB_RES_METRICS = (  # (key, label, format, name pattern)
+    ("cpu", "CPU", "pct", r"(^|[._])cpu([._]?(usage|used|util\w*|percent|load))?$"),
+    ("mem", "Memory", "pct", r"(^|[._])mem(ory)?([._]?(usage|used|util\w*|percent))?$"),
+    ("disk", "Log disk", "pct", r"(^|[._])(log[._]?)?disk([._]?(usage|used|util\w*|percent))?$"),
+    ("conn", "Concurrent connections", "num", r"(concurrent|current|tcp|active)[._]?conn(ection)?s?$|(^|[._])conn(ection)?s?$|(^|[._])sessions?$"),
+    ("cps", "Connections / s", "num", r"conn(ection)?s?[._]?(per[._]?s(ec(ond)?)?|rate)$|(^|[._])cps$"),
+    ("rps", "HTTP requests / s", "num", r"(http[._]?)?req(uest)?s?[._]?(per[._]?s(ec(ond)?)?|rate)$|(^|[._])(rps|tps)$"),
+    ("thr", "Throughput", "num", r"throughput|(^|[._])(bandwidth|traffic)$"))
+
+
+def fwb_flat(v, pre="", out=None):
+    out = {} if out is None else out
+    if isinstance(v, dict):
+        for k, x in v.items():
+            fwb_flat(x, (pre + "." if pre else "") + str(k).lower(), out)
+    elif isinstance(v, list):
+        if len(v) == 1:
+            fwb_flat(v[0], pre, out)
+    elif v not in (None, ""):
+        out.setdefault(pre, v)
+    return out
+
+
+def fwb_num(v):
+    m = re.match(r"\s*(-?\d+(?:\.\d+)?)", str(v))
+    return float(m.group(1)) if m else None
+
+
+# ---- FortiWeb local certificates: name, subject, issuer, expiry (days left), soonest first ----
+def fwb_cert_time(v):
+    """Expiry text -> epoch; FortiWeb shows e.g. 'Dec 31 23:59:59 2026 GMT', '2026-12-31 23:59:59' or an epoch."""
+    if v in (None, ""):
+        return None
+    if isinstance(v, (int, float)) or str(v).strip().isdigit():
+        n = float(v)
+        return n / 1000 if n > 1e11 else n
+    t = str(v).strip()
+    try:
+        return ssl.cert_time_to_seconds(t)   # "Dec 31 23:59:59 2026 GMT"
+    except ValueError:
+        pass
+    for fmt, n in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%dT%H:%M:%S", 19), ("%Y/%m/%d %H:%M:%S", 19), ("%b %d %H:%M:%S %Y", 20),
+                   ("%Y-%m-%d", 10), ("%Y/%m/%d", 10)):
+        try:
+            return calendar.timegm(time.strptime(t[:n], fmt))
+        except ValueError:
+            continue
+    m = re.search(r"(\d{4})[-/](\d\d)[-/](\d\d)", t)
+    return calendar.timegm((int(m.group(1)), int(m.group(2)), int(m.group(3)), 0, 0, 0)) if m else None
+
+
+def fwb_certs(sess, vals):
+    t0 = time.time()
+    spec = fx_spec(sess, vals["_check"])
+    d, used = fx_first(sess, spec["fx"])
+    term = vals.get("filter") or ""
+    pick = lambda r, *pats: next((fx_val(r, k) for k in r for pt in pats if re.search(pt, str(k), re.I) and fx_val(r, k) not in ("", None)), "")   # noqa: E731
+    now, rows, findings = time.time(), [], []
+    for r in fx_rows(d):
+        if not isinstance(r, dict) or not fx_match(r, term):
+            continue
+        name = fx_name(r) or pick(r, r"^name$", r"mkey")
+        exp_raw = pick(r, r"valid.?to|not.?after|expir|end.?date|valid.?until|validity.?end")
+        exp = fwb_cert_time(exp_raw)
+        days = int((exp - now) // 86400) if exp else None
+        state = "" if days is None else "EXPIRED" if days < 0 else "expires soon" if days <= 30 else "ok"
+        rows.append({"name": name, "subject": pick(r, r"^subject$", r"subject"), "issuer": pick(r, r"^issuer$", r"issuer"),
+                     "expires": time.strftime("%Y-%m-%d", time.gmtime(exp)) if exp else str(exp_raw or ""),
+                     "days_left": days if days is not None else "", "status": state})
+        if days is not None and days <= 30:
+            findings.append(finding("high" if days < 0 else "medium", name, ("expired %d day(s) ago" % -days) if days < 0 else
+                                    "expires in %d day(s) (%s)" % (days, rows[-1]["expires"])))
+    rows.sort(key=lambda r: (r["days_left"] if r["days_left"] != "" else 10 ** 6, str(r["name"]).lower()))
+    exp_n = sum(1 for r in rows if r["status"] == "EXPIRED")
+    soon = sum(1 for r in rows if r["status"] == "expires soon")
+    out = fx_done(sess, used, dict({"certificates": rows}, **({"findings": findings} if findings else {})),
+                  ["%d local certificate(s)%s; %d expired, %d expire within 30 days. Soonest first." % (
+                      len(rows), " matching '%s'" % term if term else "", exp_n, soon)], t0)
+    out["verdict"] = {"label": "%d EXPIRED · %d EXPIRE WITHIN 30 DAYS" % (exp_n, soon) if exp_n or soon else
+                      "%d CERTIFICATE(S), NONE EXPIRING WITHIN 30 DAYS" % len(rows), "kind": "bad" if exp_n else "warn" if soon else "ok"}
+    return out
+
+
+def fwb_resources(sess, vals):
+    t0 = time.time()
+    flat, used = {}, []
+    for path in FWB_RES_PATHS:
+        try:
+            d = fx_get(sess, path)
+        except (FxError, urllib.error.URLError, OSError):
+            continue
+        used.append(path)
+        for k, x in fwb_flat(fx_clean(d)).items():
+            flat.setdefault(k, x)
+    if not used:
+        return fx_generic(sess, vals)
+    tiles, findings, metrics, taken = [], [], [], set()
+    for key, label, fmt, pat in FWB_RES_METRICS:
+        rx = re.compile(pat, re.I)
+        hit = next(((k, fwb_num(x)) for k, x in flat.items() if k not in taken and rx.search(k) and fwb_num(x) is not None
+                    and (fmt != "pct" or 0 <= fwb_num(x) <= 100)), None)
+        if not hit:
+            continue
+        k, val = hit
+        taken.add(k)
+        unit = str(flat.get(k)).strip()[len(str(val).rstrip("0").rstrip(".")):].strip() if fmt == "num" else "%"
+        sev = ("high" if val >= 90 else "medium" if val >= 80 else None) if fmt == "pct" else None
+        tiles.append({"label": label, "value": round(val, 1), "fmt": fmt, "kind": {"high": "bad", "medium": "warn"}.get(sev, ""),
+                      "sub": unit if fmt == "num" and unit and not unit[0].isdigit() else ""})
+        metrics.append({"metric": label, "value": ("%.1f%%" % val) if fmt == "pct" else "{:,}".format(val).rstrip("0").rstrip("."),
+                        "status": {"high": "HIGH", "medium": "warning"}.get(sev, "ok") if fmt == "pct" else "", "field": k})
+        if sev:
+            findings.append(finding(sev, label, "%s at %.0f%%: %s" % (label, val, "90% or more, close to the limit; check traffic "
+                                    "peaks and what is using it" if sev == "high" else "above 80%, watch it")))
+    if not tiles:
+        r = fx_generic(sess, vals)
+        if r.get("ok"):
+            r.setdefault("summary", []).append("No CPU / memory / disk field was recognised in this firmware's answer; the "
+                                              "raw values are shown.")
+        return r
+    audit(sess, "FortiWeb performance dashboard")
+    worst = "high" if any(f.get("severity") == "high" for f in findings) else "medium" if findings else ""
+    pct = {t["label"]: t["value"] for t in tiles if t["fmt"] == "pct"}
+    label = " · ".join("%s %.0f%%" % (k.upper(), v) for k, v in pct.items()) or "PERFORMANCE"
+    rest = {k: x for k, x in flat.items() if k not in taken and not isinstance(x, (dict, list))}
+    data = {"metrics": metrics}
+    if findings:
+        data["findings"] = findings
+    data["other_values"] = [{"field": k, "value": x} for k, x in sorted(rest.items())][:150]
+    return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000), "request": "GET " + ", ".join(used),
+            "verdict": {"label": label, "kind": "bad" if worst == "high" else "warn" if worst else "ok"},
+            "summary": ["Current values from %s. Gauges turn amber at 80%% and red at 90%%." % ", ".join(used),
+                        "FortiWeb names these fields differently per firmware; the field each figure comes from is in the table."],
+            "data": data, "tiles": tiles}
 
 
 def fwb_stats(sess, vals):
@@ -5834,10 +6541,10 @@ PAN_HANDLERS = {"pan_nat_rules": pan_nat_rules, "pan_static_routes": pan_static_
                 "f5_perf": f5_perf, "f5_vs_top": f5_vs_top, "pan_app_traffic": pan_app_traffic,
                 "pan_snat": pan_snat, "fg_snat": fg_snat, "f5_snat": f5_snat_lookup, "f5_conns": f5_conns,
                 "f5_irules": f5_irules, "adv_config": lambda s_, v_: adv_config(s_, v_), "secdash": lambda s_, v_: secdash_run(s_, v_),
-                "sw_overview": sw_overview, "sw_alerts": sw_alerts, "sw_nodes": sw_nodes, "sw_node_issues": sw_node_issues,
+                "sw_overview": sw_overview, "sw_insights": sw_insights, "sw_alerts": sw_alerts, "sw_nodes": sw_nodes, "sw_node_issues": sw_node_issues,
                 "sw_node": sw_node, "sw_iface_issues": sw_iface_issues, "sw_iface_top": sw_iface_top,
                 "fx_generic": fx_generic, "fwb_policies": fwb_policies, "fwb_attacks": fwb_attacks, "fad_vs": fad_vs,
-                "fwb_stats": fwb_stats, "fwb_mlapi": fwb_mlapi,
+                "fwb_stats": fwb_stats, "fwb_mlapi": fwb_mlapi, "fwb_owasp": fwb_owasp, "fwb_owasp_cfg": fwb_owasp_cfg, "fwb_resources": fwb_resources, "fwb_traffic": fwb_traffic, "fwb_certs": fwb_certs,
                 "fx_find": fx_find}
 
 
@@ -8810,6 +9517,226 @@ F5_SEC_TOPS = (("ip", "Source IP addresses", True), ("tci", "True-Client-IP (rea
 F5_SEC_RULES = (("type", "Attack types"), ("vio", "Violations"), ("sig", "Signatures"))
 
 
+# ---- F5 ASM request log counted by the device ----------------------------------------------------------------
+# A busy unit logs hundreds of thousands of requests a week; reading them over REST is not practical. When the device
+# reports totalItems and filters by time, totals and the chart are counted there (exact), and the top lists come from a
+# sample spread evenly over the range. Both abilities are probed and checked once per session.
+F5_CNT_TIME = (("requestDatetime", "'%Y-%m-%dT%H:%M:%SZ'"), ("requestDatetime", "'%Y-%m-%dT%H:%M:%S'"),
+               ("requestDatetime", "%Y-%m-%dT%H:%M:%SZ"), ("occurrenceTime", "'%Y-%m-%dT%H:%M:%SZ'"))
+F5_CNT_STEP = {1: 300, 6: 900, 24: 3600, 72: 7200, 168: 14400}   # chart buckets when counting on the device
+
+
+def f5_asm_count(sess, flt, cap):
+    """Entries matching flt, counted by the device (totalItems); None if it does not say."""
+    q = "/mgmt/tm/asm/events/requests?" + ("$filter=%s&" % urllib.parse.quote(flt) if flt else "") + "$top=1" + cap["extra"]
+    try:
+        st, ok, d = rest_get(sess, q, 60)
+    except (urllib.error.URLError, OSError):
+        return None
+    n = d.get("totalItems") if ok and isinstance(d, dict) else None
+    if isinstance(n, bool):
+        return None
+    if isinstance(n, int) or (isinstance(n, str) and n.isdigit()):
+        return int(n)
+    return None
+
+
+def f5_asm_tf(cap, op, epoch):
+    """Time condition in the form this device accepts; epoch is real time, shifted to the device's clock."""
+    field, fmt = cap["tf"]
+    return "%s %s %s" % (field, op, time.strftime(fmt, time.gmtime(epoch + cap.get("off", 0))))
+
+
+def f5_asm_countcap(sess):
+    """Probe once per hour per session: does the device count matching entries and filter them by time?"""
+    cap = sess.get("asm_cnt")
+    if isinstance(cap, dict) and time.time() - cap.get("t", 0) < 3600:
+        return cap
+    cap = {"t": time.time(), "ok": False, "extra": "", "tf": None, "off": 0, "why": ""}
+    total = None
+    for extra in ("&$select=id", "", "&$inlinecount=allpages"):
+        cap["extra"] = extra
+        total = f5_asm_count(sess, "", cap)
+        if total is not None:
+            break
+    if total is None:
+        cap["why"] = "this F5 does not report how many log entries match (totalItems)"
+        sess["asm_cnt"] = cap
+        return cap
+    now = time.time()
+    # A device that logs local time without a zone: its newest entry looks like it is in the future. Only a forward
+    # shift is taken as the clock difference (an older newest entry may just mean a quiet unit).
+    try:
+        _, ok, d = rest_get(sess, "/mgmt/tm/asm/events/requests?$orderby=requestDatetime%20desc&$top=1" + cap["extra"], 60)
+        its = d.get("items") if ok and isinstance(d, dict) else None
+        ts = to_epoch(first(its[0], "requestDatetime", "occurrenceTime", "dateTime", "time")) if its else None
+        if ts and ts - now > 600:
+            cap["off"] = int(round((ts - now) / 900.0)) * 900
+    except (urllib.error.URLError, OSError):
+        pass
+    tol = max(100, total // 100)
+    for tf in F5_CNT_TIME:
+        cap["tf"] = tf
+        if f5_asm_count(sess, f5_asm_tf(cap, "gt", now + 86400), cap) != 0:
+            continue
+        c = now - 3600
+        nh, nl = f5_asm_count(sess, f5_asm_tf(cap, "gt", c), cap), f5_asm_count(sess, f5_asm_tf(cap, "lt", c), cap)
+        if nh is None or nl is None or abs(nh + nl - total) > tol:
+            continue
+        if nh:   # the oldest entry the filter returns must be just after the cut-off
+            try:
+                _, ok, d = rest_get(sess, "/mgmt/tm/asm/events/requests?$filter=%s&$orderby=%s%%20asc&$top=1"
+                                    % (urllib.parse.quote(f5_asm_tf(cap, "gt", c)), tf[0]), 60)
+            except (urllib.error.URLError, OSError):
+                continue
+            its = d.get("items") if ok and isinstance(d, dict) else None
+            ts = to_epoch(first(its[0], "requestDatetime", "occurrenceTime", "dateTime", "time")) if its else None
+            if ts is None or ts < c + cap["off"] - 120 or (nh > 200 and ts > c + cap["off"] + 1800):
+                continue
+        cap["ok"] = True
+        break
+    if not cap["ok"]:
+        cap.update(tf=None, why="this F5 does not filter the request log by time")
+    sess["asm_cnt"] = cap
+    return cap
+
+
+def f5_sec_events(sess, items, t0, budget=110):
+    """ASM log entries -> dashboard events (violation details read for up to 300 blocked / alerted ones)."""
+    pcache, acache, enriched = {}, {}, 0
+    status_of = lambda i: str(first(i, "requestStatus", "enforcementState") or "unknown").lower()   # noqa: E731
+    sample = [i for i in items if status_of(i) not in ASM_STATUS["passed"]]
+    with_v = sum(1 for i in sample if i.get("violations"))
+    for i in sample:
+        if i.get("violations") or enriched >= 300 or time.time() - t0 > budget - 5:
+            continue
+        if asm_enrich(sess, i):
+            enriched += 1
+    evs = []
+    for i in items:
+        stt = status_of(i)
+        stt = "blocked" if stt in ASM_STATUS["blocked"] else "alerted" if stt in ASM_STATUS["alerted"] else \
+            "passed" if stt in ASM_STATUS["passed"] else stt
+        pol = f5_ref_name(sess, i.get("requestPolicyReference"), pcache) if i.get("requestPolicyReference") else ""
+        pol = str(pol or first(i, "policyName", "policy") or "")
+        info = asm_attack(sess, i, acache) if i.get("violations") and time.time() - t0 < budget else ([], [], [], set())
+        ua = next((v for k, v in asm_http(i)[1] if k == "user-agent"), "") if i.get("rawRequest") else ""
+        geo = first(i, "geolocation", "geoLocation", "countryCode", "geoCountry", "clientCountry")
+        evs.append({"ts": to_epoch(first(i, "requestDatetime", "occurrenceTime", "dateTime", "time")), "action": stt,
+                    "svc": pol.split("/")[-1] if pol else "(no policy)", "mit": stt == "blocked",
+                    "t": {"ip": str(i.get("clientIp") or ""), "tci": asm_header_ip(i), "host": asm_hostname(i),
+                          "path": str(first(i, "url", "uri") or "").split("?")[0], "country": str(geo or ""),
+                          "method": str(i.get("method") or "").upper(), "code": str(i.get("responseCode") or ""),
+                          "rating": str(i.get("violationRating") or ""), "ua": ua[:120]},
+                    "r": {"type": info[0], "vio": info[2], "sig": info[1]}})
+    return evs, sample, with_v, enriched
+
+
+def f5_secdash_counted(sess, b, rng, hours, f, cap, t0, spec):
+    """Security dashboard with totals and chart counted by the F5 and top lists from a spread sample."""
+    now = time.time()
+    start = now - hours * 3600
+    step = F5_CNT_STEP.get(hours, 3600)
+    nb = int(hours * 3600 / step)
+    edges = [start + i * step for i in range(nb)]
+    sflt = {a: asm_status_flt(sess, a) for a in ("blocked", "alerted", "passed")}
+    jobs = [("total", "", 0)] + [(a, sflt[a], i) for a in ("blocked", "alerted", "passed") if sflt[a] for i in range(nb)]
+    deadline = t0 + 75
+
+    def cnt(job):
+        a, sf, i = job
+        if time.time() > deadline:
+            return None
+        tf = f5_asm_tf(cap, "gt", edges[i])
+        return f5_asm_count(sess, "%s and %s" % (sf, tf) if sf else tf, cap)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        got = dict(zip([(a, i) for a, _, i in jobs], ex.map(cnt, jobs)))
+    total = got.get(("total", 0))
+    series, exact = {}, {}
+    for a in ("blocked", "alerted", "passed"):
+        cum = [got.get((a, i)) for i in range(nb)] if sflt[a] else []
+        if cum and None not in cum:
+            exact[a] = cum[0]
+            series[a] = [max(0, cum[i] - (cum[i + 1] if i + 1 < nb else 0)) for i in range(nb)]
+    # sample: up to 12 windows across the range, newest entries of each window
+    nwin = min(12, nb)
+    wedge = [start + (now - start) * k / nwin for k in range(nwin + 1)]
+    per = max(50, min(500, 2400 // nwin))
+
+    def win(k):
+        if time.time() > t0 + 95:
+            return []
+        flt = "%s and %s" % (f5_asm_tf(cap, "gt", wedge[k]), f5_asm_tf(cap, "lt", wedge[k + 1]))
+        try:
+            _, ok, d = rest_get(sess, "/mgmt/tm/asm/events/requests?$filter=%s&$orderby=%s%%20desc&$top=%d"
+                                % (urllib.parse.quote(flt), cap["tf"][0], per), 60)
+        except (urllib.error.URLError, OSError):
+            return []
+        return d.get("items", []) if ok and isinstance(d, dict) else []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        items = [i for part in ex.map(win, range(nwin)) for i in part]
+    evs, sample, with_v, enriched = f5_sec_events(sess, items, t0, budget=115)
+    allev = len(evs)
+    evs = [e for e in evs if secdash_match(e, f)]
+    spec = dict(spec, svc_title=spec["svc_title"] + " · sample",
+                rules_title=spec["rules_title"] + " · sample")
+    dash, data = secdash_build(evs, hours, spec)
+    dash["ctx"] = {"vendor": "f5", "range": rng, "filters": f}
+    dash["tops"] = [[t + " · sample", rows, k] for t, rows, k in dash["tops"]]
+    counted = not f and total is not None and series
+    if counted:
+        keys = [time.strftime("%m-%d %H:%M" if hours > 24 else "%H:%M", time.localtime(e + step)) for e in edges]
+        acts = [a for a in ("blocked", "alerted", "passed") if a in series and (exact.get(a) or a != "passed")]
+        spark = lambda a: series.get(a, [0] * nb)   # noqa: E731
+        tiles = [{"label": "Total events", "value": total, "prev": None, "fmt": "num",
+                  "spark": [sum(series[a][i] for a in series) for i in range(nb)]}]
+        for a in acts:
+            tiles.append({"label": a.capitalize(), "value": exact[a], "prev": None, "fmt": "num", "spark": spark(a)})
+        dash.update(bucket={300: "5 minutes", 900: "15 minutes", 3600: "1 hour", 7200: "2 hours", 14400: "4 hours"}[step],
+                    t=keys, tiles=tiles, actions=[[a, series[a]] for a in acts])
+        pct = lambda c: "%.1f%%" % (100.0 * c / total) if total else ""   # noqa: E731
+        data["headline"] = {t["label"]: "{:,}".format(t["value"]) for t in tiles}
+        data["events_by_action"] = [{"action": a, "events": exact[a], "share": pct(exact[a])} for a in acts]
+    span = {"1h": "hour", "6h": "6 hours", "24h": "24 hours", "3d": "3 days", "7d": "7 days"}[rng]
+    notes = []
+    if counted:
+        notes.append("ASM request log, the last %s: %s request(s), counted by the F5 (totals and chart are exact)."
+                     % (span, "{:,}".format(total)))
+        if len(series) < len([a for a in sflt if sflt[a]]):
+            notes.append("Some per-status counts did not finish in time; those statuses are left out of the chart.")
+        notes.append("Policies, top lists, attack types, violations and signatures: from a sample of %s request(s), the "
+                     "newest of each of %d equal time slices of the range (counts and %% are of the sample)."
+                     % ("{:,}".format(allev), nwin))
+    else:
+        notes.append("ASM request log, the last %s; a sample of %s request(s) spread over the range%s." % (
+            span, "{:,}".format(allev), (", %d matching %s" % (len(evs), ", ".join("%s = %s" % kv for kv in f.items())))
+            if f else ""))
+        if f:
+            notes.append("With a filter the dashboard shows the matching requests of the sample, not exact totals.")
+        elif total is None or not series:
+            notes.append("The F5 did not finish counting in time; the figures are from the sample only.")
+    notes.append("Violation details: %d blocked / alerted request(s) carried them, %d full record(s) read." % (with_v, enriched))
+    if f.get("rule") and len(sample) > with_v + enriched:
+        notes.append("The attack type / violation / signature filter can only match the %d request(s) whose details were "
+                     "read." % (with_v + enriched))
+    if cap.get("off"):
+        notes.append("This F5 logs local time without a time zone (%+.1f h); the range was shifted to match." % (cap["off"] / 3600.0))
+    notes.append("Times are this PC's local time.")
+    if not any(e["t"]["country"] for e in evs):
+        notes.append("No country in these log entries (the logging profile or this TMOS version does not include "
+                     "geolocation in the list view).")
+    tot_v = total if counted else len(evs)
+    blk = exact.get("blocked") if counted else sum(1 for e in evs if e["mit"])
+    alr = exact.get("alerted", 0) if counted else sum(1 for e in evs if e["action"] == "alerted")
+    r = {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
+         "request": "GET /mgmt/tm/asm/events/requests (counted on the device, sampled in %d slices)" % nwin,
+         "verdict": {"label": "%s ASM REQUESTS · %s BLOCKED · %s ALERTED" % (
+             "{:,}".format(tot_v), "{:,}".format(blk or 0), "{:,}".format(alr or 0)),
+             "kind": "warn" if (blk or alr) else "ok"}, "summary": notes, "data": data}
+    r["secdash"] = dash
+    return r
+
+
 def f5_secdash(sess, b):
     """ASM request log over the range, newest first (bounded); violations / attack types / signatures come from the
     full record of up to F5_SEC_ENRICH blocked or alerted requests when the list view leaves them out."""
@@ -8830,6 +9757,12 @@ def f5_secdash(sess, b):
             return {"ok": False, "status": st0, "error": "request log query failed (HTTP %s). Is ASM / Advanced WAF "
                     "provisioned and does the account have access?" % st0}
         order = ""
+    spec = {"order": ("blocked", "alerted", "passed"), "mit_label": "Blocked", "mit_actions": {"blocked"},
+            "svc_title": "Events by security policy", "tops": F5_SEC_TOPS, "rules": F5_SEC_RULES,
+            "rules_title": "Attack types, violations and signatures"}
+    cap = f5_asm_countcap(sess)
+    if cap.get("ok"):
+        return f5_secdash_counted(sess, b, rng, hours, f, cap, t0, spec)
     items, prev, capped, path = [], None, True, base
     for skip in range(0, 20000, 500):
         if time.time() - t0 > 75:
@@ -8846,37 +9779,9 @@ def f5_secdash(sess, b):
         if len(page) < 500 or (order and page and not asm_recent(page[-1], cutoff)):
             capped = False
             break
-    pcache, acache, enriched = {}, {}, 0
-    status_of = lambda i: str(first(i, "requestStatus", "enforcementState") or "unknown").lower()   # noqa: E731
-    sample = [i for i in items if status_of(i) not in ASM_STATUS["passed"]]
-    with_v = sum(1 for i in sample if i.get("violations"))
-    for i in sample:
-        if i.get("violations") or enriched >= 300 or time.time() - t0 > 105:
-            continue
-        if asm_enrich(sess, i):
-            enriched += 1
-    evs = []
-    for i in items:
-        stt = status_of(i)
-        stt = "blocked" if stt in ASM_STATUS["blocked"] else "alerted" if stt in ASM_STATUS["alerted"] else \
-            "passed" if stt in ASM_STATUS["passed"] else stt
-        pol = f5_ref_name(sess, i.get("requestPolicyReference"), pcache) if i.get("requestPolicyReference") else ""
-        pol = str(pol or first(i, "policyName", "policy") or "")
-        info = asm_attack(sess, i, acache) if i.get("violations") and time.time() - t0 < 110 else ([], [], [], set())
-        ua = next((v for k, v in asm_http(i)[1] if k == "user-agent"), "") if i.get("rawRequest") else ""
-        geo = first(i, "geolocation", "geoLocation", "countryCode", "geoCountry", "clientCountry")
-        evs.append({"ts": to_epoch(first(i, "requestDatetime", "occurrenceTime", "dateTime", "time")), "action": stt,
-                    "svc": pol.split("/")[-1] if pol else "(no policy)", "mit": stt == "blocked",
-                    "t": {"ip": str(i.get("clientIp") or ""), "tci": asm_header_ip(i), "host": asm_hostname(i),
-                          "path": str(first(i, "url", "uri") or "").split("?")[0], "country": str(geo or ""),
-                          "method": str(i.get("method") or "").upper(), "code": str(i.get("responseCode") or ""),
-                          "rating": str(i.get("violationRating") or ""), "ua": ua[:120]},
-                    "r": {"type": info[0], "vio": info[2], "sig": info[1]}})
+    evs, sample, with_v, enriched = f5_sec_events(sess, items, t0)
     allev = len(evs)
     evs = [e for e in evs if secdash_match(e, f)]
-    spec = {"order": ("blocked", "alerted", "passed"), "mit_label": "Blocked", "mit_actions": {"blocked"},
-            "svc_title": "Events by security policy", "tops": F5_SEC_TOPS, "rules": F5_SEC_RULES,
-            "rules_title": "Attack types, violations and signatures"}
     dash, data = secdash_build(evs, hours, spec)
     dash["ctx"] = {"vendor": "f5", "range": rng, "filters": f}
     nviol = sum(1 for e in evs if e["action"] != "passed")
@@ -8893,6 +9798,8 @@ def f5_secdash(sess, b):
     if capped:
         notes.append("Read %d log entries (limit / time) before reaching the start of the range: older requests are not "
                      "counted. Choose a shorter range for full coverage." % len(items))
+    if cap.get("why"):
+        notes.append("Exact counts were not possible: %s, so the newest entries were read instead." % cap["why"])
     if not any(e["t"]["country"] for e in evs):
         notes.append("No country in these log entries (the logging profile or this TMOS version does not include "
                      "geolocation in the list view).")
@@ -10228,7 +11135,7 @@ def device_hostname(sess):
             h = (d.get("results") or {}).get("hostname") if ok and isinstance(d, dict) else ""
         else:
             _, ok, d = pan_op(sess, "<show><system><info/></system></show>")
-            h = (((d.get("response") or {}).get("result") or {}).get("system") or {}).get("hostname") if ok else ""
+            h = (((d.get("response") or d).get("result") or {}).get("system") or {}).get("hostname") if ok and isinstance(d, dict) else ""
     except (urllib.error.URLError, OSError, AttributeError, ValueError):
         h = ""
     return str(h or sess["name"])
@@ -13428,7 +14335,9 @@ def llm_tools():
         cat = CATALOG[v]
         vt("run_check", "run one read-only check from the console catalog. Checks: %s" % "; ".join(
             "%s = %s%s" % (c["id"], c["label"], " (params: %s)" % ", ".join(
-                x["name"] + ("" if x.get("required", True) else "?") for x in c.get("params", [])) if c.get("params") else "")
+                x["name"] + ("" if x.get("required", True) else "?") +
+                ("=" + "|".join(ch[0] for ch in x["choices"]) if x.get("choices") else "")
+                for x in c.get("params", [])) if c.get("params") else "")
             for c in cat), {"check": S("check id", enum=[c["id"] for c in cat]),
                             "params": {"type": "object", "description": "parameters of the check by name"}}, ["check"])
         if v in ("paloalto", "fortigate"):
@@ -14074,6 +14983,7 @@ header small{color:var(--dim)}
 .wrap.lcol>#lpane .panebar{flex-direction:column-reverse;position:sticky;top:12px;margin:0}.wrap.lcol>#lpane .panebar span{flex:none;writing-mode:vertical-rl}
 .wrap.rcol{grid-template-rows:auto 1fr}.wrap.rcol>#rpane>:not(.panebar){display:none}.wrap.rcol>#lpane{grid-row:1/3}
 .wrap.rcol>.outcard{grid-column:2;grid-row:2;align-self:start}
+@media(min-width:901px){.wrap:has(>#rpane.menu){grid-template-rows:auto 1fr}.wrap:has(>#rpane.menu)>#lpane{grid-row:1/3}.wrap:has(>#rpane.menu)>.outcard{grid-column:2;grid-row:2;align-self:start}}
 @media(max-width:900px){.wrap.lcol{grid-template-columns:1fr}.wrap.lcol>#lpane .panebar{flex-direction:row}
  .wrap.lcol>#lpane .panebar span{flex:1;writing-mode:horizontal-tb}.wrap.rcol>#lpane{grid-row:auto}.wrap.rcol>.outcard{grid-column:1;grid-row:auto}}
 /* Decorative emblem in the empty space below the sidebar; stays in view while the right column scrolls. */
@@ -14106,7 +15016,29 @@ border:1px solid transparent;cursor:pointer}
 .grp{margin:12px 0 4px;color:var(--mint);font-size:12px;letter-spacing:.1em;text-transform:uppercase}
 .chkrow{display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px dashed #2a285088;flex-wrap:wrap}
 .chkrow .lbl{flex:1 1 220px}
-.chkrow input{width:130px;padding:5px 8px}
+.chkrow input,.chkrow select{width:130px;padding:5px 8px}
+.vhide{display:none!important}#rpane.menu #main>h3,#rpane.menu #main .grp,#rpane.menu .card.multi>h3{display:none}
+#viewhdr{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 12px;font-size:14px;color:var(--dim)}#viewhdr[hidden]{display:none}
+#viewhdr .vhdev{background:var(--dc);color:var(--dt);font-weight:700;padding:3px 10px;border-radius:8px}#viewhdr b{color:var(--text)}
+#devs{display:flex;flex-direction:column;gap:5px;margin-bottom:10px}
+.dgrp{border-radius:10px;overflow:hidden;background:var(--panel2);border:1px solid var(--line)}
+.dghead{display:flex;align-items:center;gap:8px;padding:5px 10px 5px 12px;font-size:13.5px;background:var(--dc);color:var(--dt);cursor:pointer;font-weight:700;user-select:none}
+.dghead .dgname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dghead .dgbad{background:#fff;color:#d93025;font-size:11px;font-weight:800;border-radius:9px;padding:0 6px;line-height:16px}.dghead .dgbad[hidden]{display:none}
+.dghead .dgtag{font-size:10px;font-weight:600;opacity:.85;text-transform:uppercase;letter-spacing:.04em}
+.dghead .dgcar{width:14px;text-align:center;transition:transform .15s}.dgrp.open .dghead .dgcar{transform:rotate(180deg)}
+.dghead .dgx{background:none;border:0;color:inherit;opacity:0;padding:0 4px;font-size:13px;cursor:pointer;width:auto}.dghead:hover .dgx,.dghead .dgx:focus{opacity:.85}
+.dgrp.sel{box-shadow:0 0 0 2px var(--dc)}
+.dgbody{padding:3px 5px 5px;display:flex;flex-direction:column;gap:1px}
+#devs .dgbody button{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:6px;width:100%;padding:3px 8px;border-radius:6px;font-size:12.5px;color:var(--text);cursor:pointer;line-height:1.3}
+#devs .dgbody button:hover{background:color-mix(in srgb,var(--dc) 12%,transparent)}#devs .dgbody button:focus-visible{outline:2px solid var(--dc)}
+#devs .dgbody .dgsec{font-weight:700}.dgbody .dgsec::after{content:"\203A";margin-left:auto;transition:transform .15s;opacity:.6}.dgbody .dgsec.open::after{transform:rotate(90deg)}
+#devs .dgbody .dgic{width:16px;height:16px;flex:0 0 16px;fill:none;stroke:color-mix(in srgb,var(--dc) 80%,var(--text));stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+#devs .dgbody .dgit.sub{padding-left:30px;color:var(--dim)}#devs .dgbody .dgit.on{background:color-mix(in srgb,var(--dc) 18%,transparent);color:var(--text);font-weight:700;box-shadow:inset 3px 0 0 var(--dc)}
+.dgcol{display:flex;align-items:center;gap:5px;flex-wrap:wrap;padding:6px 8px 2px;margin-top:3px;border-top:1px dashed var(--line);font-size:12px;color:var(--dim)}
+#devs .dgcol .sw{all:unset;display:inline-block;padding:0;width:16px;height:16px;border-radius:50%;cursor:pointer;box-shadow:inset 0 0 0 1px #0002}#devs .dgcol .sw.on{box-shadow:0 0 0 2px var(--panel2),0 0 0 4px var(--text)}
+.addbox{margin-top:4px}.addbox>summary{cursor:pointer;font-weight:700;padding:8px 2px;color:var(--dim);list-style:none}.addbox>summary::-webkit-details-marker{display:none}
+.addbox[open]>summary{color:var(--text)}.dgnote{font-size:12px;color:var(--dim);padding:6px 8px}
 pre{margin:0;background:#07061380;border:1px solid var(--line);border-radius:10px;padding:12px;
 max-height:560px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace}
 .meta{display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap;color:var(--dim);font-size:12px}
@@ -14164,7 +15096,58 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 #pretty .dleg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
 #pretty .dleg b{color:var(--text);font-weight:600;margin-left:4px}
 #pretty svg .hv{fill:transparent}#pretty svg .hv:hover{fill:#ffffff12}
-#pretty .secbar{display:flex;height:16px;border-radius:4px;overflow:hidden;margin-top:8px;background:var(--line)}.secbar span{display:block;height:100%;cursor:pointer;min-width:2px}.secleg{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px}.secleg span{cursor:pointer}.secleg i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}.dash h4.dsub{margin:14px 0 6px;font-size:13px}.dash select.secrange{width:auto;padding:2px 6px;font-size:12px;margin-right:8px}.dtop{display:grid;grid-template-columns:minmax(0,1fr) 30% auto;gap:6px 10px;align-items:center;font-size:12.5px}
+#pretty .secbar{display:flex;height:16px;border-radius:4px;overflow:hidden;margin-top:8px;background:var(--line)}.secbar span{display:block;height:100%;cursor:pointer;min-width:2px}.secleg{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px}.secleg span{cursor:pointer}.secleg i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}.dash h4.dsub{margin:14px 0 6px;font-size:13px}
+.owhead{font-weight:700;padding:8px 10px}.owbar{display:inline-flex;gap:2px;vertical-align:middle}.owbar i{width:9px;height:10px;background:var(--line);display:inline-block}
+.owbar i.r{background:var(--bad)}.owbar i.a{background:#e0a800}.owbar i.g{background:var(--ok)}
+.owcat{border-top:1px solid var(--line);padding:6px 0}.owcat summary{cursor:pointer;display:flex;gap:8px;align-items:center;padding:4px 0}.owcat summary b{flex:1}
+.owcat .owok{color:var(--ok);font-size:12px}.owcat .owno{color:var(--warn);font-size:12px}.owcat p{margin:4px 0 8px;font-size:12.5px}
+.owg{font-weight:600;margin:8px 0 4px;font-size:13px}.owit{display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:6px;font-size:12.5px;padding:2px 0}
+.owit.y .owi{color:var(--ok)}.owit.n .owi,.owit.n .ows{color:var(--bad)}.owit .ows{color:var(--dim)}
+.fwlbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.fwlbar select,.fwlbar input,.fwlbar button{width:auto;flex:0 0 auto}
+.fwlbar #wl_value{flex:1 1 220px;min-width:160px}.fwlbar .fwln{width:80px}
+.fwlchips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:10px 0 2px}
+.fwlchips .fchip{display:inline-flex;align-items:center;gap:2px;padding:2px 4px 2px 10px;border:1px solid var(--mint);border-radius:999px;font-size:12px}
+.fwlchips .fchip .fx,.fwlchips .fclr{all:unset;cursor:pointer;color:var(--mint);padding:0 6px;font-size:14px}.fwlchips .fclr{font-size:12px;border:1px solid var(--mint);border-radius:999px;padding:1px 10px}
+.fwl{display:grid;grid-template-columns:minmax(0,1fr);gap:12px;margin-bottom:14px;align-items:start}.fwl.open{grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr)}
+.fwl:not(.open)>.fwdet{display:none}.fwdh .fwdx{background:none;border:0;color:var(--dim);font-size:16px;padding:2px 6px;box-shadow:none}.fwdh .fwdx:hover{color:var(--text);background:none}
+.fwlist{overflow:auto;max-height:70vh;border:1px solid var(--line);border-radius:8px}
+#pretty .fwlist table{width:100%;border-collapse:collapse;font-size:12.5px}#pretty .fwlist th{position:sticky;top:0;z-index:1}
+#pretty .fwlist td{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+#pretty .fwlist tr.on td{background:color-mix(in srgb,var(--mint) 18%,transparent)!important}
+.fwdet{border:1px solid var(--line);border-radius:8px;padding:10px 12px;position:sticky;top:10px;max-height:70vh;overflow:auto}
+.fwdh{display:flex;align-items:center;gap:8px;margin-bottom:8px}.fwdh b{flex:1}.fwdh button{width:auto;flex:0 0 auto}
+.fwkv>div{display:grid;grid-template-columns:minmax(110px,42%) minmax(0,1fr);gap:8px;padding:3px 0;border-bottom:1px dashed var(--line);font-size:12.5px}
+.fwkv .k{color:var(--dim)}.fwkv .v{overflow-wrap:anywhere}.fwkv .na .v{color:var(--dim)}
+@media (max-width:1100px){.fwl{grid-template-columns:1fr}.fwdet{position:static}}
+.swi{display:flex;flex-direction:column;gap:14px;margin-bottom:14px}.swibar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.swibar select{width:auto}
+.swicard{border:1px solid var(--line);border-radius:10px;padding:10px 14px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.swicard h4.dsub{margin:2px 0 6px;font-size:13px}
+.swirow{display:grid;grid-template-columns:44px minmax(0,1.2fr) minmax(0,2fr) auto;gap:12px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.swirow:nth-child(2){border-top:0}
+.swiscore{font:700 14px ui-monospace,Consolas,monospace;text-align:center;border-radius:8px;padding:5px 0}
+.swiscore.c{background:#d930251f;color:var(--bad)}.swiscore.w{background:#f0a8302a;color:var(--warn)}.swiscore.i{background:var(--panel2);color:var(--dim)}
+.swidash{margin-top:12px;margin-bottom:0}.swidash>.swibar h4.dsub{margin:0;font-size:13px;letter-spacing:.06em;text-transform:uppercase}
+.swi div.swinode{display:flex;flex-direction:column;min-width:0}.swi div.swinode b{overflow-wrap:anywhere}.swi div.swinode small{color:var(--dim);font-size:12.5px}
+.swiresp{border-collapse:collapse;font-size:12.5px;width:100%}.swiresp th{text-align:left;color:var(--dim);font-weight:500;padding:4px 10px 4px 0;border-bottom:1px solid var(--line)}
+.swiresp td{padding:4px 10px 4px 0;border-bottom:1px dashed var(--line)}.swiresp td.n{font:500 12.5px ui-monospace,Consolas,monospace;white-space:nowrap}.swiresp td.bad{color:var(--bad)}
+#pretty .swi button.swinode{all:unset;cursor:pointer;display:flex;flex-direction:column;min-width:0;color:var(--text)}#pretty .swi button.swinode:hover b,#pretty .swi button.swinode:hover{background:none;color:var(--text);box-shadow:none;border:0;text-decoration:underline}
+#pretty .swi button.swinode:focus-visible{outline:2px solid var(--mint)}#pretty .swi button.swinode b{overflow-wrap:anywhere}#pretty .swi button.swinode small{color:var(--dim);font-size:12.5px}
+.swiwhy{display:flex;flex-wrap:wrap;gap:5px}.swiwhy span{font-size:12px;padding:1px 8px;border-radius:6px;background:var(--panel2);white-space:nowrap}
+.swiwhy span.hot{background:#d930251f;color:var(--bad)}
+.swiage{font:500 13px ui-monospace,Consolas,monospace;color:var(--dim);white-space:nowrap}
+.swikpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.swikpi{border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:2px;min-width:0}
+.swikpi .l{font-size:12px;color:var(--dim)}.swikpi .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+.swikpi .d{font:500 12px ui-monospace,Consolas,monospace;color:var(--dim);overflow-wrap:anywhere}.swikpi .d.up{color:var(--bad)}.swikpi .d.down{color:var(--ok)}
+.swiscroll{overflow-x:auto}:is(#pretty,#dashbody) table.swiheat{border-collapse:separate;border-spacing:3px;font-size:12px;width:auto}:is(#pretty,#dashbody) table.swiheat tr td,:is(#pretty,#dashbody) table.swiheat tr th{background:none;border:0}
+:is(#pretty,#dashbody) table.swiheat th{font-weight:500;color:var(--dim);text-align:left;white-space:nowrap;padding:2px 8px 2px 0;max-width:140px;overflow:hidden;text-overflow:ellipsis}
+:is(#pretty,#dashbody) table.swiheat tr:first-child th{text-align:center;font-size:11px}
+:is(#pretty,#dashbody) table.swiheat td{min-width:46px;height:26px;border-radius:5px;text-align:center;font:600 11.5px ui-monospace,Consolas,monospace}
+:is(#pretty,#dashbody) table.swiheat tr td.tot{background:none;color:var(--dim)}
+:is(#pretty,#dashbody) table.swiheat tr td.h0{background:var(--panel2)}:is(#pretty,#dashbody) table.swiheat tr td.h1{background:#f0a83033}:is(#pretty,#dashbody) table.swiheat tr td.h2{background:#f0a83080}
+:is(#pretty,#dashbody) table.swiheat tr td.h3{background:#d95926c0;color:#fff}:is(#pretty,#dashbody) table.swiheat tr td.h4{background:#c42b1c;color:#fff}
+.swiflap{font:700 10px ui-monospace,Consolas,monospace;color:var(--warn);margin-left:6px}
+@media (max-width:760px){.swirow{grid-template-columns:40px minmax(0,1fr) auto}.swirow .swiwhy{grid-column:2/-1;grid-row:2}}.dash select.secrange{width:auto;padding:2px 6px;font-size:12px;margin-right:8px}.dash .fchips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 10px}.dash .fchips:empty{display:none}.dash .fchip{display:inline-flex;align-items:center;gap:2px;max-width:100%;padding:2px 4px 2px 10px;border:1px solid var(--mint);border-radius:999px;font-size:12px}.dash .fchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px}.dash .fchip .fx,.dash .fclr{width:auto;margin:0;padding:0 6px;border:0;background:none;color:var(--mint);font-size:14px;line-height:18px;cursor:pointer}.dash .fclr{font-size:12px;border:1px solid var(--mint);border-radius:999px;padding:1px 10px}.dash .fchip .fx:hover,.dash .fclr:hover{color:var(--red,#d92d20)}.dtop{display:grid;grid-template-columns:minmax(0,1fr) 30% auto;gap:6px 10px;align-items:center;font-size:12.5px}
 #pretty .dtop .dn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#pretty .dtop .dn.lnk{cursor:pointer;color:var(--mint)}
 #pretty .dtop .db{height:6px;border-radius:3px;background:var(--panel2)}#pretty .dtop .db span{display:block;height:6px;border-radius:3px;background:#3987e5}
 #pretty .dtabs{display:flex;gap:6px;flex-wrap:wrap}#pretty .dtabs button.on{border-color:var(--violet);box-shadow:0 0 12px #7C6CFF33;color:var(--mint)}
@@ -14268,12 +15251,13 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 .apill{font-size:11.5px;padding:0 7px;border-radius:9px;font-weight:600;white-space:nowrap;border:1px solid transparent}
 .apill.a-c{color:var(--bad);border-color:var(--bad)}.apill.a-h{color:var(--warn);border-color:var(--warn)}.apill.a-k{background:var(--bad);color:#fff}.apill.a-m{color:var(--dim);border-color:var(--line)}
 #advpanel{margin:0;padding:12px 24px 14px;border-bottom:1px solid var(--line);background:var(--panel2);max-height:62vh;overflow:auto;font-size:13px}
-#advpanel .ahead{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}#advpanel .ahead h3{margin:0;font-size:15px;flex:1;min-width:200px}
-#advpanel select{width:auto}#advpanel .abox{border:1px solid var(--line);border-left:4px solid var(--mint);border-radius:8px;padding:8px 12px;margin:0 0 10px;background:var(--panel)}
-#advpanel .abox.eol{border-left-color:var(--bad)}#advpanel table{border-collapse:collapse;width:100%;font-size:12.5px;background:var(--panel)}
-#advpanel th{text-align:left;color:var(--dim);font-weight:600;border-bottom:1px solid var(--line);padding:5px 8px;white-space:nowrap;position:sticky;top:-12px;background:var(--panel)}
-#advpanel td{border-bottom:1px solid var(--line);padding:5px 8px;vertical-align:top}#advpanel td.nw{white-space:nowrap}
-#advpanel a{color:var(--mint)}#advpanel .afoot{margin-top:10px;color:var(--dim);font-size:12px;line-height:1.5}
+:is(#advpanel,#advdev) .ahead{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}:is(#advpanel,#advdev) .ahead h3{margin:0;font-size:15px;flex:1;min-width:200px}
+:is(#advpanel,#advdev) select{width:auto}:is(#advpanel,#advdev) .abox{border:1px solid var(--line);border-left:4px solid var(--mint);border-radius:8px;padding:8px 12px;margin:0 0 10px;background:var(--panel)}
+:is(#advpanel,#advdev) .abox.eol{border-left-color:var(--bad)}:is(#advpanel,#advdev) table{border-collapse:collapse;width:100%;font-size:12.5px;background:var(--panel)}
+:is(#advpanel,#advdev) th{text-align:left;color:var(--dim);font-weight:600;border-bottom:1px solid var(--line);padding:5px 8px;white-space:nowrap;position:sticky;top:-12px;background:var(--panel)}
+:is(#advpanel,#advdev) td{border-bottom:1px solid var(--line);padding:5px 8px;vertical-align:top}:is(#advpanel,#advdev) td.nw{white-space:nowrap}
+:is(#advpanel,#advdev) a{color:var(--mint)}:is(#advpanel,#advdev) .afoot{margin-top:10px;color:var(--dim);font-size:12px;line-height:1.5}
+#advdev .card{font-size:13px;overflow-x:auto}#advdev th{position:static}
 /* ---- Operations dashboard ---- */
 #fwbv{position:fixed;inset:0;z-index:56;background:var(--bg);color:var(--text);overflow:auto;padding-bottom:24px}#fwbv[hidden]{display:none}
 #ftv{position:fixed;inset:0;z-index:57;background:var(--bg);color:var(--text);overflow:auto;padding-bottom:24px}#ftv[hidden]{display:none}
@@ -14478,7 +15462,9 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 <div id="monpanel" hidden></div><div id="montoasts" aria-live="assertive"></div>
 <div class="wrap" id="wrap">
 <div id="lpane">
-  <div class="panebar"><span>Devices &amp; connect</span><button id="lpane_btn" onclick="paneToggle('l')" title="Collapse this pane" aria-label="Collapse the devices pane">«</button></div>
+  <div class="panebar"><span>Devices</span><button id="lpane_btn" onclick="paneToggle('l')" title="Collapse this pane" aria-label="Collapse the devices pane">«</button></div>
+  <div id="vault"></div><div id="devs" class="muted">No devices connected.</div>
+  <details id="addbox" class="addbox"><summary>＋ Add device · saved profiles · session</summary>
   <div class="card"><h3>Saved device profiles</h3>
     <select id="profiles"><option value="">Loading profiles…</option></select>
     <div class="row" style="margin-top:8px"><button onclick="useProfile()">Use</button>
@@ -14487,7 +15473,6 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
     <div id="perr" class="err"></div>
     <p class="muted" style="margin:8px 0 0">Only device details are saved locally. Passwords, usernames, and API keys are never stored in profiles.</p>
   </div>
-  <div class="card"><h3>Devices</h3><div id="vault"></div><div id="devs" class="muted">No devices connected.</div></div>
   <div class="card"><h3>Connect</h3>
     <label>Vendor</label>
     <select id="vendor"><option value="f5">F5 BIG-IP (iControl REST)</option>
@@ -14514,6 +15499,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
   <div class="card"><h3>Session</h3>
     <button onclick="showAudit()">View audit log</button>
     <p class="muted" style="margin:8px 0 0">Credentials stay in memory of the Python process. Closing it clears everything.</p></div>
+  </details>
   <div class="bglogo" aria-hidden="true"><svg viewBox="0 0 280 350">
     <defs><linearGradient id="bgl-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient>
     <linearGradient id="bgl-sw" x1="1" y1="0" x2="0" y2="0"><stop offset="0" stop-color="#2EE6C5" stop-opacity=".28"/><stop offset="1" stop-color="#2EE6C5" stop-opacity="0"/></linearGradient></defs>
@@ -14535,10 +15521,11 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 </div>
 <div id="rpane">
   <div class="panebar"><span>Checks &amp; tools</span><button id="rpane_btn" onclick="paneToggle('r')" title="Collapse this pane: the output moves up" aria-label="Collapse the checks pane">Hide ▴</button></div>
-  <div id="fwbtools"></div><div id="sshtool"></div><div id="terms"></div><div id="cftools"></div><div id="acc"></div><div id="appsec"></div>
-  <div id="iplookup"></div><div id="f5tools"></div>
+  <div id="viewhdr" hidden></div><div id="devmon" data-it="mon"></div><div id="advdev" data-it="chk:advcfg"></div>
+  <div id="fwbtools" data-it="anl"></div><div id="fwblog" data-it="fwblog fwbtraf"></div><div id="swtools"></div><div id="sshtool" data-it="ssh"></div><div id="terms" data-it="ssh"></div><div id="cftools"></div><div id="acc" data-it="acc"></div><div id="appsec"></div>
+  <div id="iplookup"></div><div id="f5tools" data-it="tools"></div>
   <div class="card" id="main"><h3>Checks</h3><div class="muted">Connect a device to begin.</div></div>
-  <div class="card"><h3>Raw read-only query</h3>
+  <div class="card" data-it="raw"><h3>Raw read-only query</h3>
     <div class="row"><input id="raw" placeholder="" style="flex:5"><button style="flex:1" onclick="runRaw()">Run</button></div>
     <div id="rawhint" class="muted" style="margin-top:6px"></div></div>
 </div>
@@ -14659,13 +15646,147 @@ async function connect(){$("#cerr").textContent="Connecting…";
  $("#cerr").textContent=(r.vendor==="cloudflare"?"Token sees "+r.zones.length+" zone(s) in "+r.accounts+" account(s)."+(r.note?" Note: "+r.note:""):"")+
   (r.remember_error?" Connected, but the login was not saved: "+r.remember_error:r.remembered?" Login saved (encrypted).":"");
  $("#password").value="";$("#apikey").value="";$("#vpass").value="";
- devices.push(r);select(r.id);if(r.remembered)vaultLoad()}
+ devices.push(r);openDev=r.id;select(r.id);if(r.remembered)vaultLoad()}
 async function disconnect(id,ev){ev.stopPropagation();await api("/api/disconnect",{id});
  devices=devices.filter(d=>d.id!==id);if(cur===id)cur=devices.length?devices[0].id:null;renderAll()}
 function select(id){cur=id;try{sessionStorage.setItem("cur",id||"")}catch(e){}renderAll()}
 function dev(){return devices.find(d=>d.id===cur)}
-function renderAll(){renderDevs();renderChecks();renderFwb();renderSsh();renderCf();renderAcc();renderAppsec();renderIp();renderF5();const d=dev();
- $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:""}
+// ---- SolarWinds NOC attention board (check "insights"): ranked attention list, KPIs vs previous period, noisy-node heatmap.
+function swInsights(range){const d=dev();if(!d||d.vendor!=="solarwinds")return;try{localStorage.setItem("swi_range",range)}catch(e){}
+ run((catalog.solarwinds||[]).find(c=>c.id==="insights"),{range:{value:range}})}
+function swNode(name){const c=(catalog.solarwinds||[]).find(x=>x.id==="node");if(c&&name)run(c,{node:{value:name}})}
+function swInsNode(w,dash){const root=mk("div","swi"+(dash?" swidash":""));
+ const nodeEl=(name,cls)=>{if(dash){const x=mk("div",cls);x.title=name;return x}const b=mk("button",cls);b.type="button";b.title="Open "+name;b.onclick=()=>swNode(name);return b};
+ const span={"24h":"24 hours","7d":"7 days","30d":"30 days"}[w.range]||w.range;
+ if(dash){const h=mk("div","swibar");h.appendChild(mk("h4","dsub","NOC attention board"));h.appendChild(mk("span","muted","alert history, last "+span+" compared with the "+span+" before · follows the range picker below"));root.appendChild(h);
+  if(w.error){root.appendChild(mk("div","dline k-warn","Could not read the alert history: "+w.error));return root}}
+ const bar=mk("div","swibar"),rs=mk("select");rs.setAttribute("aria-label","Time range");
+ [["24h","Last 24 hours"],["7d","Last 7 days"],["30d","Last 30 days"]].forEach(([v,l])=>{const o=mk("option",null,l);o.value=v;rs.appendChild(o)});
+ rs.value=w.range;rs.onchange=()=>swInsights(rs.value);bar.appendChild(rs);if(!dash){
+ bar.appendChild(mk("span","muted","Compared with the previous "+({"24h":"24 hours","7d":"7 days","30d":"30 days"}[w.range]||w.range)+" · click a node for its detail"));root.appendChild(bar)}
+ // 1. needs attention now
+ const at=mk("div","swicard");at.appendChild(mk("h4","dsub","Needs attention now"));
+ if(!w.attention.length)at.appendChild(mk("div","muted","No active alert. Nothing needs action."));
+ w.attention.forEach(a=>{const r=mk("div","swirow"),sc=mk("span","swiscore "+(a.score>=75?"c":a.score>=50?"w":"i"),String(a.score));sc.title="Attention score (0-100)";r.appendChild(sc);
+  const n=nodeEl(a.node,"swinode");n.appendChild(mk("b",null,a.node));n.appendChild(mk("small",null,a.alert+(a.object&&a.object!==a.node?" · "+a.object:"")));r.appendChild(n);
+  const wy=mk("span","swiwhy");a.why.forEach(t=>wy.appendChild(mk("span",(a.hot||[]).includes(t)?"hot":null,t)));r.appendChild(wy);
+  r.appendChild(mk("span","swiage",a.age));at.appendChild(r)});
+ root.appendChild(at);
+ // 2. KPIs with the change against the previous period (for times: lower is better)
+ const k=mk("div","swikpis");w.kpis.forEach(x=>{const t=mk("div","swikpi");t.appendChild(mk("span","l",x.label));
+  t.appendChild(mk("span","v",x.fmt==="num"?Number(x.value).toLocaleString():String(x.value)));
+  let dl="",cls="";if(x.prev!=null&&x.prev>0){const c=100*(x.value-x.prev)/x.prev;dl=(Math.abs(c)<1?"= ":c>0?"↗ +":"↘ ")+Math.round(c)+"% vs "+x.prev.toLocaleString();cls=Math.abs(c)<1?"":c>0?"up":"down"}
+  else if(x.sec!=null&&x.prev_sec!=null&&x.prev_sec>0){const c=100*(x.sec-x.prev_sec)/x.prev_sec;dl=Math.abs(c)<1?"= same as before":(c>0?"↗ +":"↘ ")+Math.round(c)+"% vs before";cls=Math.abs(c)<1?"":c>0?"up":"down"}
+  else if(x.note)dl=x.note;t.appendChild(mk("span","d "+cls,dl));if(x.note&&x.prev==null)t.title=x.note;k.appendChild(t)});root.appendChild(k);
+ // 3. noisy nodes: node x alert type
+ if(w.heat.rows.length){const hc=mk("div","swicard");hc.appendChild(mk("h4","dsub","Noisy nodes · alarms triggered by type"));
+  const sc=mk("div","swiscroll"),tb=mk("table","swiheat"),hr=mk("tr");hr.appendChild(mk("th"));w.heat.cols.forEach(c=>{const th=mk("th",null,c);th.title=c;hr.appendChild(th)});hr.appendChild(mk("th",null,"Total"));tb.appendChild(hr);
+  const mx=Math.max(1,...w.heat.rows.flatMap(r=>r.cells));
+  w.heat.rows.forEach(r=>{const tr=mk("tr"),th=mk("th"),b=nodeEl(r.node,"swinode");b.textContent=r.node;th.appendChild(b);
+   if(r.flap){const f=mk("span","swiflap","FLAP");f.title="Has an alarm that keeps triggering and clearing";th.appendChild(f)}tr.appendChild(th);
+   r.cells.forEach((v,i)=>{const lv=v?Math.min(4,1+Math.floor(3.999*v/mx)):0,td=mk("td","h"+lv,v?String(v):"");td.title=r.node+" · "+w.heat.cols[i]+": "+v;tr.appendChild(td)});
+   tr.appendChild(mk("td","tot",String(r.total)));tb.appendChild(tr)});
+  sc.appendChild(tb);hc.appendChild(sc);hc.appendChild(mk("div","muted","A bright row is a sick device, a bright column a noisy alert rule, a bright cell one recurring fault."));root.appendChild(hc)}
+ // 4. response per alarm type (the check's output has it as a table below)
+ if(dash&&(w.response||[]).length){const rc=mk("div","swicard");rc.appendChild(mk("h4","dsub","Response · median time to acknowledge and to clear"));
+  const sc=mk("div","swiscroll"),tb=mk("table","swiresp"),hr=mk("tr");["Alarm type","Times","Acknowledge","Clear","Still open"].forEach(t=>hr.appendChild(mk("th",null,t)));tb.appendChild(hr);
+  w.response.forEach(r=>{const tr=mk("tr");tr.appendChild(mk("td",null,r.alert));tr.appendChild(mk("td","n",String(r.times)));
+   tr.appendChild(mk("td","n"+(r.median_ack==="never"?" bad":""),r.median_ack==="never"?"not acknowledged":r.median_ack));
+   tr.appendChild(mk("td","n"+(r.median_clear==="not cleared"?" bad":""),r.median_clear==="not cleared"?"open":r.median_clear));
+   tr.appendChild(mk("td","n"+(r.still_open?" bad":""),String(r.still_open)));tb.appendChild(tr)});sc.appendChild(tb);rc.appendChild(sc);root.appendChild(rc)}
+ return root}
+// The attention board opens from its check row (Checks > Overview) and shows on the Operations dashboard.
+function renderSw(){const box=$("#swtools");if(box)box.textContent=""}
+// ---- FortiWeb attack log: GUI-style filters, list + log details panel ----
+const FWB_LOGF=[["action","Action","Alert_Deny"],["policy","Server policy","shop-policy"],["service","Service","https"],["ip","Client IP","203.0.113.5"],
+ ["dst","Destination","10.0.0.10"],["host","HTTP host","shop.example.com"],["url","URL","/login"],["method","Method","post"],["country","Country","Saudi Arabia"],
+ ["main","Main type","Signature Detection"],["sub","Sub type","SQL Injection"],["sig","Signature ID","050140001"],["cve","CVE ID","CVE-2021-44228"],
+ ["owasp","OWASP Top10","A03"],["owaspapi","OWASP API Top10","API6"],["level","Threat level","high"],["risk","Client risk","high"],["monitor","Monitor mode","enabled"],
+ ["msg","Message","bot"],["msgid","Message ID","000003120424"],["logid","Log ID","20000051"],["code","Response code","403"],["text","Any field","any text"]];
+// Filters are picked from a drop-down (as in the FortiWeb GUI) and shown as removable chips.
+let fwlF={};
+const FWB_LOGS={action:["Alert","Alert_Deny","Block_IP","Deny","Redirect","Send_403_Forbidden","Period_Block","Captcha","Erase"],method:["get","post","put","delete","head","options","patch"],
+ level:["Critical","High","Medium","Low","Info"],risk:["High","Medium","Low","Unidentified"],monitor:["Enabled","Disabled"],service:["http","https"],
+ owasp:["A01","A02","A03","A04","A05","A06","A07","A08","A09","A10"],owaspapi:["API1","API2","API3","API4","API5","API6","API7","API8","API9","API10"]};
+function fwlKind(){const s=$("#wl_log");return s?s.value:"attack"}
+function renderFwbLog(){const box=$("#fwblog");if(!box)return;box.textContent="";const d=dev();if(!d||d.vendor!=="fortiweb")return;
+ const kind=viewOf(d)==="fwbtraf"?"traffic":"attack",c=mk("div","card"),h3=mk("h3",null,kind==="traffic"?"Traffic log search":"Attack log search");c.appendChild(h3);
+ const ls=mk("select");ls.id="wl_log";ls.setAttribute("aria-label","Log");[["attack","Attack log"],["traffic","Traffic log"]].forEach(([v,t])=>{const o=mk("option",null,t);o.value=v;ls.appendChild(o)});
+ ls.value=kind;ls.onchange=()=>{h3.textContent=ls.value==="traffic"?"Traffic log search":"Attack log search"};
+ const r1=mk("div","fwlbar"),fs=mk("select"),vi=mk("input"),dl=mk("datalist"),add=mk("button",null,"+ Add filter");r1.appendChild(ls);
+ fs.id="wl_field";fs.setAttribute("aria-label","Filter field");vi.id="wl_value";vi.setAttribute("aria-label","Filter value");vi.autocomplete="off";dl.id="wl_vals";vi.setAttribute("list","wl_vals");
+ FWB_LOGF.forEach(([k,l])=>{const o=mk("option",null,l);o.value=k;fs.appendChild(o)});
+ const sync=()=>{const f=FWB_LOGF.find(x=>x[0]===fs.value);vi.placeholder=f?"e.g. "+f[2]:"";dl.innerHTML="";(FWB_LOGS[fs.value]||[]).forEach(v=>{const o=mk("option");o.value=v;dl.appendChild(o)})};
+ fs.onchange=()=>{sync();vi.focus()};sync();
+ const doAdd=()=>{const v=vi.value.trim();if(!v)return;fwlF[fs.value]=v;vi.value="";fwlChips()};add.type="button";add.onclick=doAdd;
+ vi.onkeydown=e=>{if(e.key==="Enter"){e.preventDefault();vi.value.trim()?doAdd():fwbLogSearch()}};
+ const rs=mk("select");rs.id="wl_range";rs.setAttribute("aria-label","Time range");
+ [["1h","Last hour"],["6h","Last 6 hours"],["24h","Last 24 hours"],["3d","Last 3 days"],["7d","Last 7 days"]].forEach(([v,t])=>{const o=mk("option",null,t);o.value=v;rs.appendChild(o)});rs.value="24h";
+ const ni=mk("input");ni.id="wl_count";ni.value="200";ni.title="Max rows";ni.setAttribute("aria-label","Max rows");ni.className="fwln";
+ const go=mk("button","primary","Search");go.type="button";go.onclick=fwbLogSearch;
+ [fs,vi,dl,add,rs,ni,go].forEach(x=>r1.appendChild(x));c.appendChild(r1);
+ const ch=mk("div","fwlchips");ch.id="wl_chips";c.appendChild(ch);
+ c.appendChild(mk("p","muted","Pick a field, type a value, Add. Each filter matches text the field contains; a value starting with - excludes it (e.g. Action -Alert). Enter in the value box adds the filter, or searches when it is empty."));
+ box.appendChild(c);fwlChips()}
+function fwlChips(){const ch=$("#wl_chips");if(!ch)return;ch.textContent="";const ks=Object.keys(fwlF);
+ if(!ks.length){ch.appendChild(mk("span","muted","No filter: every entry in the time range."));return}
+ ks.forEach(k=>{const f=FWB_LOGF.find(x=>x[0]===k)||[k,k],c=mk("span","fchip");c.appendChild(mk("b",null,f[1]+": "));c.appendChild(mk("span",null,fwlF[k]));
+  const x=mk("button","fx","×");x.type="button";x.title="Remove this filter";x.onclick=()=>{delete fwlF[k];fwlChips()};c.appendChild(x);ch.appendChild(c)});
+ const a=mk("button","fclr","Clear all ×");a.type="button";a.onclick=()=>{fwlF={};fwlChips()};ch.appendChild(a)}
+function fwbLogSearch(){const k=fwlKind(),c={id:k==="traffic"?"traffic":"attacks",label:"FortiWeb "+k+" log search"};const ins={};
+ const pend=$("#wl_value");if(pend&&pend.value.trim()){fwlF[g("wl_field")]=pend.value.trim();pend.value="";fwlChips()}
+ FWB_LOGF.forEach(([k])=>{ins[k]={value:fwlF[k]||""}});ins.range={value:g("wl_range")};ins.count={value:g("wl_count")};run(c,ins)}
+const FWB_LOGD=["date","time","msg_id","log_id","policy","service","http_version","http_host","http_method","http_url","monitor_mode","action","threat_level","severity_level",
+ "client_risk","srccountry","cve_id","owasp_top10","owasp_api_top10","main_type","sub_type","signature_subclass","signature_id","msg","src","src_port","dst","dst_port",
+ "http_agent","http_refer","http_request_bytes","http_response_bytes","http_retcode","ja4","backend_service","cipher_suite","user","session_id"];
+const FWB_LOGL={src:"Source",src_port:"Source port",dst:"Destination",dst_port:"Destination port",srccountry:"Source country or region",http_url:"URL",
+ http_host:"HTTP host",http_method:"Method",http_version:"HTTP version",msg:"Message",cve_id:"CVE ID",owasp_top10:"OWASP Top10",owasp_api_top10:"OWASP API Top10",
+ http_agent:"User agent",http_refer:"Referer",http_retcode:"Response code",ja4:"JA4",log_id:"Log ID",msg_id:"Message ID"};
+function fwbLogTime(r){return ((r.date||"")+" "+(r.time||"")).trim()||String(r.timestamp||r.eventtime||"")}
+function fwbLogNode(rows){const w=mk("div","fwl");if(!rows||!rows.length){w.appendChild(mk("div","muted","No entry matches."));return w}
+ const left=mk("div","fwlist"),right=mk("div","fwdet"),tb=mk("table"),hd=mk("tr");
+ const traf=!rows.some(r=>r.main_type||r.sub_type);
+ const cols=[["Date/Time",fwbLogTime],["Policy",r=>r.policy],["Source",r=>r.src||r.srcip||r.client_ip],["Host",r=>r.http_host],["URL",r=>r.http_url],
+  ["Action",r=>r.action]].concat(traf?[["Method",r=>r.http_method],["Code",r=>r.http_retcode||r.return_code||r.status_code]]:[["Main type",r=>r.main_type],["Sub type",r=>r.sub_type]]);
+ cols.forEach(([t])=>hd.appendChild(mk("th",null,t)));tb.appendChild(hd);
+ const close=()=>{w.classList.remove("open");tb.querySelectorAll("tr.on").forEach(x=>x.classList.remove("on"));right.textContent=""};
+ const pick=(r,tr)=>{if(tr.classList.contains("on")){close();return}tb.querySelectorAll("tr.on").forEach(x=>x.classList.remove("on"));tr.classList.add("on");right.textContent="";w.classList.add("open");
+  const h=mk("div","fwdh");h.appendChild(mk("b",null,"Log details"));const ai=mk("button",null,"✦ Analyze with AI");ai.type="button";
+  ai.onclick=()=>{aiToggle(true);aiAsk("chat","Analyze this FortiWeb attack log entry. 1. What the request tried to do. 2. Real attack, bot or likely false positive, and the evidence. 3. Whether the action taken was right. 4. What to change in FortiWeb if anything (which menu, which setting). Entry: "+JSON.stringify(r),"Analyze attack log entry")};
+  h.appendChild(ai);const xb=mk("button","fwdx","✕");xb.type="button";xb.title="Close the details";xb.setAttribute("aria-label","Close the details");xb.onclick=close;h.appendChild(xb);right.appendChild(h);
+  const keys=FWB_LOGD.filter(k=>k in r).concat(Object.keys(r).filter(k=>!FWB_LOGD.includes(k)));
+  const dl=mk("div","fwkv");keys.forEach(k=>{const v=r[k];if(v===null||v===undefined||v===""||(typeof v==="object"))return;
+   const na=/^(n\/a|none|-)$/i.test(String(v));const row=mk("div",na?"na":null);row.appendChild(mk("span","k",FWB_LOGL[k]||hum(k)));row.appendChild(mk("span","v",String(v)));dl.appendChild(row)});
+  right.appendChild(dl)};
+ rows.forEach((r,i)=>{const tr=mk("tr");if(/deny|block|redirect|reset|captcha|period/i.test(String(r.action||"")))tr.classList.add("deny");
+  cols.forEach(([,f])=>{const v=String(f(r)||"");const td=mk("td",null,v);td.title=v;tr.appendChild(td)});tr.tabIndex=0;
+  tr.onclick=()=>pick(r,tr);tr.onkeydown=e=>{if(e.key==="Enter")pick(r,tr)};tb.appendChild(tr)});
+ left.appendChild(tb);w.appendChild(left);w.appendChild(right);return w}
+// ---- FortiWeb OWASP Top 10 compliance (FortiWeb's own evaluation): policies list + per-category details ----
+function owcNode(o){const w=mk("div","fwl"),left=mk("div","fwlist"),right=mk("div","fwdet"),tb=mk("table"),hd=mk("tr");
+ ["Policy name","Web protection profile","Content routing","Compliance rate"].forEach(t=>hd.appendChild(mk("th",null,t)));tb.appendChild(hd);
+ const close=()=>{w.classList.remove("open");tb.querySelectorAll("tr.on").forEach(x=>x.classList.remove("on"));right.textContent=""};
+ const bar=(sc,mx)=>{const b=mk("span","owbar"),n=Math.round(10*sc/(mx||10));for(let i=0;i<10;i++)b.appendChild(mk("i",i<n?(n<=4?"r":n<=7?"a":"g"):null));return b};
+ const pick=(r,tr)=>{if(tr.classList.contains("on")){close();return}tb.querySelectorAll("tr.on").forEach(x=>x.classList.remove("on"));tr.classList.add("on");right.textContent="";w.classList.add("open");
+  const h=mk("div","fwdh");h.appendChild(mk("b",null,"Compliance details"));const xb=mk("button","fwdx","✕");xb.type="button";xb.title="Close";xb.onclick=close;h.appendChild(xb);right.appendChild(h);
+  const kv=mk("div","fwkv");[["Policy name",r.policy],["Web protection profile",r.profile],["Content routing",r.routing||""]].forEach(([k,v])=>{const d=mk("div");d.appendChild(mk("span","k",k));d.appendChild(mk("span","v",v));kv.appendChild(d)});
+  const rd=mk("div");rd.appendChild(mk("span","k","Compliance rate"));const rv=mk("span","v",r.score!=null?r.score+" / "+(r.max||10).toFixed(2)+" ":"n/a");if(r.score!=null)rv.appendChild(bar(r.score,r.max));rd.appendChild(rv);kv.appendChild(rd);right.appendChild(kv);
+  if(r.error)right.appendChild(mk("p","bad",r.error));
+  (r.cats||[]).forEach((c,i)=>{const det=mk("details","owcat");if(i===0)det.open=true;const sm=mk("summary");sm.appendChild(mk("b",null,c.name));
+   sm.appendChild(mk("span",c.total&&c.ok===c.total?"owok":"owno",c.total?c.ok+" / "+c.total+" fulfilled":""));det.appendChild(sm);
+   if(c.desc)det.appendChild(mk("p","muted",c.desc));
+   Object.entries(c.groups||{}).forEach(([gname,its])=>{det.appendChild(mk("div","owg",gname));
+    its.forEach(([lab,ok])=>{const d=mk("div","owit "+(ok===true?"y":ok===false?"n":""));d.appendChild(mk("span","owi",ok===true?"✓":ok===false?"✗":"•"));
+     d.appendChild(mk("span",null,lab));d.appendChild(mk("span","ows",ok===true?"Fulfilled":ok===false?"Unfulfilled":""));det.appendChild(d)})});
+   right.appendChild(det)})};
+ (o.rows||[]).forEach(r=>{const tr=mk("tr");tr.tabIndex=0;[r.policy,r.profile,r.routing||""].forEach(v=>tr.appendChild(mk("td",null,v)));
+  const td=mk("td");if(r.score!=null){td.appendChild(mk("span",null,r.score+" / "+(r.max||10).toFixed(2)+" "));td.appendChild(bar(r.score,r.max))}else td.textContent=r.error?"error":"n/a";tr.appendChild(td);
+  tr.onclick=()=>pick(r,tr);tr.onkeydown=e=>{if(e.key==="Enter")pick(r,tr)};tb.appendChild(tr)});
+ const cap=mk("div","owhead",o.partial+" Partially / "+o.full+" Fully Compliant");left.appendChild(cap);left.appendChild(tb);w.appendChild(left);w.appendChild(right);return w}
+function renderAll(){renderDevs();renderChecks();renderFwb();renderFwbLog();renderSw();renderSsh();renderCf();renderAcc();renderAppsec();renderIp();renderF5();renderDevMon();if(typeof advDevRender==="function")advDevRender();const d=dev();
+ $("#raw").placeholder=d?hints[d.vendor]:"";$("#rawhint").textContent=d?hints[d.vendor]:"";applyView(true)}
+// re-apply the view whenever a tool re-renders itself (attribute changes only, so this does not loop)
+document.addEventListener("DOMContentLoaded",()=>{const rp=$("#rpane");if(rp)new MutationObserver(()=>{if(!avQ){avQ=1;requestAnimationFrame(()=>{avQ=0;applyView()})}}).observe(rp,{childList:true,subtree:true})});
 // Flow trace: its own full-screen view (⇄ beside ▦), not a card under Checks & tools. While it is open the Output card
 // is moved into it (diagram, AI context and "show" keep working) and goes back to its place when it closes.
 let ftOpen=false,ftHome=null;
@@ -14706,17 +15827,139 @@ async function flowTrace(){if(!g("ft_dst").trim())return show({ok:false,error:"e
  setBusy("flow trace on "+devices.length+" device(s)"+($("#ft_logs").checked?" + logs (up to a few minutes)":""));
  show(await api("/api/flowtrace",{src:g("ft_src").trim(),dst:g("ft_dst").trim(),port:g("ft_port"),proto:g("ft_proto"),
   within:g("ft_within"),logs:$("#ft_logs").checked}),"flow trace (all devices)")}
-function renderDevs(){const el=$("#devs");el.innerHTML="";renderFlow();
- if(!devices.length){el.textContent="No devices connected.";return}
- devices.forEach(d=>{const x=document.createElement("div");x.className="dev"+(d.id===cur?" sel":"");
-  x.onclick=()=>select(d.id);
-  const l=document.createElement("span");l.textContent=d.name+" ";
-  const t=document.createElement("span");t.className="tag "+d.vendor;t.textContent=d.vendor;l.appendChild(t);
-  const h=document.createElement("small");h.className="muted";h.textContent=" "+d.host;l.appendChild(h);
-  const b=document.createElement("button");b.textContent="✕";b.onclick=e=>disconnect(d.id,e);
-  x.appendChild(l);x.appendChild(b);el.appendChild(x)})}
+// ---- Devices sidebar: one coloured bar per device; F5 / FortiGate / Palo Alto open into sections whose items
+// show just that tool on the right. Other vendors keep their full page. Colours are per device on this PC (localStorage).
+const DCOL=[["#1a73e8","#fff"],["#188038","#fff"],["#fa903e","#202124"],["#9334e6","#fff"],["#d93025","#fff"],["#007b83","#fff"],
+ ["#f9ab00","#202124"],["#d01884","#fff"],["#5f6368","#fff"]];
+const VSHORT={f5:"F5",fortigate:"FortiGate",paloalto:"Palo Alto",cloudflare:"Cloudflare",fortiweb:"FortiWeb",fortiadc:"FortiADC",solarwinds:"SolarWinds"};
+const MENU={
+ f5:[["Vendor advisory","chk:advcfg"],["Health & alarms","mon"],["SSH to device","ssh"],
+  ["WAF",[["asm","ASM / Advanced WAF request log"],["chk:secdash","Security dashboard"],["waf","WAF posture"]]],
+  ["LTM",[["iplk","IP lookup"],["host","Hostname lookup"],["chk:vstop","Top virtual servers"],["chk:irules","iRules"],["chk:vsall","All virtual servers"],
+   ["chk:vsone","One virtual server stats"],["chk:polsearch","Local traffic policy search"],["chk:snat","Source NAT for an IP"],["chk:poolall","All pool stats"],
+   ["chk:poolmem","Pool member stats"],["chk:conns","Live connections by client IP"]]],
+  ["Audit check",[["audit","Admin audit"]]],
+  ["Troubleshooting",[["tools","F5 active tools"],["raw","Raw read-only query"]]],
+  ["General",[["backup","Configuration backup"],["chk:resutil","Performance dashboard"],["chk:ifaces","Interface stats"],["chk:certs","Certificates (expiry)"],
+   ["chk:sync","Config sync status"],["syncrev","Config sync review"],["sslp","SSL / cert posture"],["chk:failover","Failover status"],["chk:license","License"],
+   ["chk:version","Software version"],["chk:hardware","Hardware / platform"],["chk:tgstats","Traffic-group stats"],["chk:perf","Performance (all stats)"]]]],
+ fortigate:[["Vendor advisory","chk:advcfg"],["Health & alarms","mon"],["SSH to device","ssh"],
+  ["Troubleshooting",[["pol","Policy lookup"],["logs","Traffic log search"],["fc","Flow check (policy match)"],["chk:polstats","Policy hit counts"],
+   ["chk:sessions","Session list"],["raw","Raw read-only query"]]],
+  ["ACC",[["acc","Application Command Center"],["cov","AppSec checks"]]],
+  ["VPN",[["chk:ipsec","IPsec tunnels"]]],
+  ["Network",[["chk:ifaces","Interfaces"],["chk:routes","IPv4 routing table"],["chk:staticroutes","Static routes"],["chk:vips","Virtual IPs"],["chk:snat","Source NAT for an IP"]]],
+  ["Device",[["chk:license","License status"],["chk:resutil","Resource utilization"],["chk:ha","HA peers"],["backup","Backup"],["chk:status","System status"],
+   ["chk:hachk","HA checksums"],["chk:resources","Resource usage (summary)"]]],
+  ["Audit",[["audit","Admin audit"]]]],
+ fortiweb:[["Vendor advisory","chk:advcfg"],["SSH to device","ssh"],
+  ["Security",[["chk:secdash","Security dashboard"],["anl","Open Analytics"],["fwblog","Attack log search"],["fwbtraf","Traffic log search"],["chk:owasp","OWASP Compliance"],
+   ["chk:profiles","Web protection profiles"]]],
+  ["Server policies",[["chk:policies","Server policies"],["chk:vservers","Virtual servers"],["chk:vips","Virtual IPs"],["chk:pools","Server pools"],
+   ["chk:poolmem","Server pool members"],["chk:hosts","Protected hostnames"],["chk:find","Find in configuration"]]],
+  ["General",[["chk:resources","Performance dashboard"],["chk:ifaces","Interfaces"],["chk:ha","HA status / configuration"],["chk:certs","Local certificates"],
+   ["chk:license","License and FortiGuard"],["chk:status","System status"],["raw","Raw read-only query"]]]],
+ paloalto:[["Vendor advisory","chk:advcfg"],["Health & alarms","mon"],["SSH to device","ssh"],
+  ["Troubleshooting",[["pol","Policy lookup"],["logs","Traffic / threat / URL log search"],["fc","Flow check (policy match)"],["chk:sessions","Session list"],
+   ["chk:sessbysrc","Sessions by source IP"],["chk:sessinfo","Session info"],["chk:drops","Global drop counters"],["chk:fib","FIB lookup"],["chk:urlcat","URL category lookup"],
+   ["raw","Raw read-only query"]]],
+  ["ACC",[["acc","Application Command Center"],["cov","AppSec checks"],["chk:apptraffic","Application traffic volume"]]],
+  ["VPN",[["chk:ipsec","IPsec tunnels"],["chk:ikesa","IKE SAs"]]],
+  ["Network",[["chk:ifaces","Interfaces"],["chk:routes","Routing table"],["chk:staticroutes","Static routes"],["chk:nat","Destination NAT (virtual IPs)"],["chk:snat","Source NAT for an IP"]]],
+  ["Device",[["chk:resutil","Resource utilization"],["chk:ha","HA state"],["backup","Backup"],["chk:sysinfo","System info"],["chk:resources","System resources (top)"],["chk:jobs","Jobs"]]],
+  ["Audit",[["audit","Admin audit"]]]]};
+let openDev=null,openSec={},VIEW={};
+// Line icons for the top-level menu entries (24x24, stroked in the device colour).
+const DGI={adv:"M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6zM12 8v5M12 16.5v.5",mon:"M3 12h4l2-5 4 10 2-5h6",
+ ssh:"M3 5h18v14H3zM7 10l3 2-3 2M12 15h5",waf:"M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6zM9 12l2 2 4-4",
+ ltm:"M10 3h4v4h-4zM12 7v4M5 15v-4h14v4M3 15h4v4H3zM10 15h4v4h-4zM17 15h4v4h-4z",audit:"M9 3h6v3H9zM7 5H5v16h14V5h-2M8 11h8M8 15h8M8 19h5",
+ tool:"M14.7 6.3a4 4 0 0 0-5.4 5.4L4 17l3 3 5.3-5.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z",
+ gear:"M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6zM12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1",
+ chart:"M3 20h18M6 20v-8M11 20V5M16 20v-11M21 20v-5",lock:"M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4M12 15v2",
+ net:"M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18z",server:"M4 4h16v6H4zM4 14h16v6H4zM8 7h.01M8 17h.01M12 7h4M12 17h4",
+ more:"M5 12h.01M12 12h.01M19 12h.01"};
+const DGI_OF={Security:"waf","Server policies":"ltm","Vendor advisory":"adv","Health & alarms":"mon","SSH to device":"ssh",WAF:"waf",LTM:"ltm","Audit check":"audit",Audit:"audit",
+ Troubleshooting:"tool",General:"gear",ACC:"chart",VPN:"lock",Network:"net",Device:"server",More:"more"};
+function dgIcon(b,label){const k=DGI_OF[label]||"more",ns="http://www.w3.org/2000/svg",sv=document.createElementNS(ns,"svg"),p=document.createElementNS(ns,"path");
+ sv.setAttribute("viewBox","0 0 24 24");sv.setAttribute("class","dgic");sv.setAttribute("aria-hidden","true");p.setAttribute("d",DGI[k]);sv.appendChild(p);b.insertBefore(sv,b.firstChild)}
+try{VIEW=JSON.parse(sessionStorage.getItem("view")||"{}")||{}}catch(e){}
+function devKey(d){return d.vendor+"|"+String(d.host||"").toLowerCase()}
+function devColMap(){try{return JSON.parse(localStorage.getItem("devcol")||"{}")||{}}catch(e){return {}}}
+function devCol(d){const m=devColMap(),k=devKey(d);let i=m[k];
+ if(i==null||!DCOL[i]){const used=new Set(devices.filter(x=>x!==d).map(x=>m[devKey(x)]));i=DCOL.findIndex((_,j)=>!used.has(j));
+  if(i<0)i=devices.indexOf(d)%DCOL.length;m[k]=i;try{localStorage.setItem("devcol",JSON.stringify(m))}catch(e){}}
+ return {c:DCOL[i][0],t:DCOL[i][1],i}}
+function devSetCol(d,i){const m=devColMap();m[devKey(d)]=i;try{localStorage.setItem("devcol",JSON.stringify(m))}catch(e){}renderDevs();applyView(true)}
+// The menu of a device with the catalog applied: items for checks it does not have are dropped, checks the menu does not
+// name are listed under "More", so nothing disappears.
+function menuOf(d){const base=d&&MENU[d.vendor],cat=d&&catalog&&catalog[d.vendor];if(!base||!cat)return null;
+ const ids=new Set(cat.map(c=>"chk:"+c.id)),seen=new Set(),ok=([id])=>!id.startsWith("chk:")||ids.has(id);
+ const out=base.map(([l,v])=>{if(typeof v==="string"){seen.add(v);return [l,v]}v=v.filter(ok);v.forEach(([id])=>seen.add(id));return [l,v]})
+  .filter(([l,v])=>typeof v==="string"?ok([v]):v.length);
+ const more=cat.filter(c=>!seen.has("chk:"+c.id)).map(c=>["chk:"+c.id,c.label.split(" (")[0]]);
+ if(more.length)out.push(["More",more]);return out}
+function menuItems(d){const m=menuOf(d)||[];return [].concat(...m.map(([l,v])=>typeof v==="string"?[[v,l,null]]:v.map(([id,t])=>[id,t,l])))}
+function viewOf(d){const its=menuItems(d),v=VIEW[d.id];return its.some(x=>x[0]===v)?v:its.some(x=>x[0]==="mon")?"mon":(its[0]||["mon"])[0]}
+function secOf(d,id){const x=menuItems(d).find(y=>y[0]===id);return x?x[2]:null}
+function pickItem(id,item){VIEW[id]=item;if(item==="fwblog"||item==="fwbtraf"){const s_=$("#wl_log");if(s_){s_.value=item==="fwbtraf"?"traffic":"attack";s_.onchange()}}try{sessionStorage.setItem("view",JSON.stringify(VIEW))}catch(e){}
+ const d=devices.find(x=>x.id===id),s=d&&secOf(d,item);if(s)(openSec[id]=openSec[id]||new Set()).add(s);openDev=id;
+ if(cur!==id){select(id);return}renderDevs();applyView(true);const r=$("#rpane");if(r&&r.getBoundingClientRect().top<0)r.scrollIntoView({block:"start"})}
+function devClick(d){if(cur!==d.id){openDev=d.id;select(d.id)}else{openDev=openDev===d.id?"":d.id;renderDevs()}}
+function renderDevs(){const el=$("#devs");el.innerHTML="";el.classList.remove("muted");renderFlow();
+ if(!devices.length){el.classList.add("muted");el.textContent="No devices connected.";const a=$("#addbox");if(a)a.open=true;return}
+ if(openDev===null)openDev=cur||"";
+ devices.forEach(d=>{const col=devCol(d),menu=menuOf(d),open=d.id===openDev,w=mk("div","dgrp"+(d.id===cur?" sel":"")+(open?" open":""));
+  w.style.setProperty("--dc",col.c);w.style.setProperty("--dt",col.t);
+  const hd=mk("div","dghead");hd.title=(VSHORT[d.vendor]||d.vendor)+" · "+d.host;hd.tabIndex=0;hd.setAttribute("role","button");hd.setAttribute("aria-expanded",open?"true":"false");
+  hd.onclick=()=>devClick(d);hd.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();devClick(d)}};
+  hd.appendChild(mk("span","dgname",d.name));const bd=mk("span","dgbad");bd.dataset.dev=d.name;bd.hidden=true;hd.appendChild(bd);hd.appendChild(mk("span","dgtag",VSHORT[d.vendor]||d.vendor));
+  const x=mk("button","dgx","✕");x.title="Disconnect "+d.name;x.setAttribute("aria-label","Disconnect "+d.name);x.onclick=e=>disconnect(d.id,e);hd.appendChild(x);
+  hd.appendChild(mk("span","dgcar","⌄"));w.appendChild(hd);
+  if(open){const body=mk("div","dgbody"),v=d.id===cur&&menu?viewOf(d):null;
+   const item=(id,t,sub)=>{const b=mk("button","dgit"+(sub?" sub":"")+(v===id?" on":""),t);b.title=t;b.onclick=()=>pickItem(d.id,id);if(!sub)dgIcon(b,t);return b};
+   if(menu){const os=openSec[d.id]=openSec[d.id]||new Set(v&&secOf(d,v)?[secOf(d,v)]:[]);
+    menu.forEach(([l,its])=>{if(typeof its==="string"){body.appendChild(item(its,l,false));return}
+     const so=os.has(l),h=mk("button","dgsec"+(so?" open":""),l);dgIcon(h,l);h.setAttribute("aria-expanded",so?"true":"false");
+     h.onclick=()=>{so?os.delete(l):os.add(l);renderDevs()};body.appendChild(h);if(so)its.forEach(([id,t])=>body.appendChild(item(id,t,true)))})}
+   else body.appendChild(mk("div","dgnote","All tools for this device are on the right."));
+   const cr=mk("div","dgcol");cr.appendChild(mk("span",null,"Colour"));
+   DCOL.forEach(([c],i)=>{const s=mk("button","sw"+(i===col.i?" on":""));s.style.background=c;s.title="Use this colour";s.setAttribute("aria-label","Colour "+(i+1));s.onclick=()=>devSetCol(d,i);cr.appendChild(s)});
+   body.appendChild(cr);w.appendChild(body)}
+  el.appendChild(w)});devBadges()}
+// Out-of-service count of each device on its bar (from the device monitor).
+function devBadges(){const st=(monLast&&monLast.status)||[];document.querySelectorAll("#devs .dgbad").forEach(b=>{const s=st.find(x=>x.device===b.dataset.dev),n=s&&s.offline||0;
+ b.hidden=!n;b.textContent=n;b.title=n?n+" down · open Health & alarms":""})}
+// Show only the selected item's tool on the right (F5 / FortiGate / Palo Alto). Elements carry data-it="<item ...>".
+let avKey="",avQ=0;
+function applyView(force){const rp=$("#rpane");if(!rp)return;const d=dev(),menu=menuOf(d),vh=$("#viewhdr");rp.classList.toggle("menu",!!menu);
+ const all=[...rp.querySelectorAll("[data-it]")];
+ if(!menu){rp.querySelectorAll(".vhide").forEach(e=>e.classList.remove("vhide"));if(!vh.hidden){vh.hidden=true;vh.textContent=""}avKey="";return}
+ const v=viewOf(d);all.forEach(e=>e.classList.toggle("vhide",!e.dataset.it.split(" ").includes(v)));
+ rp.querySelectorAll(".card").forEach(c=>{if(c.dataset.it||(c.parentElement&&c.parentElement.closest("[data-it]")))return;
+  const its=[...c.querySelectorAll("[data-it]")];c.classList.toggle("vhide",!its.some(x=>!x.classList.contains("vhide")))});
+ rp.querySelectorAll(".card.multi>.row").forEach(r=>r.classList.toggle("vhide",![...r.children].some(x=>!x.classList.contains("vhide"))));
+ const it=menuItems(d).find(x=>x[0]===v)||[v,v,null],col=devCol(d),key=[d.id,v,col.i,d.name].join("|");
+ if(force||key!==avKey){avKey=key;vh.textContent="";vh.hidden=false;const c=mk("span","vhdev",d.name);c.style.setProperty("--dc",col.c);c.style.setProperty("--dt",col.t);
+  vh.appendChild(c);if(it[2]){vh.appendChild(mk("span",null,"›"));vh.appendChild(mk("span",null,it[2]))}vh.appendChild(mk("span",null,"›"));
+  const lb=it[1];vh.appendChild(mk("b",null,lb))}}
+// Health & alarms: the bell's monitor, for this device only.
+function renderDevMon(){const box=$("#devmon");if(!box)return;box.textContent="";const d=dev();if(!d||!["f5","fortigate","paloalto"].includes(d.vendor))return;
+ const m=monLast||{status:[],events:[]},card=mk("div","card");card.appendChild(mk("h3",null,"Health & alarms · "+d.name));
+ const r1=mk("div","row");r1.style.cssText="gap:8px;flex-wrap:wrap;margin-bottom:8px";
+ const b1=m.on?mk("button",null,"Check now"):mk("button","primary","Turn monitoring on");b1.style.cssText="flex:0 0 auto;width:auto";
+ b1.onclick=()=>monSet(m.on?{now:true}:{on:true});r1.appendChild(b1);card.appendChild(r1);
+ const s=(m.status||[]).find(x=>x.device===d.name);
+ if(s){card.appendChild(mk("div","grp","Status"));card.appendChild(mk("div","mline"+(s.error?" error":""),
+  s.error?"cannot read ("+s.error+")":Object.entries(s.counts||{}).map(([k,v])=>v+" "+k.toLowerCase()+(v===1?"":"s")).join(", ")+(s.ha?" · HA "+s.ha:"")+" · "+(s.offline||0)+" down"+(s.time?" · checked "+s.time:"")+
+  ((s.warnings||[]).length?" · not readable: "+s.warnings.join("; "):"")));
+  const down=s.down||[];if(down.length){card.appendChild(mk("div","grp","Out of service now ("+down.length+")"));
+   down.slice(0,100).forEach(x=>card.appendChild(mk("div","mline "+(x.cls==="bad"?"offline":"admin"),x.cat+" "+x.label+" · "+x.state+(x.vips&&x.vips.length?" · VIP "+x.vips.join(", "):""))))}}
+ else if(m.on)card.appendChild(mk("div","mline muted","First check running…"));
+ const ev=(m.events||[]).filter(e=>e.device===d.name).slice().reverse();card.appendChild(mk("div","grp","Alarms and changes"+(ev.length?" ("+ev.length+")":"")));
+ if(!ev.length)card.appendChild(mk("div","mline muted","None yet for this device."));ev.forEach(e=>card.appendChild(mk("div","mline "+e.kind,e.t+" · "+monTitle(e)+" · "+e.text)));
+ box.appendChild(card)}
 function renderSsh(){const box=$("#sshtool");if(!box)return;box.innerHTML="";const d=dev();
- if(!d||!["f5","fortigate","paloalto"].includes(d.vendor))return;
+ if(!d||!["f5","fortigate","paloalto","fortiweb"].includes(d.vendor))return;
  box.innerHTML='<div class="card"><h3>SSH · '+esc(d.name)+'</h3><div class="row3">'+
   fld("ssh_user","SSH user name",d.vendor==="fortigate"?"admin":"admin",d.user||"")+fld("ssh_port","SSH port","22","22")+
   '<div><label>&nbsp;</label><div class="row" style="gap:8px;flex-wrap:wrap"><button class="primary" onclick="termOpen()">Open SSH in this page</button>'+
@@ -14853,9 +16096,11 @@ function renderChecks(){const m=$("#main");m.innerHTML="<h3>Checks</h3>";const d
  const list=catalog[d.vendor];const groups=[...new Set(list.map(c=>c.group))];
  groups.forEach(g=>{const h=document.createElement("div");h.className="grp";h.textContent=g;m.appendChild(h);
   list.filter(c=>c.group===g).forEach(c=>{const r=document.createElement("div");r.className="chkrow";
-   const l=document.createElement("span");l.className="lbl";l.textContent=c.label;r.appendChild(l);
-   const ins={};(c.params||[]).forEach(p=>{const i=document.createElement("input");
-    i.placeholder=p.label+(p.placeholder?" ("+p.placeholder+")":"");i.value=p.default||"";ins[p.name]=i;r.appendChild(i)});
+   const l=document.createElement("span");l.className="lbl";l.textContent=c.label;r.appendChild(l);r.dataset.it="chk:"+c.id;
+   const ins={};(c.params||[]).forEach(p=>{let i;
+    if(p.choices){i=document.createElement("select");i.title=p.label;p.choices.forEach(([v,t])=>{const o=document.createElement("option");o.value=v;o.textContent=t;i.appendChild(o)})}
+    else{i=document.createElement("input");i.placeholder=p.label+(p.placeholder?" ("+p.placeholder+")":"")}
+    i.value=p.default||"";ins[p.name]=i;r.appendChild(i)});
    const b=document.createElement("button");b.textContent="Run";
    b.onclick=()=>run(c,ins);r.appendChild(b);m.appendChild(r)})})}
 async function run(c,ins){const p={};for(const k in ins)p[k]=ins[k].value;
@@ -14914,7 +16159,11 @@ function toSections(v,title,out,depth){
  v=unwrap(v);if(blank(v))return;
  if(typeof v!=="object"){out.push(isLong(v)?{t:"text",title:title||"Output",text:String(v)}:{t:"kv",title:title||"Details",rows:[[title||"Value",v]]});return}
  if(Array.isArray(v)){
-  if(v.every(isObj)){out.push(tableSec(title||"Results",v));return}
+  if(v.every(isObj)){
+   // a listing of sub-collections only ({reference:{link}}): show the names and paths instead of an empty table
+   if(v.every(r=>Object.keys(r).every(k=>noisy(k,r[k]))&&Object.values(r).some(isRef)))
+    v=v.map(r=>{const ref=Object.values(r).find(isRef),p=String(ref.link).replace(/^https?:\/\/[^\/]+/,"").split("?")[0];return {Name:urlName(p),Path:p}});
+   out.push(tableSec(title||"Results",v));return}
   if(v.every(x=>x===null||typeof x!=="object")){out.push({t:"list",title:title||"Results",items:v.map(String)});return}
   v.forEach((x,i)=>toSections(x,(title||"Item")+" #"+(i+1),out,depth+1));return}
  const ks=Object.keys(v);
@@ -15012,15 +16261,18 @@ function flowDiagram(p){
 function renderOut(){const box=$("#pretty");box.textContent="";if(!last)return;
  if(last.error){box.appendChild(mk("div","bad",last.error));return}
  if(last.path&&Array.isArray(last.path.stages))box.appendChild(flowDiagram(last.path));
- box.classList.toggle("tall",!!(last.dashboard||last.secdash||last.charts||last.acc||last.tiles||last.bars));
+ box.classList.toggle("tall",!!(last.dashboard||last.secdash||last.swins||last.charts||last.acc||last.tiles||last.bars));
  if(Array.isArray(last.tiles)&&last.tiles.length)box.appendChild(tilesNode(last.tiles));
  if(Array.isArray(last.charts)&&last.charts.length&&last.bars)box.appendChild(chartsNode(last.charts,last.heat));
  if(Array.isArray(last.bars)&&last.bars.length)box.appendChild(barsNode(last.bars));
  if(last.dashboard)box.appendChild(dashNode(last.dashboard));
  if(last.secdash)box.appendChild(secDashNode(last.secdash));
+ if(last.swins)box.appendChild(swInsNode(last.swins));
+ if(last.fwblog&&last.data)box.appendChild(fwbLogNode(last.data.attacks||last.data.traffic));
+ if(last.owaspc)box.appendChild(owcNode(last.owaspc));
  if(last.acc)box.appendChild(accNode(last.acc));  // charts first; the tables below are the table view
  if(Array.isArray(last.charts)&&last.charts.length&&!last.bars)box.appendChild(chartsNode(last.charts,last.heat));
- buildSections(last.data).forEach(s=>box.appendChild(secNode(s)));
+ buildSections(last.fwblog&&last.data?Object.assign({},last.data,{attacks:undefined,traffic:undefined}):last.data).forEach(s=>box.appendChild(secNode(s)));
  if(!box.childNodes.length)box.appendChild(mk("div","nv","Nothing to show for this check."));
  // Blocked / denied traffic in red: table rows with a deny-type cell, and log lines whose action precedes " -> ".
  const DENY=/^(deny|denied|drop|dropped|block|blocked|block-\w+|reset|reset-\w+|blackhole|sinkhole)$/i,DENYW=/\b(deny|denied|drop|dropped|block|blocked|block-\w+|reset-\w+)\b/i;
@@ -15066,23 +16318,23 @@ function fld(id,l,ph,v){return '<div><label>'+l+'</label><input id="'+id+'" plac
 function g(i){const e=$("#"+i);return e?e.value:""}
 function renderIp(){const box=$("#iplookup");box.innerHTML="";const d=dev();if(!d||["cloudflare","solarwinds","fortiweb","fortiadc"].includes(d.vendor))return;const v=d.vendor;
  if(v==="paloalto"||v==="fortigate"){const pan=v==="paloalto";
-  box.innerHTML='<div class="card"><h3>Policy lookup · by IP, by '+(pan?'rule name, or list all security rules':'policy name or ID, or list all firewall policies')+'</h3><div class="row3">'+
+  box.innerHTML='<div class="card" data-it="pol"><h3>Policy lookup · by IP, by '+(pan?'rule name, or list all security rules':'policy name or ID, or list all firewall policies')+'</h3><div class="row3">'+
   (pan?fld("pl_q","IP, subnet or rule name (blank = all rules)","10.1.1.10, 10.1.2.32/28 or allow-web")+fld("pl_vsys","vsys","vsys1","vsys1")
       :fld("pl_q","IP, subnet, policy name or ID (blank = all policies)","10.1.1.10, 10.1.2.32/28, web-in or 12")+fld("pl_vdom","VDOM (optional)","root"))+'</div>'+
   '<div class="row" style="margin-top:10px"><button class="primary" onclick="fwLookup()">Look up</button><button onclick="fwLookup(true)">List all policies</button></div>'+
   '<p class="muted" style="margin:8px 0 0">An IP or subnet shows the address objects and '+(pan?'rules':'policies')+' that reference or overlap it; '+(pan?'any other text finds rules whose name contains it':'a number finds that policy ID, any other text finds policies whose name contains it')+'. Reads the running config (read-only).</p></div>'+
-  '<div class="card"><h3>Flow check · which '+(pan?'rule':'policy')+' allows or blocks source → destination</h3><div class="row3">'+
+  '<div class="card" data-it="fc"><h3>Flow check · which '+(pan?'rule':'policy')+' allows or blocks source → destination</h3><div class="row3">'+
   fld("fc_src","Source IP","10.1.1.10")+fld("fc_dst","Destination IP","203.0.113.10")+fld("fc_port","Destination port (optional)","443")+
   '<div><label>Protocol</label><select id="fc_proto"><option>tcp</option><option>udp</option><option>icmp</option></select></div>'+
-  (pan?fld("fc_from","From zone (optional)","trust")+fld("fc_to","To zone (optional)","untrust")
-      :fld("fc_if","Ingress interface (optional, auto from route)","port1"))+'</div>'+
+  (pan?fld("fc_from","From zone (optional)","trust")+fld("fc_to","To zone (optional)","untrust")+fld("fc_vsys","vsys","vsys1","vsys1")
+      :fld("fc_if","Ingress interface (optional, auto from route)","port1")+fld("fc_vdom","VDOM (optional)","root"))+'</div>'+
   '<div class="row" style="margin-top:10px"><button class="primary" onclick="flowCheck()">Check flow</button></div>'+
-  '<p class="muted" style="margin:8px 0 0">'+(pan?"Runs 'test security-policy-match' (as Device &gt; Test Policy Match), so Panorama-pushed rules are covered. Leave the zones blank to let the firewall evaluate all rules; vsys is taken from the box above.":
-   "Runs FortiOS policy lookup (as Policy &amp; Objects &gt; Policy Lookup). Leave the ingress interface blank to use the interface of the route back to the source; VDOM is taken from the box above.")+
+  '<p class="muted" style="margin:8px 0 0">'+(pan?"Runs 'test security-policy-match' (as Device &gt; Test Policy Match), so Panorama-pushed rules are covered. Leave the zones blank to let the firewall evaluate all rules.":
+   "Runs FortiOS policy lookup (as Policy &amp; Objects &gt; Policy Lookup). Leave the ingress interface blank to use the interface of the route back to the source.")+
   ' Read-only.</p></div>';return}
- let h='<div class="card"><h3>IP lookup · pools, nodes, virtual servers, data groups, local traffic policies</h3><div class="row3">'+fld("ip_ip","IP address","203.0.113.7");
+ let h='<div class="card" data-it="iplk"><h3>IP lookup · pools, nodes, virtual servers, data groups, local traffic policies</h3><div class="row3">'+fld("ip_ip","IP address","203.0.113.7");
  h+='</div><div style="margin-top:10px"><button class="primary" onclick="ipLookup()">Check</button></div></div>';
- if(v==="f5")h+='<div class="card"><h3>Hostname lookup · virtual server and local traffic policy</h3><div class="row3">'+fld("fh_host","Hostname","app.example.com")+
+ if(v==="f5")h+='<div class="card" data-it="host"><h3>Hostname lookup · virtual server and local traffic policy</h3><div class="row3">'+fld("fh_host","Hostname","app.example.com")+
   '</div><div style="margin-top:10px"><button class="primary" onclick="f5Host()">Find virtual server / policy</button></div></div>';
  box.innerHTML=h}
 async function f5Host(){setBusy("hostname lookup");
@@ -15092,7 +16344,7 @@ async function ipLookup(){setBusy("IP lookup");
 async function flowCheck(){if(!g("fc_src").trim()||!g("fc_dst").trim())return show({ok:false,error:"enter both the source and the destination IP"},"flow check");
  setBusy("flow check");
  show(await api("/api/ipcheck",{id:cur,mode:"verdict",ip:g("fc_src").trim(),peer:g("fc_dst").trim(),role:"source",port:g("fc_port"),proto:g("fc_proto"),
-  from:g("fc_from"),to:g("fc_to"),srcintf:g("fc_if"),vsys:g("pl_vsys"),vdom:g("pl_vdom")}),"flow check")}
+  from:g("fc_from"),to:g("fc_to"),srcintf:g("fc_if"),vsys:g("fc_vsys")||g("pl_vsys"),vdom:g("fc_vdom")||g("pl_vdom")}),"flow check")}
 async function fwLookup(all){const q=g("pl_q").trim(),vs=g("pl_vsys"),vd=g("pl_vdom");
  if(all||!q){setBusy("all policies");return show(await api("/api/policy",{id:cur,all:true,vsys:vs,vdom:vd}),"all policies")}
  if(/^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(q)||/^[0-9a-f]*:[0-9a-f]*:[0-9a-f:.]*(\/\d{1,3})?$/i.test(q)){setBusy("IP lookup");
@@ -15138,17 +16390,16 @@ function wsel(id){return sel(id,"Time range",WITHIN,"any time")}
 function sel(id,label,opts,def){return '<div><label>'+label+'</label><select id="'+id+'">'+
  opts.map(o=>'<option'+(o===def?' selected':'')+'>'+o+'</option>').join("")+'</select></div>'}
 function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if(!d||["cloudflare","solarwinds","fortiweb","fortiadc"].includes(d.vendor))return;const v=d.vendor;
- let h='<div class="card"><h3>AppSec checks · read-only</h3><div class="row3">';
+ let h='<div class="card multi"><h3>AppSec checks · read-only</h3><div data-it="'+(v==="f5"?"sslp":"cov")+'"><div class="row3">';
  if(v==="paloalto")h+=fld("as_vsys","vsys","vsys1","vsys1");
  if(v==="fortigate")h+=fld("as_vdom","VDOM (optional)","root");
  if(v==="f5")h+=fld("as_days","Cert warning (days)","60","60");
- h+='</div><div class="row" style="margin-top:10px;flex-wrap:wrap">'+
-  '<button onclick="appsec(\'waf\')">'+(v==="f5"?"WAF posture":"Security-profile coverage")+'</button>'+
-  (v==="f5"?'<button onclick="appsec(\'ssl\')">SSL / cert posture</button>':'')+'</div>';
+ h+='</div></div><div class="row" style="margin-top:10px;flex-wrap:wrap">'+
+  '<span data-it="'+(v==="f5"?"waf":"cov")+'"><button onclick="appsec(\'waf\')">'+(v==="f5"?"WAF posture":"Security-profile coverage")+'</button></span>'+
+  (v==="f5"?'<span data-it="sslp"><button onclick="appsec(\'ssl\')">SSL / cert posture</button></span>':'')+'</div>';
  if(v==="f5"){
-  h+='<div class="grp">ASM / Advanced WAF request log</div><div class="row3">'+sel("asm_dr","Security dashboard: time range",["1h","6h","24h","3d","7d"],"24h")+'</div>'+
-  '<div style="margin-top:8px"><button class="primary" onclick="devSecDash(cur,g(\'asm_dr\'),{})">Security dashboard</button> <span class="muted">blocked / alerted requests over time, by policy, top sources, attack types, violations and signatures</span></div>'+
-  '<div class="row3" style="margin-top:14px">'+fld("asm_sid","Support ID (from block page)","1234567890123456789")+wsel("asm_sw")+
+  h+='<div data-it="asm"><div class="grp">ASM / Advanced WAF request log</div>'+
+  '<div class="row3">'+fld("asm_sid","Support ID (from block page)","1234567890123456789")+wsel("asm_sw")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="asmLookup(\'supportid\')">Look up support ID</button></div>'+
   '<div class="grp" style="margin-top:14px">Search requests</div><div class="row3">'+fld("asm_ip","Client IP","203.0.113.7")+
   fld("asm_tci","True-Client-IP","198.51.100.9")+fld("asm_host","Hostname contains","app.example.com")+fld("asm_url","URL path contains","/login")+
@@ -15161,34 +16412,34 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   '<div class="grp" style="margin-top:14px">Top 10 hostnames by violations</div><div class="row3">'+
   sel("asm_tst","Status",["","blocked","alerted"],"")+fld("asm_scan","Entries to scan","1000","1000")+wsel("asm_tw")+
   '</div><div style="margin-top:8px"><button onclick="asmLookup(\'tophosts\')">Top 10 hostnames by violations</button> '+
-  '<span class="muted">(Status blank = blocked + alerted)</span></div>'}
+  '<span class="muted">(Status blank = blocked + alerted)</span></div></div>'}
  if(v==="paloalto"){
-  h+='<div class="grp">Log search (threat / URL / traffic)</div><div class="row3">'+fld("pl_ip","IP or subnet (src or dst)","203.0.113.7 or 10.2.64.0/24")+fld("pl_dst","Destination IP or subnet (optional)","198.51.100.0/24")+sel("pl_dtype","Destination is",["either","normal destination","DNAT (translated) destination"],"either")+
+  h+='<div data-it="logs"><div class="grp">Log search (threat / URL / traffic)</div><div class="row3">'+fld("pl_ip","IP or subnet (src or dst)","203.0.113.7 or 10.2.64.0/24")+fld("pl_dst","Destination IP or subnet (optional)","198.51.100.0/24")+sel("pl_dtype","Destination is",["either","normal destination","DNAT (translated) destination"],"either")+
   sel("pl_type","Log type",["threat","url","traffic"],"threat")+
   sel("pl_period","Time range",["last-15-minutes","last-hour","last-6-hrs","last-12-hrs","last-24-hrs","last-7-days","last-30-days"],"last-24-hrs")+
   fld("pl_n","Max rows","100","100")+sel("pl_blocked","Show",["all entries","blocked only","allowed only"],"blocked only")+
   '</div><div style="margin-top:8px"><button class="primary" onclick="panLogs()">Search logs</button></div>'+
-  '<p class="muted" style="margin:8px 0 0">URL category lookup is under Checks → Policy.</p>'}
+  '<p class="muted" style="margin:8px 0 0">URL category lookup: Troubleshooting → URL category lookup.</p></div>'}
  if(v==="fortigate"){
-  h+='<div class="grp">Traffic log search (is this IP being blocked?)</div><div class="row3">'+fld("fl_ip","IP or subnet (src or dst)","203.0.113.7 or 10.2.64.0/24")+
+  h+='<div data-it="logs"><div class="grp">Traffic log search (is this IP being blocked?)</div><div class="row3">'+fld("fl_ip","IP or subnet (src or dst)","203.0.113.7 or 10.2.64.0/24")+
   fld("fl_dst","Destination IP or subnet (optional)","198.51.100.0/24")+
   sel("fl_dtype","Destination is",["either","normal destination","DNAT (translated) destination"],"either")+
   sel("fl_src","Log source",["disk","memory","fortianalyzer"],"disk")+fld("fl_n","Max rows per direction","500","500")+wsel("fl_w")+
   sel("fl_blocked","Show",["all entries","blocked only","allowed only"],"blocked only")+fld("fl_vdom","VDOM (optional)","root")+
-  '</div><div style="margin-top:8px"><button class="primary" onclick="fgLogs()">Search traffic logs</button></div>'}
- if(v==="f5")h+='<div class="grp">Config sync · changes made here and whether the peer has them</div><div class="row3">'+
+  '</div><div style="margin-top:8px"><button class="primary" onclick="fgLogs()">Search traffic logs</button></div></div>'}
+ if(v==="f5")h+='<div data-it="syncrev"><div class="grp">Config sync · changes made here and whether the peer has them</div><div class="row3">'+
   fld("sy_h","Look back (hours)","24","24")+fld("sy_n","Max rows","200","200")+
-  '</div><div style="margin-top:8px"><button class="primary" onclick="f5Sync()">Review config sync</button></div>';
- h+='<div class="grp">Configuration backup (saved, then downloaded to this PC)</div>'+
+  '</div><div style="margin-top:8px"><button class="primary" onclick="f5Sync()">Review config sync</button></div></div>';
+ h+='<div data-it="backup"><div class="grp">Configuration backup (saved, then downloaded to this PC)</div>'+
   (v==="f5"?'<div class="chk"><input type="checkbox" id="bk_ack"><span>I understand this creates a UCS archive on the BIG-IP and copies it through the shell (Administrator role); approved for this device</span></div>':'')+
   (v==="fortigate"?'<div class="row3">'+fld("bk_vdom","VDOM (optional, blank = whole device)","root")+'</div>':'')+
-  '<div style="margin-top:8px"><button class="primary" onclick="backup()">Back up &amp; download</button></div>';
- h+='<div class="grp">Admin audit · who logged in and what they did</div><div class="row3">'+fld("au_user","Admin user name","admin")+
+  '<div style="margin-top:8px"><button class="primary" onclick="backup()">Back up &amp; download</button></div></div>';
+ h+='<div data-it="audit"><div class="grp">Admin audit · who logged in and what they did</div><div class="row3">'+fld("au_user","Admin user name","admin")+
   fld("au_act","Action contains (optional)","delete, commit, edit")+fld("au_n","Max rows","100","100")+
   (v==="paloalto"?sel("au_period","Time range",["last-15-minutes","last-hour","last-6-hrs","last-12-hrs","last-24-hrs","last-7-days","last-30-days"],"last-24-hrs"):"")+
   (v==="fortigate"?sel("au_src","Log source",["disk","memory","fortianalyzer"],"disk")+fld("au_vdom","VDOM (optional)","root"):"")+
   (v!=="paloalto"?wsel("au_w"):"")+
-  '</div><div style="margin-top:8px"><button class="primary" onclick="adminAudit()">Search admin activity</button></div>';
+  '</div><div style="margin-top:8px"><button class="primary" onclick="adminAudit()">Search admin activity</button></div></div>';
  box.innerHTML=h+'</div>'}
 async function backup(){setBusy("configuration backup (F5 archives can take several minutes)");
  const r=await api("/api/backup",{id:cur,ack:!!($("#bk_ack")&&$("#bk_ack").checked),vdom:g("bk_vdom")});show(r,"configuration backup");
@@ -15300,6 +16551,15 @@ function cfSecDash(x){secX=x||{};
  const f=Object.keys(secX).filter(k=>k!=="until").map(k=>k==="since"?secX.since+" → "+secX.until+" (UTC+3)":k+" "+secX[k]);
  cfRun("secdash","Cloudflare security dashboard"+(f.length?" · "+f.join(" · "):""),Object.assign(cfEvF(),secX))}
 function secDrill(k,v){cfSecDash(Object.assign({},secX,{[k]:v}))}
+// Active drill-down filters as chips; × removes one filter, "Clear all" goes back to the unfiltered dashboard.
+const SEC_FL={ip:"IP",source:"Service",service:"Category",host:"Host",path:"Path",url:"URL",asn:"ASN",country:"Country",rule:"Rule",action:"Action",ua:"User agent",method:"Method",ja4:"JA4",ja3:"JA3",ref:"Referer",referer:"Referer",client_ip:"Client IP",description:"Rule",user_agent:"User agent",colo:"Data center",policy:"Policy",tcip:"True-Client-IP",code:"Response code",rating:"Rating"};
+function secChips(ctx){const bar=mk("div","fchips"),ks=Object.keys(secX).filter(k=>k!=="until");if(!ks.length)return bar;
+ const re=x=>ctx?devSecDash(last&&last._dev||cur,ctx.range,x):cfSecDash(x);bar.appendChild(mk("span","muted","Filtered by:"));
+ ks.forEach(k=>{const c=mk("span","fchip"),lbl=k==="since"?"Time":(SEC_FL[k]||k),val=k==="since"?secX.since+" → "+(secX.until||"")+" (UTC+3)":String(secX[k]);
+  c.appendChild(mk("b",null,lbl+": "));c.appendChild(mk("span",null,val));c.title=lbl+": "+val;
+  const x=mk("button","fx","×");x.title="Remove this filter";x.onclick=()=>{const n=Object.assign({},secX);delete n[k];if(k==="since")delete n.until;re(n)};c.appendChild(x);bar.appendChild(c)});
+ if(ks.length>1){const a=mk("button","fclr","Clear all ×");a.title="Back to the unfiltered dashboard";a.onclick=()=>re({});bar.appendChild(a)}
+ return bar}
 // F5 / FortiWeb: the same dashboard from the device's own log; drill-down filters go to /api/secdash.
 async function devSecDash(id,range,filters){secX=filters||{};const dv=devices.find(x=>x.id===id)||{};
  const f=Object.keys(secX).map(k=>k+" "+secX[k]);const lbl=(dv.vendor==="f5"?"F5 ASM":"FortiWeb")+" security dashboard · "+(dv.name||"")+" · "+range+(f.length?" · "+f.join(" · "):"");
@@ -15321,7 +16581,7 @@ function secDashNode(d){const w=mk("div","dash");
  if(ctx){const rs=mk("select","secrange");[["1h","Last hour"],["6h","Last 6 hours"],["24h","Last 24 hours"],["3d","Last 3 days"],["7d","Last 7 days"]].forEach(([v,l])=>{const o=mk("option",null,l);o.value=v;rs.appendChild(o)});
   rs.value=ctx.range;rs.title="Time range";rs.onchange=()=>devSecDash(last&&last._dev||cur,rs.value,secX);hint.insertBefore(rs,hint.firstChild)}
  if(Object.keys(secX).length){const c=mk("span","lnk"," · clear filters");c.style.cursor="pointer";c.style.color="var(--mint)";c.onclick=()=>ctx?devSecDash(last&&last._dev||cur,ctx.range,{}):cfSecDash();hint.appendChild(c)}
- w.appendChild(hint);
+ w.appendChild(hint);w.insertBefore(secChips(ctx),w.firstChild);
  if(d.services.length){const card=mk("div","dcard");card.appendChild(mk("div","sec",d.services_title||"Events by service"));
   const tot=d.services.reduce((a,s)=>a+s[1],0)||1,bar=mk("div","secbar"),leg=mk("div","secleg");
   d.services.forEach(([nm,c,src],i)=>{const col=SEC_SV[i%SEC_SV.length],seg=mk("span");seg.style.width=(100*c/tot)+"%";seg.style.background=col;
@@ -15724,7 +16984,7 @@ async function monPoll(){dashBtn();if(!devices.some(d=>["f5","paloalto","fortiga
  const off=r.status.reduce((n,s)=>n+(s.offline||0),0),b=$("#monbadge");
  b.hidden=!off;b.textContent=off;$("#monbtn").classList.toggle("alert",off>0);
  $("#monbtn").title="Device monitor: "+(r.on?"on, every "+r.interval+" s":"off")+(off?" \u00b7 "+off+" down":"");
- if(monOpen)monRender()}
+ if(monOpen)monRender();renderDevMon();devBadges()}
 function monRender(){const p=$("#monpanel"),m=monLast||{status:[],events:[]};p.innerHTML="";p.appendChild(mk("h3",null,"Device monitor"));
  const r1=mk("div","mrow"),lb=mk("label"),cb=mk("input");cb.type="checkbox";cb.checked=!!m.on;cb.onchange=()=>monSet({on:cb.checked});
  lb.appendChild(cb);lb.appendChild(document.createTextNode("Watch devices"));r1.appendChild(lb);
@@ -15736,16 +16996,7 @@ function monRender(){const p=$("#monpanel"),m=monLast||{status:[],events:[]};p.i
   a.disabled=Notification.permission==="denied";a.onclick=monAskNotify;r2.appendChild(a)}
  p.appendChild(r2);const r3=mk("div","mrow"),l3=mk("label"),c3=mk("input");c3.type="checkbox";c3.checked=m.changes!==false;c3.onchange=()=>monSet({changes:c3.checked});
  l3.appendChild(c3);l3.appendChild(document.createTextNode("Pop up configuration changes (checked every minute)"));r3.appendChild(l3);p.appendChild(r3);
- p.appendChild(mk("div","msec","Devices"));(m.status||[]).forEach(s=>p.appendChild(mk("div","mline"+(s.error?" error":""),
-  s.device+": "+(s.error?"cannot read ("+s.error+")":Object.entries(s.counts||{}).map(([k,v])=>v+" "+k.toLowerCase()+(v===1?"":"s")).join(", ")+
-   (s.ha?" \u00b7 HA "+s.ha:"")+" \u00b7 "+(s.offline||0)+" down")+(s.time?" \u00b7 checked "+s.time:"")+
-   ((s.warnings||[]).length?" \u00b7 not readable: "+s.warnings.join("; "):""))));
- if(!(m.status||[]).length)p.appendChild(mk("div","mline muted",m.on?"First check running\u2026":"Monitoring is off."));
- const down=[].concat(...(m.status||[]).map(s=>(s.down||[]).map(x=>Object.assign({device:s.device},x))));
- if(down.length){p.appendChild(mk("div","msec","Out of service now ("+down.length+")"));down.slice(0,60).forEach(x=>p.appendChild(mk("div","mline "+(x.cls==="bad"?"offline":"admin"),
-  x.cat+" "+x.label+" \u00b7 "+x.state+" \u00b7 "+x.device+(x.vips&&x.vips.length?" \u00b7 VIP "+x.vips.join(", "):""))))}
- p.appendChild(mk("div","msec","Recent changes"));const ev=(m.events||[]).slice().reverse();
- if(!ev.length)p.appendChild(mk("div","mline muted","No changes yet."));ev.slice(0,25).forEach(e=>p.appendChild(mk("div","mline "+e.kind,e.t+" \u00b7 "+e.text)))}
+ p.appendChild(mk("div","mline muted","Status and alarms: open a device in the sidebar → Health & alarms."))}
 function monPanel(){monOpen=$("#monpanel").hidden;$("#monpanel").hidden=!monOpen;if(monOpen){monRender();if(window.Notification&&Notification.permission==="default"&&monPref("notify",true))monAskNotify()}}
 async function monSet(b){const r=await api("/api/monitor",b);if(!r.ok){alert(r.error);return}monPoll();setTimeout(monPoll,2500)}
 function monAskNotify(){if(window.Notification&&Notification.permission==="default")Notification.requestPermission().then(()=>{if(monOpen)monRender()})}
@@ -15887,6 +17138,7 @@ function swPanel(d){const w=mk("div","swp"),s=d.sw;const h=mk("div","dh swh");h.
  tile(k.down,"nodes down",k.down?"bad":"");tile(k.warn,"nodes warning",k.warn?"warn":"");tile(k.if_down,"interfaces down",k.if_down?"bad":"");
  tile(k.if_hot,"interfaces ≥ 80%",k.if_hot?"warn":"");tile(k.alerts,"active alerts",k.critical?"bad":k.alerts?"warn":"",k.critical+" critical or serious");
  tile(k.unack,"not acknowledged",k.unack?"warn":"");tile(k.nodes.toLocaleString(),"nodes · "+k.ifaces.toLocaleString()+" interfaces","",k.unmanaged+" unmanaged");w.appendChild(t);
+ if(s.ins)w.appendChild(swInsNode(s.ins,true));
  const g1=mk("div","swg2");g1.appendChild(swBar("Nodes by status",s.node_status));g1.appendChild(swBar("Interfaces by status",s.if_status));w.appendChild(g1);
  const g2=mk("div","swg4"),tr=s.trend;
  if(tr){g2.appendChild(swLine("Average CPU",tr.cpu,"%",100));g2.appendChild(swLine("Average memory",tr.mem,"%",100));
@@ -15900,7 +17152,7 @@ function swPanel(d){const w=mk("div","swp"),s=d.sw;const h=mk("div","dh swh");h.
  sub.appendChild(mk("span",null," · "+(r_.sw_busy?"⟳ reading Orion history…":tr?s.trend_src.replace("average",per+" average")+(tr.range!==r_.sw_range?" (still showing "+(tr.label||"last 24 hours")+")":""):"this console's refreshes, last 24 hours at most (Orion history not readable)")));
  w.appendChild(sub);if(tr&&tr.note)w.appendChild(mk("div","dline k-warn","⚠ "+tr.note));w.appendChild(g2);
  const g3=mk("div","swg3");
- g3.appendChild(swList("Needs attention"+(s.attention_total>s.attention.length?" · "+s.attention.length+" of "+s.attention_total:""),s.attention,r=>{const x=mk("div","swr");
+ g3.appendChild(swList("Unhealthy nodes"+(s.attention_total>s.attention.length?" · "+s.attention.length+" of "+s.attention_total:""),s.attention,r=>{const x=mk("div","swr");
   x.appendChild(mk("span","dpill k-"+(SWK[r.cls]||""),r.status));x.appendChild(mk("b",null,r.node));x.appendChild(mk("span","swd",r.issue));x.title=r.node+" ("+r.ip+") · CPU "+r["cpu_%"]+"% · memory "+r["memory_%"]+"% · response "+r.response_ms+" ms · loss "+r["packet_loss_%"]+"%";return x},"every node is up, CPU and memory below 90%"));
  g3.appendChild(swList("Active alerts · most severe first",s.alerts,r=>{const x=mk("div","swr");
   x.appendChild(mk("span","dpill k-"+(/critical|serious/i.test(r.severity)?"bad":/warning/i.test(r.severity)?"warn":""),r.severity));x.appendChild(mk("b",null,r.alert));
@@ -16140,7 +17392,7 @@ function advPills(g){const c=g.counts||{};let s="";
  if(c.critical)s+='<span class="apill a-c">'+c.critical+' critical</span>';if(c.high)s+='<span class="apill a-h">'+c.high+' high</span>';
  if(c.medium)s+='<span class="apill a-m">'+c.medium+' medium</span>';if(c.unrated)s+='<span class="apill a-m">'+c.unrated+' not rated</span>';
  if(g.exploited)s+='<span class="apill a-k" title="Listed by CISA as exploited in the wild, or marked as actively exploited in the CVE record">'+g.exploited+' exploited</span>';return s}
-function advRender(){const r=advData,b=$("#advbar");b.hidden=false;const res=r.results||[],nerr=Object.keys(r.errors||{}).length;
+function advRender(){const r=advData,b=$("#advbar");b.hidden=true;advDevRender();const res=r.results||[],nerr=Object.keys(r.errors||{}).length;
  let h='<span class="ahd">\u{1F6E1} Vendor advisories</span>';
  res.forEach((g,i)=>{const d=g.devices||[],dv=d.length>2?d.slice(0,2).join(", ")+" +"+(d.length-2):d.join(", ");
   let s='<b>'+esc(g.label)+'</b><span class="adim">'+esc(dv)+' · '+esc(g.version||"?")+'</span>';
@@ -16156,16 +17408,22 @@ function advRender(){const r=advData,b=$("#advbar");b.hidden=false;const res=r.r
 function advOpen(i){advSel=advSel===i?-1:i;advRender();if(advSel===-1)$("#advpanel").hidden=true}
 document.addEventListener("click",e=>{const c=e.target.closest&&e.target.closest("#advbar .achip");if(c)advOpen(+c.dataset.i)});
 document.addEventListener("keydown",e=>{const c=e.target.closest&&e.target.closest("#advbar .achip");if(c&&e.key==="Enter")advOpen(+c.dataset.i)});
-function advPanel(){const r=advData,p=$("#advpanel"),g=advSel>=0?(r.results||[])[advSel]:null;if(advSel>=0&&!g){advSel=-1;p.hidden=true;return}p.hidden=false;
- let h='<div class="ahead"><h3>'+(g?esc(g.label)+' '+esc(g.version||"")+' <span class="adim" style="font-weight:400">· '+esc((g.devices||[]).join(", "))+(g.model?' · '+esc(g.model):'')+(g.mods&&g.mods.length?' · modules: '+esc(g.mods.join(", ")):'')+'</span>':'Advisory lists')+'</h3>'+
+function advPanel(){const r=advData,p=$("#advpanel"),g=advSel>=0?(r.results||[])[advSel]:null;if(advSel>=0&&!g){advSel=-1;p.hidden=true;return}p.hidden=false;p.innerHTML=advHtml(r,g,advSel,true)}
+// Vendor advisories of the selected device (its version group), shown in the device's "Vendor advisory" item.
+function advDevRender(){const box=$("#advdev");if(!box)return;const d=dev();box.textContent="";if(!d||!ADV_V.includes(d.vendor))return;
+ const r=advData,res=(r&&r.results)||[],gi=res.findIndex(x=>(x.ids||[]).includes(d.id)),c=mk("div","card");
+ if(gi<0)c.innerHTML='<h3>Vendor advisories · '+esc(d.name)+'</h3><p class="muted" style="margin:0">'+esc(r&&r.busy?(r.stage||"Checking…"):"Waiting for the first check of the public advisory lists…")+'</p>';
+ else c.innerHTML=advHtml(r,res[gi],gi,false);box.appendChild(c)}
+function advHtml(r,g,gi,close){
+ let h='<div class="ahead"><h3'+(close?'':' hidden')+'>'+(g?esc(g.label)+' '+esc(g.version||"")+' <span class="adim" style="font-weight:400">· '+esc((g.devices||[]).join(", "))+(g.model?' · '+esc(g.model):'')+(g.mods&&g.mods.length?' · modules: '+esc(g.mods.join(", ")):'')+'</span>':'Advisory lists')+'</h3>'+
   '<label class="adim">Show <select onchange="advSet({min:this.value})">'+["critical","high","medium"].map(m=>'<option value="'+m+'"'+(r.min===m?' selected':'')+'>'+m+(m==="critical"?" only":" and above")+'</option>').join("")+'</select></label>'+
-  '<button onclick="advSet({refresh:1})"'+(r.busy?' disabled':'')+'>'+(r.busy?'Checking…':'Refresh now')+'</button><button class="themebtn" onclick="advOpen(advSel)" title="Close" aria-label="Close">✕</button></div>';
+  '<button onclick="advSet({refresh:1})"'+(r.busy?' disabled':'')+'>'+(r.busy?'Checking…':'Refresh now')+'</button>'+(close?'<button class="themebtn" onclick="advOpen(advSel)" title="Close" aria-label="Close">✕</button>':'')+'</div>';
  if(g){
   if(g.eol)h+='<div class="abox eol">⚠ '+esc(g.eol)+'</div>';
   if(g.error)h+='<div class="abox">'+esc(g.error)+'</div>';
   else if(!(g.items||[]).length)h+='<div class="abox"><span class="aok">✓ No published '+esc(r.min)+'-or-higher advisory (or exploited issue) affects '+esc(g.version)+'.</span></div>';
   else{h+='<div class="abox"><b>Advice:</b> '+esc(g.advice?g.advice.text:"")+'<br><span class="adim">This is the lowest release the published advisories show as fixed, not a vendor recommendation. Check </span><a href="'+esc(g.help.url)+'" target="_blank" rel="noopener noreferrer">'+esc(g.help.text)+'</a><span class="adim"> before you pick the release, and read each advisory: some only apply when a feature is in use (GlobalProtect, management interface reachable, APM…).</span></div>';
-   h+='<div class="abox"><b>Configuration:</b> <span class="adim">does each issue need a feature this unit uses? Reads the configuration (read-only), then asks the AI assistant.</span><div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">'+(g.ids||[]).map((id,k)=>'<button onclick="advCfg('+advSel+','+k+')">Check '+esc((g.devices||[])[k]||"device")+' against its configuration (AI)</button>').join("")+'</div></div>';
+   h+='<div class="abox"><b>Configuration:</b> <span class="adim">does each issue need a feature this unit uses? Reads the configuration (read-only), then asks the AI assistant.</span><div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">'+(g.ids||[]).map((id,k)=>'<button onclick="advCfg('+gi+','+k+')">Check '+esc((g.devices||[])[k]||"device")+' against its configuration (AI)</button>').join("")+'</div></div>';
    h+='<table><thead><tr><th>Severity</th><th>Advisory</th><th>Issue</th><th>Fixed in (your train)</th><th>Exploited</th><th>Published</th></tr></thead><tbody>';
    g.items.forEach(x=>{h+='<tr><td class="nw"><span class="apill '+(x.sev==="critical"?"a-c":x.sev==="high"?"a-h":"a-m")+'">'+esc(x.sev)+(x.score!=null?' '+esc(x.score):'')+'</span></td><td class="nw"><a href="'+esc(x.url)+'" target="_blank" rel="noopener noreferrer">'+esc(x.id)+'</a></td><td>'+esc(x.title)+(x.note?' <span class="adim">('+esc(x.note)+')</span>':'')+'</td><td class="nw">'+esc(x.fix||"no fix listed")+'</td><td>'+(x.kev?'<span class="apill a-k">yes</span>':'')+'</td><td class="nw">'+esc(x.date)+'</td></tr>'});
    h+='</tbody></table>'}}
@@ -16173,7 +17431,7 @@ function advPanel(){const r=advData,p=$("#advpanel"),g=advSel>=0?(r.results||[])
  h+='<div class="afoot">Lists: '+Object.keys(nm).map(k=>esc(nm[k])+' '+(src[k]?esc(src[k]):'<i>not downloaded</i>')).join(" · ")+(r.next_in!=null?' · next download in '+Math.round(r.next_in/360)/10+' h':'')+'<br>';
  Object.entries(r.errors||{}).forEach(([k,v])=>{h+='<span style="color:var(--bad)">⚠ '+esc(k)+': '+esc(v)+'</span><br>'});
  h+='Only whole public lists are downloaded (Palo Alto, NVD, CVE.org, CISA); device versions are matched here and never sent out.</div>';
- p.innerHTML=h}
+ return h}
 async function advCfg(i,k){const g=((advData||{}).results||[])[i];if(!g||!g.ids||!g.ids[k])return;const id=g.ids[k],nm=(g.devices||[])[k]||"device";
  const lbl="Advisories vs configuration · "+nm;setBusy(lbl);
  const r=await api("/api/run",{id,check:"advcfg",params:{}});if(r&&typeof r==="object")r._dev=id;show(r,lbl);
@@ -16892,6 +18150,7 @@ def dash_sw_retrend(items, rng):
                 tr, src = None, ""
                 d.setdefault("errors", []).append("history (%s): %s" % (SW_RANGES[rng][2], str(getattr(e, "reason", e))[:160]))
             d["sw"]["trend"], d["sw"]["trend_src"] = tr, src
+            d["sw"]["ins"] = dash_sw_ins(sid, s, rng)
     finally:
         DASH["sw_busy"] = False
 
@@ -16907,6 +18166,26 @@ def sw_dev_kind(n):
     """f5 / paloalto / fortigate / firewall from the Orion node's vendor and machine type ('' = something else)."""
     text = "%s | %s" % (n.get("vendor") or "", n.get("model") or "")
     return next((k for k, rx in SW_DEV_KINDS if rx.search(text)), "")
+
+
+def dash_sw_insrange(rng=None):
+    rng = rng or dash_sw_range()
+    return rng if rng in SWI_RANGES else "30d"   # the alert history usually holds ~30 days
+
+
+def dash_sw_ins(sid, sess, rng=None):
+    """NOC attention board for the dashboard panel; read again at most every 5 minutes or when the range changes."""
+    ir = dash_sw_insrange(rng)
+    c = DASH.setdefault("swins", {}).get(sid)
+    if c and c["rng"] == ir and time.time() - c["t"] < 300:
+        return c["w"]
+    try:
+        r = sw_insights(sess, {"range": ir})
+        w = r.get("swins") or {"range": ir, "error": r.get("error") or "no alert history"}
+    except Exception as e:   # noqa: BLE001 - the rest of the panel still shows
+        w = {"range": ir, "error": str(getattr(e, "reason", e))[:200]}
+    DASH["swins"][sid] = {"t": time.time(), "rng": ir, "w": w}
+    return w
 
 
 def dash_sw(sid, sess):
@@ -16952,7 +18231,7 @@ def dash_sw(sid, sess):
                   if al is not None else None,
                   "busiest": [{"node": r["node"], "interface": r["interface"], "util": r["_util"], "in": r["in_util_%"],
                                "out": r["out_util_%"], "speed": r["speed"], "cls": r["_cls"]}
-                              for r in sorted([r for r in ifs_l if r["_cls"] != "admin"], key=lambda r: -r["_util"])[:10]],
+                              for r in sorted([r for r in ifs_l if r["_cls"] != "admin" and not r.get("_util_bad")], key=lambda r: -r["_util"])[:10]],
                   "if_down": [{"node": r["node"], "interface": r["interface"], "since": r["last_change"]}
                               for r in sorted([r for r in ifs_l if r["_cls"] == "bad"], key=lambda r: str(r["last_change"]), reverse=True)[:15]],
                   "top_cpu": [pick(n) for n in sorted([n for n in managed if n["cpu_%"] != ""], key=lambda n: -n["cpu_%"])[:8]],
@@ -16964,6 +18243,7 @@ def dash_sw(sid, sess):
     h.append({"t": time.strftime("%H:%M"), "availability": kpi["availability"], "alerts": kpi["alerts"], "if_down": kpi["if_down"],
               "cpu": round(sum(n["cpu_%"] for n in managed if n["cpu_%"] != "") / max(1, sum(1 for n in managed if n["cpu_%"] != "")), 1)})
     out["sw"]["hist"] = list(h)
+    out["sw"]["ins"] = dash_sw_ins(sid, sess)
     # per-node summary, used to add Orion's view to the firewall / F5 cards
     al_by, if_by = collections.defaultdict(list), collections.defaultdict(list)
     for a in al_l:
@@ -18465,7 +19745,7 @@ def adv_device(sess):
         info["version"], info["model"] = adv_fx_version(fi.get("version")), str(fi.get("model") or "FortiWeb")
     else:
         _, ok, d = pan_op(sess, "<show><system><info/></system></show>")
-        s = (((d.get("response") or {}).get("result") or {}).get("system") or {}) if ok and isinstance(d, dict) else {}
+        s = (((d.get("response") or d).get("result") or {}).get("system") or {}) if ok and isinstance(d, dict) else {}   # pan_op has already unwrapped <response>
         info["version"], info["model"] = str(s.get("sw-version") or ""), str(s.get("model") or "")
         info["panorama"] = bool(re.match(r"(panorama|m-\d)", info["model"], re.I))
     info["t"] = time.time()

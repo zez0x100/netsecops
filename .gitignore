@@ -12,3 +12,8 @@ brand_logo.svg
 brand_logo.png
 advisory_cache.json
 advisory_cache.json.tmp
+flow_portal.json
+portal_logins.dat
+portal_logins.dat.tmp
+portal_audit.log
+portal_audit.log.1

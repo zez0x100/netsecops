@@ -4,6 +4,31 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
 **FortiWeb** and **FortiADC** devices, **Cloudflare** accounts and **SolarWinds Orion** monitoring, from one place. Python 3.8+, standard library only, no dependencies, built with Claude Code.
 
 ## Features
+- Devices sidebar: one coloured bar per connected device (colour chosen automatically, changeable per device; kept on
+  this PC). F5, FortiGate and Palo Alto bars open into sections, and each item shows just that tool on the right with
+  a "device › section › item" header:
+  - F5: Vendor advisory, Health & alarms, SSH, WAF (ASM request log, Security dashboard, WAF posture), LTM (IP and
+    hostname lookup, virtual servers, iRules, policies, SNAT, pools, live connections), Audit check, Troubleshooting
+    (F5 active tools, raw query), General (backup, performance, interfaces, certificates, config sync, SSL posture,
+    failover, license, version, hardware)
+  - FortiGate / Palo Alto: Vendor advisory, Health & alarms, SSH, Troubleshooting (policy lookup, traffic log search,
+    flow check = which policy matches a flow on this firewall, sessions, raw query), ACC (ACC, AppSec checks), VPN
+    (IPsec tunnels; Palo Alto also IKE SAs), Network, Device (license, resources, HA, backup), Audit
+  - Health & alarms is the device monitor (the bell) for this device only: its status, what is out of service and
+    its alarms and changes. A check the menu does not name appears under "More".
+  - FortiWeb: Vendor advisory, SSH, Security (Security dashboard, Open Analytics, Attack log search, OWASP
+    Compliance, Web protection profiles), Server policies (policies, virtual servers / IPs, pools and members, protected
+    hostnames, find in configuration), General (performance, interfaces, HA, certificates, license, system status).
+    Attack log search: filters picked from a drop-down as in the FortiWeb GUI (action, policy, service, client IP,
+    destination, host, URL, method, country, main / sub type, signature ID, CVE, OWASP / OWASP API, threat level, client
+    risk, monitor mode, message, message ID, any field; a leading - excludes), time range up to 7 days; the list with a
+    Log details panel for the entry clicked (every field) and 'Analyze with AI'. Performance dashboard: CPU, memory and
+    log disk gauges, connections, connections / requests per second, throughput.
+    OWASP Compliance: FortiWeb's own OWASP Top 10 evaluation (policy.evaluate) of every server policy / web protection
+    profile pair, content-routing profiles included: 'N Partially / N Fully Compliant', compliance rate per pair, and per
+    category the attack signature and required protection items, Fulfilled or Unfulfilled (click a policy)
+  - FortiADC, Cloudflare and SolarWinds keep their full page. Connecting, saved profiles and the session
+    live under "+ Add device" below the bars.
 - Health checks and curated read-only status queries per vendor
 - "Where does this IP appear?" lookup (F5 pools, nodes, virtual servers, data groups, policies; PAN/Forti rules
   that reference the IP)
@@ -46,12 +71,15 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
 - F5 live connections by client IP (LTM > "Live connections by client IP"): client, virtual server, F5 source
   (self IP / SNAT) and pool member for each connection, read-only (`tmsh show sys connection` through the REST API)
 - F5 ASM/WAF request-log search (incl. by any HTTP header: value, IP, True-Client-IP, hostname, URL, time, support ID, POST body), top-10 hostnames by violations (with source IPs, True-Client-IPs, URLs), WAF and SSL posture checks
-  - Security dashboard (button at the top of the ASM section, or check 'Security dashboard' under Security; 1 hour to 7 days):
+  - Security dashboard (check 'Security dashboard' under Security; 1 hour to 7 days):
     the same layout as the Cloudflare one, from the ASM request log: blocked / alerted / passed over time, events by security
     policy, top source IPs, True-Client-IPs, hosts, URLs, countries, methods, response codes and violation ratings, and the
     attack types, violations and signatures (from up to 300 full records of blocked / alerted requests, as the list view leaves
-    them out; the summary says how many). Clicking a policy, list entry or rule filters the dashboard. Reads at most 20,000
-    log entries in about 75 seconds; the summary says when the range was not fully covered
+    them out; the summary says how many). Clicking a policy, list entry or rule filters the dashboard. Totals and the chart
+    are counted by the F5 itself (exact, even with hundreds of thousands of requests) when the unit reports totalItems and
+    filters the log by time (probed and checked once per session; a unit that logs local time without a zone is detected);
+    policies, top lists and attack details then come from a sample of about 2,400 requests spread evenly over the range.
+    A unit that cannot count is read newest first (at most 20,000 entries in about 75 seconds) and the summary says so
   - Attack filter: 'Attack type / signature / violation contains' (e.g. Buffer Overflow, SQL-Injection, Illegal meta character), alone or with the other
     filters. Each blocked / alerted request's full record is read (up to 1,500 per search, 2 minutes) and its violations and signatures are resolved to
     the ASM attack type; passed requests are skipped. Every search result now shows attack_type and signatures next to the block reason, and the
@@ -175,7 +203,8 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
     service (managed / custom rules, API Shield, rate limiting, bots ...), top source IPs, hosts, paths, ASNs, user
     agents, referers, methods, JA3 / JA4 fingerprints, countries and colos, and the custom / managed / rate limiting /
     HTTP DDoS / sensitive data / bot rules that fired. The card's filters narrow it; clicking a service, list entry, rule
-    or chart column drills down (a 1-minute column lists its events). Fields a plan does not offer (e.g. JA3) are left out
+    or chart column drills down (a 1-minute column lists its events). Active filters show as chips at the top of the
+    dashboard (also on F5 and FortiWeb): × removes one, 'Clear all' goes back to the unfiltered view. Fields a plan does not offer (e.g. JA3) are left out
     and named. The AI assistant can open it too (Cloudflare lookup 'secdash')
   - Traffic dashboard (optional button): headline tiles with change vs the previous period, requests, data
     transfer, status codes, cache status and edge TTFB p50 / p95 / p99 over time, and top paths, countries,
@@ -215,11 +244,10 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
   - HA: mode, this unit's state, peer state and link, config sync (F5 sync status, PAN-OS running sync, FortiGate
     checksums); a change since the previous refresh is highlighted
 
-- **Vendor advisories (headline under the header)**
-  - One chip per vendor and software version of the connected Palo Alto, FortiGate, FortiWeb and F5 units: number of critical /
-    high issues that affect that exact version, how many are known to be exploited, and the advised release
-    (→ version). Click a chip for the list: severity and score, advisory link, fixed release on your train, exploited
-    flag, publication date
+- **Vendor advisories (each device's "Vendor advisory" item; on FortiWeb at the top of its page)**
+  - For the device's software version: number of critical / high issues that affect that exact version, how many are
+    known to be exploited, the advised release, and the list: severity and score, advisory link, fixed release on your
+    train, exploited flag, publication date
   - Sources (public, downloaded whole every 12 hours while the console page is open, or "Refresh now"):
     Palo Alto's advisory feed (security.paloaltonetworks.com) for PAN-OS; for F5, FortiOS and FortiWeb, the NVD lists of
     every BIG-IP / FortiOS / FortiWeb CVE and each CVE's record from the vendor on CVE.org (affected ranges and fixed versions; NVD's
@@ -264,6 +292,16 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
 
 - **SolarWinds Orion** (vendor "SolarWinds Orion" in Connect; SWIS API on port 17774, older Orion 17778, tried
   automatically)
+  - NOC attention board (card at the top of the SolarWinds page, or check 'NOC attention board'; 24 hours, 7 or 30
+    days): from the alert history (Orion.AlertHistory), compared with the previous period of the same length:
+    - Needs attention now: the active alerts ranked by a score (severity, time active, not acknowledged, repeats in the
+      period, flapping, and the node's criticality when the nodes have a custom property such as Criticality or Tier),
+      each with the reasons
+    - KPIs: active critical, alarms triggered (vs the previous period), new alarm objects, flapping alarms, oldest
+      unacknowledged, median time to acknowledge and to clear (vs the previous period)
+    - Noisy nodes: node x alarm type heatmap, flapping marked (at least 5 triggers on one object, most cleared within
+      30 minutes); response times per alarm type. Clicking a node opens its detail. Read-only SWQL; the summary says
+      when SolarWinds' history retention is shorter than the comparison needs
   - Overview: nodes, interfaces and active alerts by status, and what needs attention
   - Active alerts, most severe first, with object, node, age, message and acknowledgement
   - Nodes needing attention (not up, CPU or memory >= 90%, packet loss), all nodes, one node in detail (health, every
@@ -354,6 +392,38 @@ and checked first, then the running server switches to it. Connected devices, op
 logins, AI settings and the URL stay as they are, so nothing has to be re-entered. If the page itself changed, a bar
 offers "Reload page"; if the edited file has an error, the bar shows it and the previous code keeps running.
 Changes to the update watcher or to startup options (`main()`) still need a restart. Turn it off with `--no-live-update`.
+
+## Flow check portal for end users (`flow_portal.py`)
+A separate, small web page for end users who have no access to the firewalls. The user enters a source IP (it is
+pre-filled with the address they connect from), a destination (IP or server name), a port and TCP / UDP. The portal
+runs the same flow trace as the console's ⇄ Flow trace and shows:
+- the verdict: no block found, blocked, could not confirm every step, or no checked device is on this path
+- the path as steps (source → each device → destination) with the names you give the devices (for example
+  "Internet firewall", "Data centre firewall"), and the step where it stops with a plain reason (for example "no
+  firewall rule allows this traffic, or a rule denies it")
+- a reference ID to give to the network team.
+
+Rule and policy names, device addresses, NAT and server addresses are never sent to the browser. Every check goes to
+`portal_audit.log` (JSON lines: time, client address, source, destination, port, the verdict and the full hop detail);
+look one up with `python flow_portal.py ref FC-261122-1A2B3C`.
+
+It runs on its own (a server or VM; Python 3.8+, standard library only) next to a copy of `netops_console.py`, which it
+imports for the trace. Put `vip_map.txt` / `nat_map.txt` there too if you use them.
+```
+python flow_portal.py setup     # add the devices: vendor, the name users see, address and a READ-ONLY login
+python flow_portal.py serve --bind 10.0.0.5 --port 8443 --allow 10.10.0.0/16,10.20.0.0/16 --cert portal.pem --key portal.key
+```
+- **Who can use it:** there is no user login. Only clients from the `--allow` networks can open it (everyone else gets
+  403); it refuses to start on a non-loopback address without `--allow`. Use HTTPS (`--cert`, `--key`).
+- **Device logins:** `portal_logins.dat`, encrypted with a passphrase (PBKDF2-SHA256 600k rounds; HMAC-SHA256 stream
+  cipher with an HMAC tag, standard library only). The passphrase is asked at start, or read from the
+  `FLOW_PORTAL_PASSPHRASE` environment variable (removed from the process environment once read). Devices that do not
+  answer at start are tried again every 5 minutes.
+- **Load on the devices:** at most 2 checks run at the same time (`--max-parallel`). Checks use the configuration
+  (routes, policies, VIPs, virtual servers); `--logs` also searches the traffic / WAF logs (slower, `--within` sets the range).
+- Settings can also go in `flow_portal.json` next to it (`bind`, `port`, `allow`, `cert`, `key`, `logs`, `within`,
+  `max_parallel`, `title`). `flow_portal.json`, `portal_logins.dat` and `portal_audit.log` are git-ignored: never commit them.
+- Supported devices: FortiGate, Palo Alto, F5 BIG-IP and Cloudflare (the devices the flow trace uses).
 
 ## Security model
 - Binds to `127.0.0.1` only; random per-launch token plus Host-header check (CSRF / DNS-rebinding protection).
