@@ -4600,6 +4600,130 @@ def swi_crit(sess):
     return out, col
 
 
+def swi_focus(att, cur, prev, flap, by_obj, now, crit_col):
+    """The board in plain sentences: what to act on now, which noise to fix (weekly) and housekeeping.
+    Items: {"lvl": act|tune|hyg, "text", "node"?, "hour_utc"?} - "{HOUR}" in a text is the hour shown in the viewer's time."""
+    act, tune, hyg, used = [], [], [], set()
+    total = len(cur)
+    pct = lambda n: int(round(100.0 * n / total)) if total else 0   # noqa: E731
+    # alarms that started together on several nodes: one cause, handle them as one incident
+    by_name = collections.defaultdict(list)
+    for a in att:
+        if a.get("trig"):
+            by_name[a["alert"]].append(a)
+    groups = []
+    for name, xs in by_name.items():
+        xs.sort(key=lambda a: a["trig"])
+        run = [xs[0]]
+        for a in xs[1:] + [None]:
+            if a is not None and a["trig"] - run[-1]["trig"] <= 600:
+                run.append(a)
+                continue
+            nodes = sorted({x["node"] for x in run})
+            if len(nodes) >= 2:
+                groups.append((name, run, nodes))
+            if a is not None:
+                run = [a]
+    groups.sort(key=lambda g: (-max(x["score"] for x in g[1]), -len(g[2])))
+    for name, run, nodes in groups[:2]:
+        span_m = int((run[-1]["trig"] - run[0]["trig"]) // 60)
+        who = (" and ".join(nodes) if len(nodes) <= 3 else "%d nodes (%s, ...)" % (len(nodes), ", ".join(nodes[:3])))
+        act.append({"lvl": "act", "text": "%s: \"%s\" started on all of them within %s, %s ago. Probably one cause: handle them as one "
+                    "incident%s." % (who, name, "%d min" % span_m if span_m else "the same minute", swi_dur(now - run[0]["trig"]),
+                                     " (site power, uplink or upstream device?)" if len(nodes) > 3 else "")})
+        used.update((x["node"], x["alert"]) for x in run)
+    # highest scores
+    hi = [a for a in att if a["score"] >= 80 and (a["node"], a["alert"]) not in used]
+    for a in hi[:3]:
+        why = [w for w in a["why"] if w not in ("critical", "warning", "serious", "informational")]
+        act.append({"lvl": "act", "node": a["node"], "text": "%s: %s%s, active %s%s." % (
+            a["node"], a["alert"], " (%s)" % a["object"] if a["object"] and a["object"] != a["node"] else "", a["age"],
+            " · " + ", ".join(why) if why else "")})
+        used.add((a["node"], a["alert"]))
+    if len(hi) > 3:
+        act.append({"lvl": "act", "text": "%d more alarm(s) score 80 or higher: see the list below." % (len(hi) - 3)})
+    # recurring: the same alarm keeps coming back
+    rec = sorted([a for a in att if a.get("rep", 0) >= 5 and (a["node"], a["alert"]) not in used and "flapping" not in " ".join(a["why"])],
+                 key=lambda a: -a["rep"])
+    for a in rec[:2]:
+        act.append({"lvl": "act", "node": a["node"], "text": "%s: \"%s\" came back %d times this period. Fix the cause; clearing it "
+                    "again will not last." % (a["node"], a["alert"], a["rep"])})
+        used.add((a["node"], a["alert"]))
+    # noise: two rules that fire together (duplicates)
+    names = collections.Counter(x["name"] for x in cur)
+    keys = collections.defaultdict(set)
+    for x in cur:
+        keys[x["name"]].add((x["node"], int(x["trig"] // 300)))
+    near = lambda k, other: k in other or (k[0], k[1] - 1) in other or (k[0], k[1] + 1) in other   # noqa: E731
+    top = [n for n, c in names.most_common(15) if c >= 10]
+    dup, in_dup = [], set()
+    for i, a in enumerate(top):
+        for b in top[i + 1:]:
+            if a in in_dup or b in in_dup:
+                continue
+            ka, kb = keys[a], keys[b]
+            small, big = (ka, kb) if len(ka) <= len(kb) else (kb, ka)
+            both = sum(1 for k in small if near(k, big))
+            if both >= 10 and both >= 0.8 * len(small):
+                dup.append((a, b, min(names[a], names[b])))
+                in_dup.update((a, b))
+    for a, b, n in sorted(dup, key=lambda d: -d[2])[:2]:
+        tune.append({"lvl": "tune", "text": "Rules \"%s\" and \"%s\" fire together on the same nodes at the same minutes: "
+                     "probably duplicates. Disabling one removes about %s alarms (%d%% of all)." % (a, b, "{:,}".format(n), pct(n))})
+    # noise: one rule makes a big share of all alarms
+    for n, c in names.most_common(3):
+        if n not in in_dup and c >= 20 and pct(c) >= 20:
+            tune.append({"lvl": "tune", "text": "Rule \"%s\" alone raised %s alarms (%d%% of all). Review its threshold or scope, or make "
+                         "it a report instead of an alarm." % (n, "{:,}".format(c), pct(c))})
+    # noise: a rule that fires many times on many nodes (too broad, or a shared cause)
+    per = collections.Counter((x["name"], x["node"]) for x in cur)
+    broad = collections.Counter(n for (n, _), c in per.items() if c >= 10)
+    for n, k in broad.most_common(2):
+        if k >= 4 and n not in in_dup and pct(names[n]) < 20:
+            tune.append({"lvl": "tune", "text": "Rule \"%s\" fires 10 or more times on each of %d nodes. Click its column in the heatmap: the "
+                         "same ports at the same hour point to unused ports being monitored or a scheduled event." % (n, k)})
+    # noise: one node makes a big share of all alarms
+    nodes = collections.Counter(x["node"] for x in cur)
+    told = {t["text"].split('"')[1] for t in tune if t["text"].startswith('Rule "')} | in_dup
+    for n, c in nodes.most_common(2):
+        mine = collections.Counter(x["name"] for x in cur if x["node"] == n)
+        if c >= 20 and pct(c) >= 20 and sum(k for r_, k in mine.items() if r_ in told) < 0.8 * c:   # not already explained by a rule
+            tune.append({"lvl": "tune", "node": n, "text": "Node %s raised %s alarms (%d%% of all). Tuning its alerts shortens "
+                         "the board the most." % (n, "{:,}".format(c), pct(c))})
+    # noise: alarms that fire at the same hour (scheduled jobs)
+    sched = []
+    for (n, node), c in per.items():
+        if c < 6:
+            continue
+        hrs = collections.Counter(time.gmtime(x["trig"]).tm_hour for x in cur if x["name"] == n and x["node"] == node)
+        h, k = hrs.most_common(1)[0]
+        if k >= 0.5 * c:
+            sched.append((c, n, node, h, int(round(100.0 * k / c))))
+    for c, n, node, h, pc in sorted(sched, reverse=True)[:2]:
+        tune.append({"lvl": "tune", "node": node, "hour_utc": h, "text": "\"%s\" on %s fires mostly at {HOUR} (%d%% of %d): looks "
+                     "scheduled (backup, job). Fix the job or set a maintenance window." % (n, node, pc, c)})
+    if flap:
+        tune.append({"lvl": "tune", "text": "%d alarm(s) are flapping: they trigger and clear within minutes, again and again. Rows marked "
+                     "FLAP in the heatmap: check the link, optic or threshold." % len(flap)})
+    # housekeeping
+    stale = [a for a in att if not a["ack"] and a.get("trig") and now - a["trig"] > 7 * 86400]
+    if stale:
+        o = min(stale, key=lambda a: a["trig"])
+        hyg.append({"lvl": "hyg", "text": "%d active alarm(s) nobody acknowledged for more than 7 days (oldest %s: %s, %s). Fix or close "
+                    "them: alarms left open teach the team to ignore the board." % (len(stale), swi_dur(now - o["trig"]), o["node"], o["alert"])})
+    acked = sum(1 for x in cur if x["ack"])
+    if total >= 20 and acked < 0.05 * total:
+        hyg.append({"lvl": "hyg", "text": "Only %d of %s alarms were acknowledged. Acknowledge what you take, so the top of the board "
+                    "shows only work nobody owns." % (acked, "{:,}".format(total))})
+    if prev and len(prev) >= 10 and total >= 1.2 * len(prev):
+        hyg.append({"lvl": "hyg", "text": "Alarms are up %d%% on the previous period (%s against %s)." % (
+            int(round(100.0 * (total - len(prev)) / len(prev))), "{:,}".format(total), "{:,}".format(len(prev)))})
+    if not crit_col:
+        hyg.append({"lvl": "hyg", "text": "Tip: a node custom property such as Criticality (core / high / low) lets the board put core "
+                    "devices first."})
+    return act[:6] + tune[:5] + hyg[:3]
+
+
 def sw_insights(sess, v):
     t0 = time.time()
     rng = str(v.get("range") or "7d")
@@ -4678,7 +4802,8 @@ def sw_insights(sess, v):
             why.append("%s: %s" % (crit_col, cw[1]))
         att.append({"score": int(round(min(100, score))), "sev": sev, "node": a.get("RelatedNodeCaption") or a.get("EntityCaption") or "",
                     "alert": a.get("Name") or "", "object": a.get("EntityCaption") or "", "why": why, "age": swi_dur(now - trig) if trig else "",
-                    "ack": ack, "hot": [w for w in why if w in ("critical", "not acknowledged") or w.startswith("flapping")]})
+                    "ack": ack, "hot": [w for w in why if w in ("critical", "not acknowledged") or w.startswith("flapping")],
+                    "trig": trig, "rep": n_rep})
     att.sort(key=lambda r: -r["score"])
     # noisy nodes x alert types (triggers in the period)
     cnt = collections.Counter((x["node"], x["name"]) for x in cur)
@@ -4688,8 +4813,19 @@ def sw_insights(sess, v):
         name_tot[a] += c
     cols = [a for a, _ in name_tot.most_common(8)]
     flap_nodes = {xs[0]["node"] for o, xs in by_obj.items() if o in flap}
-    heat = [{"node": n, "total": t, "flap": n in flap_nodes, "cells": [cnt.get((n, a), 0) for a in cols]}
-            for n, t in node_tot.most_common(15)]
+    ev_by = collections.defaultdict(list)
+    for x in cur:
+        ev_by[(x["node"], x["name"])].append(x)
+
+    def evs(xs):   # newest 100 triggers of one cell: [epoch, seconds to clear | None, acknowledged, object, alert]
+        return [[int(x["trig"]), int(x["reset"] - x["trig"]) if x["reset"] and x["reset"] >= x["trig"] else None,
+                 1 if x["ack"] else 0, x["ent"], x["name"]] for x in sorted(xs, key=lambda x: -x["trig"])[:100]]
+    heat = []
+    for n, t in node_tot.most_common(15):
+        cells = [cnt.get((n, a), 0) for a in cols]
+        other = [x for a in name_tot if a not in cols for x in ev_by.get((n, a), [])]
+        heat.append({"node": n, "total": t, "flap": n in flap_nodes, "cells": cells, "other": t - sum(cells),
+                     "ev": [evs(ev_by.get((n, a), [])) for a in cols] + [evs(other)]})
     flaps = sorted(({"node": xs[0]["node"], "alert": xs[0]["name"], "object": xs[0]["ent"], "times": len(xs),
                      "median_duration": swi_dur(swi_median([x["reset"] - x["trig"] for x in xs if x["reset"]]))}
                     for o, xs in by_obj.items() if o in flap), key=lambda r: -r["times"])[:15]
@@ -4725,6 +4861,7 @@ def sw_insights(sess, v):
          "note": oldest_un[1] if oldest_un else ""},
         {"label": "Median time to acknowledge", "value": swi_dur(ca) or "n/a", "fmt": "text", "sec": ca, "prev_sec": pa},
         {"label": "Median time to clear", "value": swi_dur(cc) or "n/a", "fmt": "text", "sec": cc, "prev_sec": pc}]
+    focus = swi_focus(att, cur, prev, flap, by_obj, now, crit_col)
     span = {"24h": "24 hours", "7d": "7 days", "30d": "30 days"}[rng]
     notes = ["Alert history of the last %s (%s alarm(s) triggered) compared with the %s before; %d active alert(s) ranked."
              % (span, "{:,}".format(len(cur)), span, len(act))]
@@ -4738,16 +4875,18 @@ def sw_insights(sess, v):
                     "; add a node custom property such as Criticality to rank core devices first"))
     notes.append("Flapping = at least 5 triggers in the period on one object, most cleared within 30 minutes. Times are UTC.")
     ncrit = sum(1 for r in att if r["sev"] == 2)
-    data = {"needs_attention": [{"score": r["score"], "node": r["node"], "alert": r["alert"], "object": r["object"],
+    data = {"focus": [("%s: " % {"act": "Act now", "tune": "Fix the noise", "hyg": "Housekeeping"}[f["lvl"]]) +
+                      f["text"].replace("{HOUR}", "%02d:00 UTC" % f["hour_utc"] if "hour_utc" in f else "") for f in focus],
+            "needs_attention": [{"score": r["score"], "node": r["node"], "alert": r["alert"], "object": r["object"],
                                  "active_for": r["age"], "why": ", ".join(r["why"])} for r in att[:25]],
             "noisy_nodes": [dict({"node": h["node"], "alarms": h["total"], "flapping": "yes" if h["flap"] else ""},
-                                 **{c: h["cells"][i] for i, c in enumerate(cols)}) for h in heat],
+                                 **dict({c: h["cells"][i] for i, c in enumerate(cols)}, Other=h["other"])) for h in heat],
             "flapping": flaps, "response_by_alert": response}
     r = sw_done(t0, "SWQL Orion.AlertHistory (%s, previous period) + Orion.AlertActive" % span, data, notes,
                 "%d NEED ATTENTION · %d CRITICAL · %s ALARMS IN %s" % (len([x for x in att if x["score"] >= 60]), ncrit,
                                                                        "{:,}".format(len(cur)), span.upper()),
                 "bad" if ncrit else "warn" if att else "ok")
-    r["swins"] = {"range": rng, "attention": att[:10], "kpis": kpis, "heat": {"cols": cols, "rows": heat}, "flapping": flaps[:8],
+    r["swins"] = {"range": rng, "focus": focus, "attention": att[:10], "kpis": kpis, "heat": {"cols": cols, "rows": heat}, "flapping": flaps[:8],
                   "response": response, "crit": crit_col}
     return r
 
@@ -14316,9 +14455,8 @@ def llm_tools():
               "device": S("only this firewall; empty = all connected firewalls", enum=fws)}, ["src", "dst"])
     if any(s["vendor"] in DASH_VENDORS for _, s in devs.values()):
         tool("dashboard", "Snapshot of the operations dashboard from its last refresh (usually minutes old; the time is "
-             "in the result): every connected firewall / F5 with health, HA state and sync, CPU / memory / sessions, "
-             "interfaces down, SolarWinds' view of it; F5s / firewalls SolarWinds monitors but the console is not "
-             "connected to; and per Orion server: nodes up %, nodes / interfaces down, active alerts, busiest interfaces, "
+             "in the result): the F5s / firewalls SolarWinds monitors (Orion's data) "
+             "and per Orion server: nodes up %, nodes / interfaces down, active alerts, busiest interfaces, "
              "highest CPU, slowest nodes and trends (range picked on the dashboard, 24 h to 12 months). Use it FIRST for overall health questions ('what needs "
              "attention', 'is anything down', 'which firewall is busiest', 'how was the last 24 h'), then run live "
              "checks for details.",
@@ -14629,7 +14767,7 @@ def do_llm_chat(b):
     if b.get("source") == "dashboard":   # asked from the dashboard: its current snapshot is the output to answer from
         dash_ensure()
         ctx = dash_snapshot()
-        b = dict(b, label="Operations dashboard (all devices; SolarWinds if connected)", device="",
+        b = dict(b, label="Operations dashboard (SolarWinds)", device="",
                  time=(DASH["last"] or "")[:40])
         for _, d in alldev.values():
             if d["vendor"] in DASH_VENDORS:
@@ -15141,13 +15279,25 @@ a.dl{color:var(--mint);display:inline-block;margin-bottom:8px}
 .swikpi .d{font:500 12px ui-monospace,Consolas,monospace;color:var(--dim);overflow-wrap:anywhere}.swikpi .d.up{color:var(--bad)}.swikpi .d.down{color:var(--ok)}
 .swiscroll{overflow-x:auto}:is(#pretty,#dashbody) table.swiheat{border-collapse:separate;border-spacing:3px;font-size:12px;width:auto}:is(#pretty,#dashbody) table.swiheat tr td,:is(#pretty,#dashbody) table.swiheat tr th{background:none;border:0}
 :is(#pretty,#dashbody) table.swiheat th{font-weight:500;color:var(--dim);text-align:left;white-space:nowrap;padding:2px 8px 2px 0;max-width:140px;overflow:hidden;text-overflow:ellipsis}
+:is(#pretty,#dashbody) table.swiheat tr:not(:first-child) th{white-space:normal;max-width:300px;min-width:160px;overflow-wrap:anywhere}
+:is(#pretty,#dashbody) table.swiheat tr td.ck{cursor:pointer}:is(#pretty,#dashbody) table.swiheat tr td.ck:hover,:is(#pretty,#dashbody) table.swiheat tr td.on{outline:2px solid var(--mint);outline-offset:-2px}
+:is(#pretty,#dashbody) table.swiheat tr td.oth.h1{background:var(--panel2);color:var(--text)}
+.swifocus{gap:8px}.swifg{border-left:3px solid var(--line);padding:2px 0 2px 12px}.swifg.act{border-color:var(--bad)}.swifg.tune{border-color:var(--warn)}.swifg.hyg{border-color:var(--dim)}
+.swift{font-size:11.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);margin-bottom:2px}.swifg.act .swift{color:var(--bad)}.swifg.tune .swift{color:var(--warn)}
+.swifg ul{margin:0;padding-left:18px}.swifg li{font-size:13.5px;line-height:1.45;margin:2px 0}
+.swidet{border-top:1px solid var(--line);margin-top:8px;padding-top:8px;display:flex;flex-direction:column;gap:6px}
+.swidh{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.swidh b{font-size:13px}.swidh .swidx{margin-left:auto;width:auto;padding:0 8px;border:0;background:none;box-shadow:none;color:var(--dim);font-size:16px;cursor:pointer}.swidh .swidx:hover{color:var(--bad);background:none}
+.swipat{font-size:12.5px;padding:4px 10px;border-radius:6px;background:var(--panel2)}
+.swidet .swiscroll{max-height:320px;overflow:auto}
 :is(#pretty,#dashbody) table.swiheat tr:first-child th{text-align:center;font-size:11px}
 :is(#pretty,#dashbody) table.swiheat td{min-width:46px;height:26px;border-radius:5px;text-align:center;font:600 11.5px ui-monospace,Consolas,monospace}
 :is(#pretty,#dashbody) table.swiheat tr td.tot{background:none;color:var(--dim)}
 :is(#pretty,#dashbody) table.swiheat tr td.h0{background:var(--panel2)}:is(#pretty,#dashbody) table.swiheat tr td.h1{background:#f0a83033}:is(#pretty,#dashbody) table.swiheat tr td.h2{background:#f0a83080}
 :is(#pretty,#dashbody) table.swiheat tr td.h3{background:#d95926c0;color:#fff}:is(#pretty,#dashbody) table.swiheat tr td.h4{background:#c42b1c;color:#fff}
 .swiflap{font:700 10px ui-monospace,Consolas,monospace;color:var(--warn);margin-left:6px}
-@media (max-width:760px){.swirow{grid-template-columns:40px minmax(0,1fr) auto}.swirow .swiwhy{grid-column:2/-1;grid-row:2}}.dash select.secrange{width:auto;padding:2px 6px;font-size:12px;margin-right:8px}.dash .fchips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 10px}.dash .fchips:empty{display:none}.dash .fchip{display:inline-flex;align-items:center;gap:2px;max-width:100%;padding:2px 4px 2px 10px;border:1px solid var(--mint);border-radius:999px;font-size:12px}.dash .fchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px}.dash .fchip .fx,.dash .fclr{width:auto;margin:0;padding:0 6px;border:0;background:none;color:var(--mint);font-size:14px;line-height:18px;cursor:pointer}.dash .fclr{font-size:12px;border:1px solid var(--mint);border-radius:999px;padding:1px 10px}.dash .fchip .fx:hover,.dash .fclr:hover{color:var(--red,#d92d20)}.dtop{display:grid;grid-template-columns:minmax(0,1fr) 30% auto;gap:6px 10px;align-items:center;font-size:12.5px}
+@media (max-width:760px){.swirow{grid-template-columns:40px minmax(0,1fr) auto}.swirow .swiwhy{grid-column:2/-1;grid-row:2}}.dash select.secrange{width:auto;padding:2px 6px;font-size:12px;margin-right:8px}.bback{margin:0 0 10px}#pretty .bback button.bbk{display:inline-flex;align-items:center;gap:8px;width:auto;margin:0;padding:3px 6px 3px 12px;border:1px solid var(--mint);border-radius:999px;background:none;color:var(--mint);font-size:12.5px;font-weight:600;box-shadow:none;cursor:pointer}
+#pretty .bback button.bbk b{font-size:15px;line-height:16px;padding:0 4px}#pretty .bback button.bbk:hover{background:var(--panel2);color:var(--mint)}#pretty .bback button.bbk:hover b{color:var(--bad)}
+.dash .fchips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 10px}.dash .fchips:empty{display:none}.dash .fchip{display:inline-flex;align-items:center;gap:2px;max-width:100%;padding:2px 4px 2px 10px;border:1px solid var(--mint);border-radius:999px;font-size:12px}.dash .fchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px}.dash .fchip .fx,.dash .fclr{width:auto;margin:0;padding:0 6px;border:0;background:none;color:var(--mint);font-size:14px;line-height:18px;cursor:pointer}.dash .fclr{font-size:12px;border:1px solid var(--mint);border-radius:999px;padding:1px 10px}.dash .fchip .fx:hover,.dash .fclr:hover{color:var(--red,#d92d20)}.dtop{display:grid;grid-template-columns:minmax(0,1fr) 30% auto;gap:6px 10px;align-items:center;font-size:12.5px}
 #pretty .dtop .dn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#pretty .dtop .dn.lnk{cursor:pointer;color:var(--mint)}
 #pretty .dtop .db{height:6px;border-radius:3px;background:var(--panel2)}#pretty .dtop .db span{display:block;height:6px;border-radius:3px;background:#3987e5}
 #pretty .dtabs{display:flex;gap:6px;flex-wrap:wrap}#pretty .dtabs button.on{border-color:var(--violet);box-shadow:0 0 12px #7C6CFF33;color:var(--mint)}
@@ -15655,6 +15805,7 @@ function dev(){return devices.find(d=>d.id===cur)}
 function swInsights(range){const d=dev();if(!d||d.vendor!=="solarwinds")return;try{localStorage.setItem("swi_range",range)}catch(e){}
  run((catalog.solarwinds||[]).find(c=>c.id==="insights"),{range:{value:range}})}
 function swNode(name){const c=(catalog.solarwinds||[]).find(x=>x.id==="node");if(c&&name)run(c,{node:{value:name}})}
+function swDur(x){x=Math.max(0,Math.round(x));return x<3600?Math.round(x/60)+" min":x<172800?Math.floor(x/3600)+" h "+String(Math.floor(x%3600/60)).padStart(2,"0")+" m":Math.floor(x/86400)+" d "+Math.floor(x%86400/3600)+" h"}
 function swInsNode(w,dash){const root=mk("div","swi"+(dash?" swidash":""));
  const nodeEl=(name,cls)=>{if(dash){const x=mk("div",cls);x.title=name;return x}const b=mk("button",cls);b.type="button";b.title="Open "+name;b.onclick=()=>swNode(name);return b};
  const span={"24h":"24 hours","7d":"7 days","30d":"30 days"}[w.range]||w.range;
@@ -15664,6 +15815,12 @@ function swInsNode(w,dash){const root=mk("div","swi"+(dash?" swidash":""));
  [["24h","Last 24 hours"],["7d","Last 7 days"],["30d","Last 30 days"]].forEach(([v,l])=>{const o=mk("option",null,l);o.value=v;rs.appendChild(o)});
  rs.value=w.range;rs.onchange=()=>swInsights(rs.value);bar.appendChild(rs);if(!dash){
  bar.appendChild(mk("span","muted","Compared with the previous "+({"24h":"24 hours","7d":"7 days","30d":"30 days"}[w.range]||w.range)+" · click a node for its detail"));root.appendChild(bar)}
+ // 0. focus: the board in sentences
+ if((w.focus||[]).length){const fc=mk("div","swicard swifocus");fc.appendChild(mk("h4","dsub","Focus · what to do"));
+  [["act","Act now"],["tune","Fix the noise · weekly"],["hyg","Housekeeping"]].forEach(([k,t])=>{const xs=w.focus.filter(f=>f.lvl===k);if(!xs.length)return;
+   const g=mk("div","swifg "+k);g.appendChild(mk("div","swift",t));const ul=mk("ul");
+   xs.forEach(f=>{const li=mk("li");let tx=f.text;if(f.hour_utc!=null){const d=new Date();d.setUTCHours(f.hour_utc,0,0,0);const h=d.getHours();tx=tx.replace("{HOUR}",String(h).padStart(2,"0")+":00–"+String((h+1)%24).padStart(2,"0")+":00")}
+    li.textContent=tx;ul.appendChild(li)});g.appendChild(ul);fc.appendChild(g)});root.appendChild(fc)}
  // 1. needs attention now
  const at=mk("div","swicard");at.appendChild(mk("h4","dsub","Needs attention now"));
  if(!w.attention.length)at.appendChild(mk("div","muted","No active alert. Nothing needs action."));
@@ -15678,15 +15835,32 @@ function swInsNode(w,dash){const root=mk("div","swi"+(dash?" swidash":""));
   let dl="",cls="";if(x.prev!=null&&x.prev>0){const c=100*(x.value-x.prev)/x.prev;dl=(Math.abs(c)<1?"= ":c>0?"↗ +":"↘ ")+Math.round(c)+"% vs "+x.prev.toLocaleString();cls=Math.abs(c)<1?"":c>0?"up":"down"}
   else if(x.sec!=null&&x.prev_sec!=null&&x.prev_sec>0){const c=100*(x.sec-x.prev_sec)/x.prev_sec;dl=Math.abs(c)<1?"= same as before":(c>0?"↗ +":"↘ ")+Math.round(c)+"% vs before";cls=Math.abs(c)<1?"":c>0?"up":"down"}
   else if(x.note)dl=x.note;t.appendChild(mk("span","d "+cls,dl));if(x.note&&x.prev==null)t.title=x.note;k.appendChild(t)});root.appendChild(k);
- // 3. noisy nodes: node x alert type
+ // 3. noisy nodes: node x alert type (+ Other); click a cell for its alarms
  if(w.heat.rows.length){const hc=mk("div","swicard");hc.appendChild(mk("h4","dsub","Noisy nodes · alarms triggered by type"));
-  const sc=mk("div","swiscroll"),tb=mk("table","swiheat"),hr=mk("tr");hr.appendChild(mk("th"));w.heat.cols.forEach(c=>{const th=mk("th",null,c);th.title=c;hr.appendChild(th)});hr.appendChild(mk("th",null,"Total"));tb.appendChild(hr);
-  const mx=Math.max(1,...w.heat.rows.flatMap(r=>r.cells));
+  const oth=w.heat.rows.some(r=>r.other>0),cols=w.heat.cols.concat(oth?["Other"]:[]);
+  const sc=mk("div","swiscroll"),tb=mk("table","swiheat"),hr=mk("tr");hr.appendChild(mk("th"));cols.forEach(c=>{const th=mk("th",null,c);th.title=c;hr.appendChild(th)});hr.appendChild(mk("th",null,"Total"));tb.appendChild(hr);
+  const mx=Math.max(1,...w.heat.rows.flatMap(r=>r.cells)),det=mk("div","swidet");det.hidden=true;let on=null;
+  const open=(r,i,td)=>{if(on===td){det.hidden=true;td.classList.remove("on");on=null;return}if(on)on.classList.remove("on");on=td;td.classList.add("on");det.textContent="";det.hidden=false;
+   const ev=(r.ev||[])[i]||[],n=i<w.heat.cols.length?r.cells[i]:r.other,other=i>=w.heat.cols.length;
+   const h=mk("div","swidh");h.appendChild(mk("b",null,r.node+" · "+(other?"other alarm types":w.heat.cols[i])));h.appendChild(mk("span","muted",n+" trigger"+(n===1?"":"s")+" in the period"+(ev.length<n?" · newest "+ev.length+" listed":"")));
+   const x=mk("button","swidx","×");x.type="button";x.title="Close";x.setAttribute("aria-label","Close");x.onclick=()=>open(r,i,td);h.appendChild(x);det.appendChild(h);
+   if(ev.length>=4){const hrs=new Array(24).fill(0);ev.forEach(e=>hrs[new Date(e[0]*1e3).getHours()]++);const top=hrs.indexOf(Math.max(...hrs)),pc=Math.round(100*hrs[top]/ev.length);
+    const cl=ev.filter(e=>e[1]!=null).map(e=>e[1]).sort((a,b)=>a-b),med=cl.length?cl[Math.floor(cl.length/2)]:null,ack=ev.filter(e=>e[2]).length;
+    det.appendChild(mk("div","swipat",(pc>=30?"Most at "+String(top).padStart(2,"0")+":00–"+String((top+1)%24).padStart(2,"0")+":00 ("+pc+"%): looks scheduled. ":"Spread over the day. ")+
+     (med!=null?"Median time to clear "+swDur(med)+". ":"")+ack+" of "+ev.length+" acknowledged."))}
+   const t=mk("table","swiresp"),th=mk("tr");["Triggered (your time)",other?"Alarm":null,"Object","Cleared after","Acknowledged"].filter(Boolean).forEach(c=>th.appendChild(mk("th",null,c)));t.appendChild(th);
+   ev.forEach(e=>{const tr=mk("tr");tr.appendChild(mk("td","n",new Date(e[0]*1e3).toLocaleString([], {month:"short",day:"2-digit",hour:"2-digit",minute:"2-digit"})));
+    if(other)tr.appendChild(mk("td",null,e[4]));tr.appendChild(mk("td",null,e[3]||""));
+    tr.appendChild(mk("td","n"+(e[1]==null?" bad":""),e[1]==null?"still open":swDur(e[1])));tr.appendChild(mk("td","n",e[2]?"yes":"no"));t.appendChild(tr)});
+   const ts=mk("div","swiscroll");ts.appendChild(t);det.appendChild(ts);det.scrollIntoView({block:"nearest",behavior:"smooth"})};
   w.heat.rows.forEach(r=>{const tr=mk("tr"),th=mk("th"),b=nodeEl(r.node,"swinode");b.textContent=r.node;th.appendChild(b);
    if(r.flap){const f=mk("span","swiflap","FLAP");f.title="Has an alarm that keeps triggering and clearing";th.appendChild(f)}tr.appendChild(th);
-   r.cells.forEach((v,i)=>{const lv=v?Math.min(4,1+Math.floor(3.999*v/mx)):0,td=mk("td","h"+lv,v?String(v):"");td.title=r.node+" · "+w.heat.cols[i]+": "+v;tr.appendChild(td)});
+   r.cells.concat(oth?[r.other]:[]).forEach((v,i)=>{const isO=i>=w.heat.cols.length,lv=v?(isO?1:Math.min(4,1+Math.floor(3.999*v/mx))):0,td=mk("td","h"+lv+(isO?" oth":""),v?String(v):"");
+    td.title=r.node+" · "+cols[i]+": "+v+(v?" · click for the alarms":"");
+    if(v){td.tabIndex=0;td.classList.add("ck");td.onclick=()=>open(r,i,td);td.onkeydown=e=>{if(e.key==="Enter")open(r,i,td)}}tr.appendChild(td)});
    tr.appendChild(mk("td","tot",String(r.total)));tb.appendChild(tr)});
-  sc.appendChild(tb);hc.appendChild(sc);hc.appendChild(mk("div","muted","A bright row is a sick device, a bright column a noisy alert rule, a bright cell one recurring fault."));root.appendChild(hc)}
+  sc.appendChild(tb);hc.appendChild(sc);hc.appendChild(det);
+  hc.appendChild(mk("div","muted","A bright row is a sick device, a bright column a noisy alert rule, a bright cell one recurring fault. Other = the node's alarms of types without a column. Click a number for its alarms."));root.appendChild(hc)}
  // 4. response per alarm type (the check's output has it as a table below)
  if(dash&&(w.response||[]).length){const rc=mk("div","swicard");rc.appendChild(mk("h4","dsub","Response · median time to acknowledge and to clear"));
   const sc=mk("div","swiscroll"),tb=mk("table","swiresp"),hr=mk("tr");["Alarm type","Times","Acknowledge","Clear","Still open"].forEach(t=>hr.appendChild(mk("th",null,t)));tb.appendChild(hr);
@@ -16110,7 +16284,19 @@ async function runRaw(){const q=$("#raw").value;if(!q)return;setBusy("raw query"
  const r=await api("/api/raw",{id:cur,query:q});show(r,"raw")}
 function setBusy(l){$("#ometa").textContent="running "+l+"…";$("#pretty").textContent="";$("#verdict").innerHTML=""}
 let lastCtx={label:"",device:"",time:""};
-function show(r,l){last=r;if(typeof aiSrcSet==="function")aiSrcSet(null);const m=$("#ometa");m.textContent="";
+// Back to the dashboard: a click inside a dashboard that opens another view (node, IP, request list...) keeps the
+// dashboard; the "Back to ..." chip (×) shows it again as it was, without reading the device again.
+let boardBack=null,outClick=null;
+function isBoard(r){return !!(r&&!r.error&&(r.dashboard||r.secdash||r.swins||r.acc||r.owaspc||r.tiles||r.charts||r.bars))}
+document.addEventListener("click",e=>{const t=e.target;outClick=t&&t.closest&&t.closest("#pretty")&&!t.closest(".bback")?{from:last}:null},true);
+function boardTrack(r){const prev=last,ok=outClick&&outClick.from===prev;outClick=null;
+ if(ok&&isBoard(prev)&&!isBoard(r))boardBack={r:prev,l:lastCtx.label,dev:prev._dev||cur};   // left the dashboard
+ else if(!(ok&&boardBack&&!isBoard(r)))boardBack=null}                                      // a click in the detail keeps the way back
+function boardBackNode(){if(!boardBack||boardBack.r===last||boardBack.dev!==(last&&last._dev||cur))return null;
+ const b=mk("div","bback"),c=mk("button","bbk");c.type="button";c.title="Close this and go back to the dashboard";
+ c.appendChild(mk("span",null,"← Back to "+(String(boardBack.l).replace(/ · .*$/,"").replace(/\s*[:(].*$/,"").trim()||"the dashboard")));c.appendChild(mk("b",null,"×"));
+ c.onclick=()=>{const k=boardBack;boardBack=null;show(k.r,k.l)};b.appendChild(c);return b}
+function show(r,l){boardTrack(r);last=r;if(typeof aiSrcSet==="function")aiSrcSet(null);const m=$("#ometa");m.textContent="";
  lastCtx={label:l,device:l==="TLS / header check"?"":((dev()||{}).name||""),time:new Date().toISOString()};
  const s=document.createElement("span");
  if(r.error){s.className="bad";s.textContent=l+" · error: "+r.error}
@@ -16259,6 +16445,7 @@ function flowDiagram(p){
  leg.appendChild(mk("span","muted","Next to each device: the source → destination it sees (after Cloudflare proxying, VIP mapping and SNAT). Hover a device for its checks."));
  wrap.appendChild(leg);return wrap}
 function renderOut(){const box=$("#pretty");box.textContent="";if(!last)return;
+ {const bb=boardBackNode();if(bb)box.appendChild(bb)}
  if(last.error){box.appendChild(mk("div","bad",last.error));return}
  if(last.path&&Array.isArray(last.path.stages))box.appendChild(flowDiagram(last.path));
  box.classList.toggle("tall",!!(last.dashboard||last.secdash||last.swins||last.charts||last.acc||last.tiles||last.bars));
@@ -16530,6 +16717,12 @@ function cfDash(x){dashX=x||{};
  const f=Object.keys(dashX).filter(k=>k!=="until").map(k=>k==="since"?dashX.since+" → "+dashX.until+" (UTC+3)":k+" "+dashX[k]);
  cfRun("dashboard","Cloudflare traffic dashboard"+(f.length?" · "+f.join(" · "):""),Object.assign(cfHtF(),dashX))}
 function dashDrill(k,v){cfDash(Object.assign({},dashX,{[k]:v}))}
+function dashChips(){const bar=mk("div","fchips"),ks=Object.keys(dashX).filter(k=>k!=="until");if(!ks.length)return bar;bar.appendChild(mk("span","muted","Filtered by:"));
+ ks.forEach(k=>{const c=mk("span","fchip"),lbl=k==="since"?"Time":(SEC_FL[k]||k),val=k==="since"?dashX.since+" → "+(dashX.until||"")+" (UTC+3)":String(dashX[k]);
+  c.appendChild(mk("b",null,lbl+": "));c.appendChild(mk("span",null,val));c.title=lbl+": "+val;
+  const x=mk("button","fx","×");x.title="Remove this filter";x.onclick=()=>{const n=Object.assign({},dashX);delete n[k];if(k==="since")delete n.until;cfDash(n)};c.appendChild(x);bar.appendChild(c)});
+ if(ks.length>1){const a=mk("button","fclr","Clear all ×");a.title="Back to the unfiltered dashboard";a.onclick=()=>cfDash({});bar.appendChild(a)}
+ return bar}
 function setRun(id,v,fn){const i=$("#"+id);if(i){i.value=v;fn()}}
 const DTOP_ACT={"Top client IPs":["Investigate this IP",n=>setRun("cf_ip",n,cfIp)],
  "Top hosts":["Investigate this hostname",n=>setRun("cf_host",n,cfHost)],
@@ -16678,8 +16871,7 @@ function dashNode(d){const w=mk("div","dash");
  const sec=DBUCKET[d.bucket],pk=sec?{pick:l=>dashPick(l,d.bucket),pickTip:sec===60?"Click: sampled requests in this minute":"Click: zoom in to this "+d.bucket}:{};
  const hint=mk("div","muted","↗ / ↘ = change vs the previous period of the same length · buckets: "+d.bucket+" · hover a chart for values"+
   (sec?", click a column to "+(sec===60?"list its sampled requests":"zoom in"):"")+" · click a top-list entry to look it up or filter by it");
- if(Object.keys(dashX).length){const c=mk("span","lnk"," · clear filters");c.style.cursor="pointer";c.style.color="var(--mint)";c.onclick=()=>cfDash();hint.appendChild(c)}
- w.appendChild(hint);
+ w.appendChild(dashChips());w.appendChild(hint);
  const grid=mk("div","dgrid");
  grid.appendChild(dChart("Requests over time",d.t,[{name:"Requests",color:DC[0],vals:d.requests}],Object.assign({},pk)));
  grid.appendChild(dChart("Data transfer",d.t,[{name:"Data transfer",color:DC[0],vals:d.bytes}],Object.assign({fmt:dBytes},pk)));
@@ -17029,7 +17221,7 @@ try{if(localStorage.getItem("pane_l"))paneToggle("l",true);if(localStorage.getIt
 // ---- Operations dashboard: resources, interfaces and HA of every firewall and F5 (the console refreshes it) ----
 let dashOpen=false,dashData=null,dashAt=0;const DASH_V={paloalto:"Palo Alto",fortigate:"FortiGate",f5:"F5 BIG-IP",firewall:"Firewall"};
 let dashObs=true;try{dashObs=localStorage.getItem("dash_obs")!=="0"}catch(e){}
-function dashBtn(){if(typeof fwbBtn==="function")fwbBtn();const show=devices.some(d=>["f5","paloalto","fortigate","solarwinds"].includes(d.vendor));$("#dashbtn").hidden=!show;if(!show&&dashOpen)dashToggle(false)}
+function dashBtn(){if(typeof fwbBtn==="function")fwbBtn();const show=devices.some(d=>d.vendor==="solarwinds");$("#dashbtn").hidden=!show;if(!show&&dashOpen)dashToggle(false)}
 function dashToggle(on){dashOpen=on==null?!dashOpen:!!on;$("#dash").hidden=!dashOpen;document.documentElement.style.overflow=dashOpen||ftOpen||(typeof fwbOpen!=="undefined"&&fwbOpen)?"hidden":"";
  try{localStorage.setItem("dash_open",dashOpen?"1":"")}catch(e){}if(dashOpen)dashLoad()}
 async function dashLoad(){let r;try{r=await api("/api/dash")}catch(e){return}if(!r||!r.ok)return;dashData=r;dashAt=Date.now();dashRender();dashClock();
@@ -17172,11 +17364,11 @@ function dashRender(){if(!dashData||!dashOpen)return;const r=dashData,all=r.devi
  if(sws.length&&!conn.length&&!obs.length)return;
  if(sws.length)body.appendChild(mk("h3","dsec","Firewalls & load balancers"));
  if(obs.length){const b=mk("div","dobsbar"),l=mk("label"),cb=mk("input");cb.type="checkbox";cb.checked=dashObs;cb.onchange=()=>dashObsSet(cb.checked);
-  l.appendChild(cb);l.appendChild(document.createTextNode("Show the "+obs.length+" F5 / firewall"+(obs.length>1?"s":"")+" seen only in SolarWinds"));b.appendChild(l);
-  b.appendChild(mk("span",null,"(dashed cards: Orion's data only, not connected in this console)"));body.appendChild(b)}
+  l.appendChild(cb);l.appendChild(document.createTextNode("Show the "+obs.length+" F5 / firewall"+(obs.length>1?"s":"")+" SolarWinds monitors"));b.appendChild(l);
+  b.appendChild(mk("span",null,"(dashed cards: SolarWinds data)"));body.appendChild(b)}
  const sum=mk("div","dsum"),tile=(v,l,k,ti)=>{const x=mk("div",k?"k-"+k:"");x.appendChild(mk("b",null,String(v)));x.appendChild(mk("span",null,l));if(ti)x.title=ti;sum.appendChild(x)};
  const kinds=devs.map(dashKind),ifd=devs.reduce((n,d)=>n+(d.observed?(d.orion.if_down||0):(d.ifaces||[]).filter(i=>i.cls==="bad").length),0),hab=conn.filter(d=>d.ha&&(d.ha.cls==="bad"||d.ha.cls==="warn")).length;
- tile(conn.length,obs.length?"connected":"devices");if(obs.length&&dashObs)tile(obs.length,"seen only in SolarWinds","","Firewalls and F5s Orion monitors that are not connected here");
+ if(conn.length)tile(conn.length,obs.length?"connected":"devices");if(obs.length&&dashObs)tile(obs.length,"F5s / firewalls in SolarWinds","","Firewalls and F5s SolarWinds monitors");
  tile(kinds.filter(k=>k==="bad").length,"critical",kinds.includes("bad")?"bad":"");tile(kinds.filter(k=>k==="warn").length,"warning",kinds.includes("warn")?"warn":"");
  tile(ifd,"interfaces down",ifd?"bad":"");tile(hab,"HA problems",hab?"bad":"",obs.length?"connected devices only (Orion does not report HA)":"");body.appendChild(sum);
  if(!devs.length){body.appendChild(mk("div","dempty",r.busy?"Reading the devices for the first time… this can take a minute.":obs.length?"Tick the box above to show the devices seen in SolarWinds.":"No data yet."));return}
@@ -17200,7 +17392,6 @@ function renderFwb(){const box=$("#fwbtools");if(!box)return;box.textContent="";
  const row=mk("div","fwbcrow"),sel=mk("select");sel.setAttribute("aria-label","Time range");let saved="24h";try{saved=localStorage.getItem("fwb_range")||"24h"}catch(e){}
  [["1h","Last hour"],["6h","Last 6 hours"],["24h","Last 24 hours"],["3d","Last 3 days"],["7d","Last 7 days"]].forEach(([v,l])=>{const o=mk("option",null,l);o.value=v;sel.appendChild(o)});
  sel.value=saved;const b=mk("button","primary","Open analytics");b.onclick=()=>fwbOpenFor(d.id,sel.value);row.appendChild(sel);row.appendChild(b);
- const sb=mk("button",null,"Security dashboard");sb.title="Cloudflare-style security dashboard from the attack log (same time range)";sb.onclick=()=>devSecDash(d.id,sel.value,{});row.appendChild(sb);
  c.appendChild(row);box.appendChild(c)}
 function fwbOpenFor(id,range){fwbSid=id;try{localStorage.setItem("fwb_range",range)}catch(e){}fwbToggle(true)}
 function fwbBtn(){if(!devices.some(d=>d.vendor==="fortiweb")&&fwbOpen)fwbToggle(false)}
@@ -17413,8 +17604,8 @@ function advPanel(){const r=advData,p=$("#advpanel"),g=advSel>=0?(r.results||[])
 function advDevRender(){const box=$("#advdev");if(!box)return;const d=dev();box.textContent="";if(!d||!ADV_V.includes(d.vendor))return;
  const r=advData,res=(r&&r.results)||[],gi=res.findIndex(x=>(x.ids||[]).includes(d.id)),c=mk("div","card");
  if(gi<0)c.innerHTML='<h3>Vendor advisories · '+esc(d.name)+'</h3><p class="muted" style="margin:0">'+esc(r&&r.busy?(r.stage||"Checking…"):"Waiting for the first check of the public advisory lists…")+'</p>';
- else c.innerHTML=advHtml(r,res[gi],gi,false);box.appendChild(c)}
-function advHtml(r,g,gi,close){
+ else c.innerHTML=advHtml(r,res[gi],gi,false,d.id);box.appendChild(c)}
+function advHtml(r,g,gi,close,only){
  let h='<div class="ahead"><h3'+(close?'':' hidden')+'>'+(g?esc(g.label)+' '+esc(g.version||"")+' <span class="adim" style="font-weight:400">· '+esc((g.devices||[]).join(", "))+(g.model?' · '+esc(g.model):'')+(g.mods&&g.mods.length?' · modules: '+esc(g.mods.join(", ")):'')+'</span>':'Advisory lists')+'</h3>'+
   '<label class="adim">Show <select onchange="advSet({min:this.value})">'+["critical","high","medium"].map(m=>'<option value="'+m+'"'+(r.min===m?' selected':'')+'>'+m+(m==="critical"?" only":" and above")+'</option>').join("")+'</select></label>'+
   '<button onclick="advSet({refresh:1})"'+(r.busy?' disabled':'')+'>'+(r.busy?'Checking…':'Refresh now')+'</button>'+(close?'<button class="themebtn" onclick="advOpen(advSel)" title="Close" aria-label="Close">✕</button>':'')+'</div>';
@@ -17423,7 +17614,7 @@ function advHtml(r,g,gi,close){
   if(g.error)h+='<div class="abox">'+esc(g.error)+'</div>';
   else if(!(g.items||[]).length)h+='<div class="abox"><span class="aok">✓ No published '+esc(r.min)+'-or-higher advisory (or exploited issue) affects '+esc(g.version)+'.</span></div>';
   else{h+='<div class="abox"><b>Advice:</b> '+esc(g.advice?g.advice.text:"")+'<br><span class="adim">This is the lowest release the published advisories show as fixed, not a vendor recommendation. Check </span><a href="'+esc(g.help.url)+'" target="_blank" rel="noopener noreferrer">'+esc(g.help.text)+'</a><span class="adim"> before you pick the release, and read each advisory: some only apply when a feature is in use (GlobalProtect, management interface reachable, APM…).</span></div>';
-   h+='<div class="abox"><b>Configuration:</b> <span class="adim">does each issue need a feature this unit uses? Reads the configuration (read-only), then asks the AI assistant.</span><div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">'+(g.ids||[]).map((id,k)=>'<button onclick="advCfg('+gi+','+k+')">Check '+esc((g.devices||[])[k]||"device")+' against its configuration (AI)</button>').join("")+'</div></div>';
+   h+='<div class="abox"><b>Configuration:</b> <span class="adim">does each issue need a feature this unit uses? Reads the configuration (read-only), then asks the AI assistant.</span><div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">'+(g.ids||[]).map((id,k)=>only&&id!==only?'':'<button onclick="advCfg('+gi+','+k+')">Check '+esc((g.devices||[])[k]||"device")+' against its configuration (AI)</button>').join("")+'</div></div>';
    h+='<table><thead><tr><th>Severity</th><th>Advisory</th><th>Issue</th><th>Fixed in (your train)</th><th>Exploited</th><th>Published</th></tr></thead><tbody>';
    g.items.forEach(x=>{h+='<tr><td class="nw"><span class="apill '+(x.sev==="critical"?"a-c":x.sev==="high"?"a-h":"a-m")+'">'+esc(x.sev)+(x.score!=null?' '+esc(x.score):'')+'</span></td><td class="nw"><a href="'+esc(x.url)+'" target="_blank" rel="noopener noreferrer">'+esc(x.id)+'</a></td><td>'+esc(x.title)+(x.note?' <span class="adim">('+esc(x.note)+')</span>':'')+'</td><td class="nw">'+esc(x.fix||"no fix listed")+'</td><td>'+(x.kev?'<span class="apill a-k">yes</span>':'')+'</td><td class="nw">'+esc(x.date)+'</td></tr>'});
    h+='</tbody></table>'}}
@@ -17947,14 +18138,14 @@ def do_monitor_set(b):
     return {"ok": True, "on": MON["on"], "interval": MON["interval"], "changes": MON.get("changes", True)}
 
 
-# ---- Operations dashboard: resources, interfaces and HA of every connected firewall and F5 on one page -------------
+# ---- Operations dashboard: the SolarWinds view (the per-device dash_device code is kept, not polled) -------------
 # One background pass reads every connected F5 / Palo Alto / FortiGate (read-only, devices in parallel) every
 # DASH["interval"] seconds (20 minutes by default). Like the monitor, passes are started by the page's polling, so
 # nothing is read while no console page is open. The page shows the result of the latest pass.
 DASH = {"on": True, "interval": 1200, "busy": False, "next": 0.0, "last": "", "took": 0, "devices": {}, "hist": {},
         "seen": {}, "prev_ha": {}, "lock": threading.Lock()}
 DASH_INTERVALS = (300, 600, 1200, 1800, 3600)
-DASH_VENDORS = ("f5", "paloalto", "fortigate", "solarwinds")
+DASH_VENDORS = ("solarwinds",)   # the connected F5s / firewalls are in SolarWinds: the dashboard shows only Orion's view (no duplicates)
 DASH_HIST = 72   # passes kept for the sparklines (24 hours at 20 minutes)
 
 
@@ -18491,7 +18682,7 @@ def dash_snapshot(device=""):
         x = {"device": d.get("device"), "vendor": d.get("vendor"), "host": d.get("host"), "health": dash_health(d)}
         if d.get("observed"):
             o = d["orion"]
-            x.update(connected=False, note="seen only in SolarWinds (not connected in the console): Orion's data only, "
+            x.update(connected=False, note="from SolarWinds: Orion's data only, "
                                            "no HA / sessions / configuration",
                      solarwinds={k: o.get(k) for k in ("source", "node", "status", "issue", "make", "model", "version",
                                                        "last_boot", "cpu", "mem", "rt", "loss", "alerts", "worst",
@@ -18554,7 +18745,7 @@ def dash_ensure(wait=150):
     with LOCK:
         items = [(sid, s) for sid, s in SESSIONS.items() if s.get("vendor") in DASH_VENDORS]
     if not items:
-        raise ValueError("no firewall, F5 or SolarWinds is connected, so the dashboard has no data")
+        raise ValueError("no SolarWinds is connected, so the dashboard has no data")
     run = False
     with DASH["lock"]:
         if not DASH["devices"] and not DASH["busy"]:
