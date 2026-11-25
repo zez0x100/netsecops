@@ -9664,6 +9664,48 @@ def secdash_match(e, f):
     return True
 
 
+def secdash_offenders(evs, spec, n=10):
+    """Source addresses ranked by blocked + alerted requests, then violations: who attacks the most.
+    spec off_keys: event keys to take the address from, first non-empty wins (e.g. the real client before the
+    connecting address); off_rule: the event rule key whose entries are counted as violations."""
+    keys, rk = spec.get("off_keys", ("ip",)), spec.get("off_rule", "type")
+    agg = {}
+    for e in evs:
+        kind = next((k for k in keys if e["t"].get(k) and e["t"][k] not in SECDASH_NA), None)
+        if not kind:
+            continue
+        a = agg.setdefault((kind, e["t"][kind]), {"requests": 0, "blocked": 0, "alerted": 0, "violations": 0,
+                                                  "names": collections.Counter(), "country": collections.Counter(),
+                                                  "via": collections.Counter()})
+        a["requests"] += 1
+        if e["mit"]:
+            a["blocked"] += 1
+        elif e["action"] != "passed":
+            a["alerted"] += 1
+        names = e["r"].get(rk) or e["r"].get("type") or []
+        a["violations"] += len(names)
+        a["names"].update(names)
+        if e["t"].get("country") and e["t"]["country"] not in SECDASH_NA:
+            a["country"][e["t"]["country"]] += 1
+        if kind != "ip" and e["t"].get("ip"):
+            a["via"][e["t"]["ip"]] += 1
+    rows = [{"ip": v, "kind": k, "requests": a["requests"], "blocked": a["blocked"], "alerted": a["alerted"],
+             "violations": a["violations"], "top": [[nm, c] for nm, c in a["names"].most_common(3)],
+             "country": a["country"].most_common(1)[0][0] if a["country"] else "",
+             "via": a["via"].most_common(1)[0][0] if a["via"] else "", "exact": False}
+            for (k, v), a in agg.items() if a["blocked"] or a["alerted"]]
+    rows.sort(key=lambda r: (-(r["blocked"] + r["alerted"]), -r["violations"], -r["requests"], r["ip"]))
+    return rows[:n]
+
+
+def secdash_offender_data(rows):
+    """The offenders table as plain rows for the output table / the AI."""
+    return [{"source_ip": r["ip"] + (" (real client, via %s)" % r["via"] if r["kind"] != "ip" and r["via"] else ""),
+             "requests": r["requests"], "blocked": r["blocked"], "alerted": r["alerted"], "violations": r["violations"],
+             "top_violations": ", ".join("%s (%d)" % (nm, c) for nm, c in r["top"]), "country": r["country"],
+             "counted": "exact (by the device)" if r["exact"] else "from the log entries read"} for r in rows]
+
+
 def secdash_build(evs, hours, spec, ref=None):
     """Normalised events -> (dashboard dict, table data)."""
     step, bucket = secdash_step(hours)
@@ -9704,13 +9746,18 @@ def secdash_build(evs, hours, spec, ref=None):
             rules.append([title, [[v, n, v] for v, n in c.most_common(10)]])
             data_rules[re.sub(r"\W+", "_", title.lower()).strip("_")] = [
                 {"name": v, "events": n, "share": pct(n)} for v, n in c.most_common(10)]
+    offenders = secdash_offenders(evs, spec)
     dash = {"bucket": bucket, "t": keys, "tiles": tiles, "actions": [[a, ts[a]] for a in acts_l],
             "services": [[s, n, s] for s, n in svc.most_common(12)], "services_title": spec.get("svc_title", "Events by service"),
-            "tops": tops, "rules": rules, "rules_title": spec.get("rules_title", "Rules that fired")}
+            "tops": tops, "rules": rules, "rules_title": spec.get("rules_title", "Rules that fired"),
+            "offenders": offenders, "offenders_title": "Top offending source IPs (most blocked + alerted)",
+            "off_rule_title": spec.get("off_rule_title", "Top violations")}
     data = {"headline": {t["label"]: "{:,}".format(t["value"]) for t in tiles},
             "events_by_action": [{"action": a, "events": acts[a], "share": pct(acts[a])} for a in acts_l],
             re.sub(r"\W+", "_", dash["services_title"].lower()).strip("_"): [
                 {"name": s, "events": n, "share": pct(n)} for s, n in svc.most_common(12)]}
+    if offenders:
+        data["top_offending_source_ips"] = secdash_offender_data(offenders)
     data.update(data_tops)
     data.update(data_rules)
     return dash, data
@@ -9759,6 +9806,7 @@ def fwb_secdash(sess, b):
     acts = {e["action"] for e in evs}
     spec = {"order": ("block_ip", "deny", "alert_deny", "redirect", "send_403_forbidden", "erase", "period_block", "alert"),
             "mit_label": "Mitigated (deny / block / redirect)", "mit_actions": {a for a in acts if FWB_BLOCK_RE.search(a)},
+            "off_keys": ("ip",), "off_rule": "type", "off_rule_title": "Top attack types",
             "svc_title": "Events by protection category", "tops": FWB_SEC_TOPS, "rules": FWB_SEC_RULES,
             "rules_title": "Attack types and signatures"}
     dash, data = secdash_build(evs, hours, spec, ref)
@@ -9949,6 +9997,13 @@ def f5_secdash_counted(sess, b, rng, hours, f, cap, t0, spec):
     dash, data = secdash_build(evs, hours, spec)
     dash["ctx"] = {"vendor": "f5", "range": rng, "filters": f}
     dash["tops"] = [[t + " · sample", rows, k] for t, rows, k in dash["tops"]]
+    n_exact = 0
+    if not f and dash["offenders"]:
+        cand = secdash_offenders(evs, spec, n=15)
+        n_exact = f5_offenders_exact(sess, cand, cap, start, sflt, t0 + 150)
+        cand.sort(key=lambda r: (-(r["blocked"] + r["alerted"]), -r["violations"], -r["requests"], r["ip"]))
+        dash["offenders"] = cand[:10]
+        data["top_offending_source_ips"] = secdash_offender_data(dash["offenders"])
     counted = not f and total is not None and series
     if counted:
         keys = [time.strftime("%m-%d %H:%M" if hours > 24 else "%H:%M", time.localtime(e + step)) for e in edges]
@@ -9973,6 +10028,10 @@ def f5_secdash_counted(sess, b, rng, hours, f, cap, t0, spec):
         notes.append("Policies, top lists, attack types, violations and signatures: from a sample of %s request(s), the "
                      "newest of each of %d equal time slices of the range (counts and %% are of the sample)."
                      % ("{:,}".format(allev), nwin))
+        if n_exact:
+            notes.append("Top offending source IPs: the %d busiest offenders of the sample were counted again by the F5 "
+                         "over the whole range (requests / blocked / alerted are exact; violations and their names are "
+                         "from the sample). An address absent from the sample cannot appear." % n_exact)
     else:
         notes.append("ASM request log, the last %s; a sample of %s request(s) spread over the range%s." % (
             span, "{:,}".format(allev), (", %d matching %s" % (len(evs), ", ".join("%s = %s" % kv for kv in f.items())))
@@ -10003,6 +10062,36 @@ def f5_secdash_counted(sess, b, rng, hours, f, cap, t0, spec):
     return r
 
 
+def f5_offenders_exact(sess, rows, cap, start, sflt, deadline):
+    """Replace the sample counts of offenders seen as the connecting address (clientIp) with the F5's own counts over
+    the range: requests, blocked, alerted. Returns how many rows got exact counts."""
+    tf = f5_asm_tf(cap, "gt", start)
+    jobs = []
+    for i, r in enumerate(rows):
+        if r["kind"] != "ip":
+            continue
+        try:
+            ip = str(ipaddress.ip_address(r["ip"]))
+        except ValueError:
+            continue
+        base = "clientIp eq '%s' and %s" % (ip, tf)
+        jobs += [(i, "requests", base)] + [(i, a, "%s and %s" % (sflt[a], base)) for a in ("blocked", "alerted") if sflt[a]]
+
+    def one(job):
+        return f5_asm_count(sess, job[2], cap) if time.time() < deadline else None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        got = list(ex.map(one, jobs))
+    res = {}
+    for (i, what, _), n in zip(jobs, got):
+        res.setdefault(i, {})[what] = n
+    done = 0
+    for i, c in res.items():
+        if all(c.get(k) is not None for k in ("requests", "blocked", "alerted") if k == "requests" or sflt[k]):
+            rows[i].update({k: c[k] for k in ("requests", "blocked", "alerted") if c.get(k) is not None}, exact=True)
+            done += 1
+    return done
+
+
 def f5_secdash(sess, b):
     """ASM request log over the range, newest first (bounded); violations / attack types / signatures come from the
     full record of up to F5_SEC_ENRICH blocked or alerted requests when the list view leaves them out."""
@@ -10025,7 +10114,7 @@ def f5_secdash(sess, b):
         order = ""
     spec = {"order": ("blocked", "alerted", "passed"), "mit_label": "Blocked", "mit_actions": {"blocked"},
             "svc_title": "Events by security policy", "tops": F5_SEC_TOPS, "rules": F5_SEC_RULES,
-            "rules_title": "Attack types, violations and signatures"}
+            "rules_title": "Attack types, violations and signatures", "off_keys": ("tci", "ip"), "off_rule": "vio"}
     cap = f5_asm_countcap(sess)
     if cap.get("ok"):
         return f5_secdash_counted(sess, b, rng, hours, f, cap, t0, spec)
@@ -16914,11 +17003,26 @@ function secDashNode(d){const w=mk("div","dash");
  const grid=mk("div","dgrid");
  grid.appendChild(dChart("Events summary · by action",d.t,d.actions.map(([k,v])=>({name:k,color:SEC_AC[k]||DOTHER,vals:v})),Object.assign({stack:true,w:1500,h:250},pk)));
  w.appendChild(grid);
+ if((d.offenders||[]).length)w.appendChild(secOffenders(d,drill));
  if(d.tops.length){w.appendChild(mk("h4","dsub","Top events by source"));const tg=mk("div","dgrid tops");
   d.tops.forEach(([t,rows,k])=>tg.appendChild(dTop(t,rows,k?['Filter the dashboard to this',n=>drill(k,k==='asn'?((String(n).match(/^AS(\d+)/)||[])[1]||n):n)]:null)));w.appendChild(tg)}
  if(d.rules.length){w.appendChild(mk("h4","dsub",d.rules_title||"Rules that fired"));const rg=mk("div","dgrid tops");
   d.rules.forEach(([t,rows])=>rg.appendChild(dTop(t,rows,["Filter the dashboard to this",(n,row)=>drill("rule",row[2])])));w.appendChild(rg)}
  return w}
+// Who attacks the most: blocked + alerted per source address, with the violations seen; click an address to filter
+function secOffenders(d,drill){const card=mk("div","dcard secoff"),ex=d.offenders.some(r=>r.exact);card.appendChild(mk("div","sec",d.offenders_title));
+ const s=mk("div","fwbscroll"),t=mk("table","swiresp"),h=mk("tr");
+ ["Source IP","Requests","Blocked","Alerted","Violations",d.off_rule_title||"Top violations","Country"].forEach(c=>h.appendChild(mk("th",null,c)));t.appendChild(h);
+ d.offenders.forEach(r=>{const tr=mk("tr"),a=mk("td","n"),l=mk("span","lnk",r.ip);l.style.cssText="cursor:pointer;color:var(--mint)";
+  l.title="Filter the dashboard to "+r.ip;l.onclick=()=>drill(r.kind,r.ip);a.appendChild(l);
+  if(r.kind!=="ip"&&r.via)a.appendChild(mk("div","muted","via "+r.via));tr.appendChild(a);
+  const ap=ex&&!r.exact?"≈ ":"",vp=ex?"≈ ":"";   // ≈ = from the sample, next to counts made by the device
+  [[r.requests,"",ap],[r.blocked,r.blocked?"bad":"",ap],[r.alerted,"",ap],[r.violations,"",vp]].forEach(([v,c,pre])=>tr.appendChild(mk("td","n"+(c?" "+c:""),pre+Number(v).toLocaleString())));
+  tr.appendChild(mk("td",null,r.top.map(([n,c])=>n+" ("+c+")").join(", ")));tr.appendChild(mk("td",null,r.country||""));t.appendChild(tr)});
+ s.appendChild(t);card.appendChild(s);
+ card.appendChild(mk("div","muted",ex?"Requests / blocked / alerted counted by the F5 over the whole range; ≈ = from the sample (violations, and addresses the F5 cannot count, such as the real client behind Cloudflare). Click an address to filter the dashboard to it.":
+  "Counted from the requests read for this dashboard. Click an address to filter the dashboard to it."));
+ card.style.marginTop="12px";return card}
 function cfUrl(){cfRun("url","Cloudflare URL response time",{url:g("cf_u_url"),match:g("cf_u_match"),status:g("cf_u_st"),cache:g("cf_u_cache"),ip:g("cf_u_ip"),top:g("cf_u_n")})}
 function chartsNode(list,heat){const grid=mk("div","dgrid");grid.style.marginBottom="16px";
  grid.style.gridTemplateColumns="repeat(auto-fill,minmax(min(100%,520px),1fr))";  // a lone chart keeps a column's width instead of stretching
