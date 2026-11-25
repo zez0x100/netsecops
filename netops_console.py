@@ -75,6 +75,8 @@ TOKEN = os.environ.pop("NETOPS_TOKEN", "") or secrets.token_urlsafe(24)   # opti
 DATA_DIR = os.environ.get("NETOPS_HOME") or os.path.dirname(os.path.abspath(__file__))
 # "readonly" (set by such a launcher): no SSH, no packet capture, no backup and nothing that needs the confirmation tick-box.
 ROLE = os.environ.get("NETOPS_ROLE", "")
+# How messages name the machine that makes the device connections: a launcher (NETOPS_HOME) runs the console on a server.
+THIS_HOST = "this server" if os.environ.get("NETOPS_HOME") else "this PC"
 RO_BLOCKED = ("/api/ssh", "/api/term/open", "/api/term/write", "/api/pancapture", "/api/backup")
 SESSIONS = {}   # id -> session dict (in memory only)
 AUDIT = collections.deque(maxlen=1000)
@@ -4265,13 +4267,13 @@ def sw_login(sess):
             return
         except (urllib.error.URLError, OSError) as e:
             if isinstance(getattr(e, "reason", e), ssl.SSLCertVerificationError):
-                raise ValueError("the SolarWinds certificate is not trusted by this PC (Orion usually uses its own "
+                raise ValueError("the SolarWinds certificate is not trusted by " + THIS_HOST + " (Orion usually uses its own "
                                  "self-signed certificate): tick 'Skip TLS verification' if this is your Orion server")
             err = err or e
     sess["port"] = ports[0]
     raise ValueError("SolarWinds did not answer on port %s: %s. The SWIS API listens on 17774 (older Orion: 17778); "
-                     "the PC must be allowed to reach that port, not only the web console on 443"
-                     % (" or ".join(map(str, ports)), getattr(err, "reason", err)))
+                     "%s must be allowed to reach that port, not only the web console on 443"
+                     % (" or ".join(map(str, ports)), getattr(err, "reason", err), THIS_HOST))
 
 
 def sw_int(x):
@@ -5000,7 +5002,7 @@ def fad_login(sess):
         tok = d["payload"].get("token")
     if st in (401, 403) or (200 <= st < 300 and not tok):
         raise FxError(401, "FortiADC refused the login (HTTP %s): check the user name and password, and that the "
-                           "administrator may use the REST API (trusted hosts include this PC)" % st)
+                           "administrator may use the REST API (trusted hosts include %s)" % (st, THIS_HOST))
     if not 200 <= st < 300:
         raise FxError(st, "FortiADC login answered HTTP %s (is this a FortiADC? check host / port)" % st)
     sess["hdr"] = {"Authorization": "Bearer " + str(tok), "Accept": "application/json"}
