@@ -89,7 +89,7 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
   with source / destination filter (URL category lookup was already available)
 - SSH to F5, FortiGate and Palo Alto from the "SSH" card of the selected device, with this PC's OpenSSH client
   (`ssh -p <port> -l <user> <device>`; user name prefilled from the login when known):
-  - "Open SSH in this page": a terminal inside the console (Windows 10 1809+; several at once). Click it to type;
+  - "Open SSH in this page": a terminal inside the console (Windows 10 1809+, Linux or macOS; several at once). Click it to type;
     copy with a selection + Ctrl+C, paste with Ctrl+V; Disconnect ends the session
   - "Open in a separate window": a normal Windows terminal window; other systems get the command to copy
   - Every connection allows the hmac-sha1 MAC (`-o MACs=+hmac-sha1`), which older devices still need and OpenSSH 10

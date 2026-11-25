@@ -26,7 +26,8 @@ Design notes
 - EXCEPTION: 'Download a file or folder' on F5 reads any path through util/bash (same tick-box); a folder is
   packed into a .tar.gz in /var/tmp first and removed afterwards. Files holding secrets need a second tick-box.
 - SSH (F5, FortiGate, Palo Alto) runs this PC's own OpenSSH client (ssh -p <port> -l <user> <device>), either in
-  a terminal inside the page (a Windows pseudo-console, ConPTY, relayed to the page) or in a separate window. In the
+  a terminal inside the page (a Windows pseudo-console, ConPTY, or a Linux / macOS pseudo-terminal, relayed to the
+  page) or in a separate window (Windows). In the
   page, keystrokes, the password too, pass through this process to ssh: they are never stored, logged or shown to the
   AI, and only "opened" / "closed" go to the audit log. What is done in that session is up to the person typing:
   it is not read-only. The AI assistant has no SSH tool.
@@ -644,9 +645,11 @@ def do_ssh(b):
                                                  "type / cipher found', tick 'Allow older algorithms' and open it again."])}
 
 
-# ---- In-page SSH terminal: this PC's ssh on a Windows pseudo-console (ConPTY), relayed to the page ------------------
-# Keystrokes (the password too) pass through this process on their way to ssh; they are never stored, logged or shown
-# to the AI. Only "opened" / "closed" go to the audit log. Standard library only (ctypes), Windows 10 1809 or later.
+# ---- In-page SSH terminal: this machine's ssh on a pseudo-terminal, relayed to the page ------------------------------
+# Windows: a pseudo-console (ConPTY, ctypes, Windows 10 1809 or later). Linux / macOS: a POSIX pseudo-terminal (also
+# when a launcher runs the console on a server: ssh then runs on the server). Keystrokes (the password too) pass
+# through this process on their way to ssh; they are never stored, logged or shown to the AI. Only "opened" / "closed"
+# go to the audit log. Standard library only.
 TERMS = {}
 TERM_LOCK = threading.Lock()
 TERM_MAX = 6            # open terminals at a time
@@ -772,6 +775,96 @@ class ConPty:
         self.k.ClosePseudoConsole(self.hpc)   # ends the output pipe, so the reader thread stops
         self.k.CloseHandle(self.inw)          # the process handle is closed by term_waiter once the wait returns
 
+    def done_reading(self):
+        self.k.CloseHandle(self.outr)
+
+    def done_waiting(self):
+        self.k.CloseHandle(self.proc)
+
+
+class PosixPty:
+    """One process on a POSIX pseudo-terminal (Linux, macOS), same methods as ConPty. ssh becomes a session leader
+    with the terminal as its controlling tty, so it can ask for the password and host-key confirmation."""
+
+    def __init__(self, argv, cols, rows):
+        import fcntl
+        import termios
+        self.fcntl, self.termios = fcntl, termios
+        master, slave = os.openpty()
+        try:
+            self._size(slave, cols, rows)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("NETOPS_")}
+            env["TERM"] = "xterm-256color"
+
+            def child():   # runs in the child between fork and exec: only async-signal-safe calls
+                os.setsid()
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            self.p = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, env=env, cwd=DATA_DIR,
+                                      preexec_fn=child, close_fds=True)
+        except BaseException:
+            os.close(master)
+            os.close(slave)
+            raise
+        os.close(slave)   # the child holds its own copies: when it ends, reading the master gives EIO (end)
+        self.fd, self.closed, self.lock = master, False, threading.Lock()
+
+    def _size(self, fd, cols, rows):
+        import struct
+        self.fcntl.ioctl(fd, self.termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def read(self):
+        """Blocking read of the next chunk of output; b'' when the process and its terminal have ended."""
+        try:
+            return os.read(self.fd, 8192)
+        except OSError:   # EIO on Linux once every slave side is closed
+            return b""
+
+    def write(self, data):
+        with self.lock:
+            while data and not self.closed and self.fd >= 0:
+                try:
+                    n = os.write(self.fd, data)
+                except OSError:
+                    return
+                data = data[n:]
+
+    def resize(self, cols, rows):
+        with self.lock:
+            if not self.closed and self.fd >= 0:
+                try:
+                    self._size(self.fd, cols, rows)   # the kernel sends SIGWINCH to ssh
+                except OSError:
+                    pass
+
+    def wait(self):
+        return self.p.wait()
+
+    def _signal(self, sig):
+        if self.p.poll() is None:
+            try:
+                os.killpg(self.p.pid, sig)
+            except OSError:
+                pass
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        import signal
+        self._signal(signal.SIGHUP)   # like closing a terminal window; ssh ends at once
+        t = threading.Timer(3, self._signal, (signal.SIGKILL,))
+        t.daemon = True
+        t.start()
+
+    def done_reading(self):
+        with self.lock:
+            fd, self.fd = self.fd, -1
+        if fd >= 0:
+            os.close(fd)
+
+    def done_waiting(self):
+        pass
+
 
 def term_reader(t):
     dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -792,7 +885,7 @@ def term_reader(t):
             t["cond"].notify_all()
         if not chunk:
             break
-    t["pty"].k.CloseHandle(t["pty"].outr)
+    t["pty"].done_reading()
 
 
 def term_waiter(t):
@@ -800,7 +893,7 @@ def term_waiter(t):
     with t["cond"]:
         t["exit"] = code
     t["pty"].close()   # the reader sees the end of output and marks the session ended
-    t["pty"].k.CloseHandle(t["pty"].proc)
+    t["pty"].done_waiting()
     audit(t["sess"], "SSH terminal closed (%s, exit code %s)" % (t["shown"], code))
 
 
@@ -830,13 +923,15 @@ def ssh_request(b):
             + (SSH_LEGACY if b.get("legacy") else []) + [host])
     if re.search(r'[%^|<>&"]', " ".join(argv)):
         raise ValueError("invalid characters for the SSH command")
-    return sess, argv, "ssh " + " ".join(argv)
+    shown = "ssh " + " ".join(argv)
+    if os.environ.get("NETOPS_HOME") and os.name != "nt":
+        # one service account for everybody on a server: each user confirms device host keys in their own file
+        argv = argv[:-1] + ["-o", "UserKnownHostsFile=" + os.path.join(DATA_DIR, "ssh_known_hosts"), argv[-1]]
+    return sess, argv, shown
 
 
 def do_term_open(b):
     term_reap()
-    if os.name != "nt":
-        return {"ok": False, "error": "the in-page terminal needs Windows; use 'Open in a separate window'"}
     try:
         sess, argv, shown = ssh_request(b)
         cols = num(b.get("cols") or "120", 20, 400, 120, "columns")
@@ -845,15 +940,17 @@ def do_term_open(b):
         return {"ok": False, "error": str(e)}
     exe = ssh_client()
     if not exe:
-        return {"ok": False, "error": "no OpenSSH client found on this PC (Settings > System > Optional features > "
-                                      "OpenSSH Client)"}
+        return {"ok": False, "error": "no OpenSSH client found on %s (%s)" % (
+            THIS_HOST, "Settings > System > Optional features > OpenSSH Client" if os.name == "nt" else
+            "install the openssh-clients / openssh-client package")}
     with TERM_LOCK:
         if sum(1 for t in TERMS.values() if t["alive"]) >= TERM_MAX:
             return {"ok": False, "error": "%d terminals are already open: close one first" % TERM_MAX}
     try:
-        pty = ConPty(subprocess.list2cmdline([exe] + argv), cols, rows)
-    except OSError as e:
-        return {"ok": False, "error": str(e)}
+        pty = (ConPty(subprocess.list2cmdline([exe] + argv), cols, rows) if os.name == "nt" else
+               PosixPty([exe] + argv, cols, rows))
+    except (OSError, ImportError) as e:
+        return {"ok": False, "error": "could not start ssh: %s" % e}
     tid = secrets.token_hex(8)
     t = {"pty": pty, "sess": sess, "shown": shown, "buf": "", "base": 0, "alive": True, "exit": None,
          "cond": threading.Condition(), "seen": time.time(), "title": "%s (%s)" % (sess["name"], sess["host"])}
@@ -1081,6 +1178,28 @@ def do_vault(b):
             "unlocked": VAULT["key"] is not None, "logins": vault_public() if VAULT["key"] is not None else []}
 
 
+def reject_text(vendor, status, data):
+    """'device rejected the request (HTTP n)' + the device's own words + the usual cause for that vendor and code."""
+    said = ""
+    if isinstance(data, dict):
+        said = str(data.get("message") or data.get("msg") or data.get("error") or "")
+    elif isinstance(data, str) and data.strip():
+        body = re.sub(r"(?is)<(head|script|style)\b.*?</\1>", " ", data)   # an HTML error page: its visible text
+        said = re.sub(r"<[^>]+>", " ", body).replace("&amp;", "&").replace("&#39;", "'").replace("&quot;", "\"")
+    said = " ".join(said.split())[:200].rstrip(". ")
+    out = "device rejected the request (HTTP %s)%s" % (status, ": " + said if said else "")
+    hint = {("f5", 401): "wrong user name / password, the account is locked, or a remote (LDAP / RADIUS / TACACS) "
+                         "account without a REST-capable role",
+            ("f5", 403): "the F5 refused this source address or this account: check that %s is in the management "
+                         "access list (System > Platform > 'Allowed IPs' / tmsh list sys httpd allow), and that the "
+                         "account has a role on All partitions with iControl REST access" % THIS_HOST,
+            ("fortigate", 401): "wrong or expired REST API token",
+            ("fortigate", 403): "the REST API admin's Trusted hosts do not include %s, or its profile cannot read "
+                                "System" % THIS_HOST,
+            ("paloalto", 403): "invalid API key, or the admin role has the XML API disabled"}.get((vendor, status))
+    return out + (". Usual cause: " + hint if hint else "")
+
+
 def do_connect(b):
     vendor = b.get("vendor")
     if vendor not in CATALOG:
@@ -1186,7 +1305,7 @@ def do_connect(b):
     except (urllib.error.URLError, OSError, ET.ParseError) as e:
         return {"ok": False, "error": "connection failed: %s" % getattr(e, "reason", e)}
     if not ok:
-        return {"ok": False, "error": "device rejected the request (HTTP %s)" % status}
+        return {"ok": False, "error": reject_text(vendor, status, data)}
     if vendor in ("f5", "paloalto", "fortiweb") and SSH_USER_RE.match(str(user or "")):
         sess["user"] = user   # the login name only, as the default for SSH
     sid = secrets.token_hex(6)
@@ -16148,7 +16267,7 @@ function renderSsh(){const box=$("#sshtool");if(!box)return;box.innerHTML="";con
  box.innerHTML='<div class="card"><h3>SSH · '+esc(d.name)+'</h3><div class="row3">'+
   fld("ssh_user","SSH user name",d.vendor==="fortigate"?"admin":"admin",d.user||"")+fld("ssh_port","SSH port","22","22")+
   '<div><label>&nbsp;</label><div class="row" style="gap:8px;flex-wrap:wrap"><button class="primary" onclick="termOpen()">Open SSH in this page</button>'+
-  '<button onclick="sshOpen()">Open in a separate window</button></div></div></div>'+
+  '<button id="ssh_win" onclick="sshOpen()">Open in a separate window</button></div></div></div>'+
   '<div class="chk"><input type="checkbox" id="ssh_legacy"><span>Allow older algorithms for this connection (old devices that answer &quot;Unable to negotiate&quot;: SHA-1 key exchange, ssh-rsa, AES-CBC; the hmac-sha1 MAC is always allowed)</span></div>'+
   '<p id="ssh_msg" class="muted" style="margin:6px 0 0"></p></div>'}
 // ---- In-page SSH terminal: a small VT emulator fed by the console's pseudo-console relay ----
