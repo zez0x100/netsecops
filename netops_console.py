@@ -15196,7 +15196,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy",
-                         "default-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'")
+                         "default-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; "
+                         "form-action 'none'")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -15255,6 +15256,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             return self._send(403, {"error": "bad host"})
         u = urllib.parse.urlparse(self.path)
+        if u.path in ("/favicon.svg", "/favicon.ico"):   # the tab icon: public, holds nothing
+            return self._send(200, FAVICON_SVG, "image/svg+xml")
         if u.path == "/":
             t = urllib.parse.parse_qs(u.query).get("t", [""])[0]
             if not tok_ok(t):
@@ -15348,11 +15351,19 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, result)
 
 
+# Browser tab icon: the shield with the prompt. Served as a file (no token: it is public) so no CSP rule can block it.
+FAVICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36"><defs><linearGradient id="g" x1="0" y1="0" x2="1" '
+               'y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" '
+               'stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 '
+               '4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#g)" stroke-width="2.2" stroke-linejoin="round"/><path '
+               'd="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" '
+               'stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg>')
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NetSecOps</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%232EE6C5'/%3E%3Cstop offset='.6' stop-color='%237C6CFF'/%3E%3Cstop offset='1' stop-color='%23FF7A59'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z' fill='%2314132a' stroke='url(%23g)' stroke-width='2.2' stroke-linejoin='round'/%3E%3Cpath d='m12 13 6 5-6 5' fill='none' stroke='%232EE6C5' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M20.5 24h5' stroke='%23FF7A59' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
 :root{--bg:#0B0A17;--panel:#14132a;--panel2:#1b1a38;--line:#2a2850;--text:#e9e8ff;--dim:#8f8cb8;
 --mint:#2EE6C5;--coral:#FF7A59;--violet:#7C6CFF;--ok:var(--mint);--bad:var(--coral)}
