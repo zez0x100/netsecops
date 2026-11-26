@@ -87,6 +87,9 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
 - FortiGate lookups: Virtual IPs (name / external / mapped IP filter), static routes (IP, gateway, interface filter)
 - PAN-OS lookups: destination / static NAT rules (the Virtual IP equivalent), configured static routes, session list
   with source / destination filter (URL category lookup was already available)
+- Environments: an optional **Environment** label per device (Add device form, saved profiles and saved logins).
+  With labels, the device list shows tabs: All (grouped under environment headings), one per environment with its
+  count, and No environment; the chosen tab is remembered in this browser.
 - SSH to F5, FortiGate and Palo Alto from the "SSH" card of the selected device, with this PC's OpenSSH client
   (`ssh -p <port> -l <user> <device>`; user name prefilled from the login when known):
   - "Open SSH in this page": a terminal inside the console (Windows 10 1809+, Linux or macOS; several at once). Click it to type;

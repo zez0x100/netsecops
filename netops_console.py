@@ -531,6 +531,17 @@ def save_profiles(profiles):
             os.remove(temp)
 
 
+ENV_RE = re.compile(r"^[\w .()&/+-]{0,40}$")   # environment label: letters (any script), digits, spaces, . ( ) & / + -
+
+
+def env_clean(v):
+    """Environment label of a device ('' = none); raises ValueError for odd characters."""
+    v = " ".join(str(v or "").split())[:40]
+    if not ENV_RE.match(v):
+        raise ValueError("environment: letters, digits, spaces and . ( ) & / + - only (max 40)")
+    return v
+
+
 def profile_from_request(b):
     if not isinstance(b, dict):
         raise ValueError("profile must be a JSON object")
@@ -554,7 +565,7 @@ def profile_from_request(b):
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
     return {"id": secrets.token_hex(6), "name": name, "vendor": vendor,
-            "host": host, "port": port, "insecure": b.get("insecure") is True}
+            "host": host, "port": port, "insecure": b.get("insecure") is True, "env": env_clean(b.get("env"))}
 
 
 def do_profile_save(b):
@@ -1031,7 +1042,7 @@ if not globals().get("_HOT_RELOADING"):
 # Without the passphrase, or under another Windows account / on another PC, the file cannot be decrypted.
 VAULT_FILE = os.path.join(DATA_DIR, "saved_logins.dat")
 VAULT = {"key": None, "logins": None}   # in memory only while unlocked
-VAULT_FIELDS = ("vendor", "name", "host", "port", "insecure", "account", "vdom", "username", "password", "apikey")
+VAULT_FIELDS = ("vendor", "name", "host", "port", "insecure", "account", "vdom", "username", "password", "apikey", "env")
 VAULT_LOCK = threading.Lock()
 
 
@@ -1215,7 +1226,11 @@ def do_connect(b):
         return {"ok": False, "error": "port must be between 1 and 65535"}
     name = b.get("name")
     name = name.strip() if isinstance(name, str) else ""
-    sess = {"vendor": vendor, "host": host, "port": port,
+    try:
+        env = env_clean(b.get("env"))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    sess = {"vendor": vendor, "host": host, "port": port, "env": env,
             "insecure": bool(b.get("insecure")) and vendor != "cloudflare",
             "name": (name or ("Cloudflare" if vendor == "cloudflare" else host))[:40]}
     user, pw, key = b.get("username", ""), b.get("password", ""), b.get("apikey", "")
@@ -1312,7 +1327,8 @@ def do_connect(b):
     with LOCK:
         SESSIONS[sid] = sess
     audit(sess, "connected")
-    out = {"ok": True, "id": sid, "name": sess["name"], "vendor": vendor, "host": host, "user": sess.get("user", "")}
+    out = {"ok": True, "id": sid, "name": sess["name"], "vendor": vendor, "host": host, "user": sess.get("user", ""),
+           "env": env}
     if sess.get("fx_info"):
         out["info"] = sess["fx_info"]
     if b.get("remember"):
@@ -15373,6 +15389,11 @@ border:1px solid transparent;cursor:pointer}
 #viewhdr{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 12px;font-size:14px;color:var(--dim)}#viewhdr[hidden]{display:none}
 #viewhdr .vhdev{background:var(--dc);color:var(--dt);font-weight:700;padding:3px 10px;border-radius:8px}#viewhdr b{color:var(--text)}
 #devs{display:flex;flex-direction:column;gap:5px;margin-bottom:10px}
+.envtabs{display:flex;flex-wrap:wrap;gap:5px;margin:0 0 6px}
+#devs .envtab{display:inline-flex;align-items:center;gap:6px;width:auto;padding:4px 10px;border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--dim);font-size:12px;cursor:pointer}
+#devs .envtab b{font-weight:600;font-size:11px;padding:0 6px;border-radius:999px;background:var(--panel2);color:var(--text)}
+#devs .envtab:hover{color:var(--text);border-color:var(--mint);box-shadow:none}#devs .envtab.on{background:var(--mint);border-color:var(--mint);color:var(--bg);font-weight:600}#devs .envtab.on b{background:rgba(127,127,127,.25);color:inherit}
+.envhd{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin:6px 2px 0}
 .dgrp{border-radius:10px;overflow:hidden;background:var(--panel2);border:1px solid var(--line)}
 .dghead{display:flex;align-items:center;gap:8px;padding:5px 10px 5px 12px;font-size:13.5px;background:var(--dc);color:var(--dt);cursor:pointer;font-weight:700;user-select:none}
 .dghead .dgname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -15849,6 +15870,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
     <option value="fortiadc">FortiADC (REST API, read-only)</option>
     <option value="solarwinds">SolarWinds Orion (SWIS API, read-only)</option></select>
     <label>Display name (optional)</label><input id="name" placeholder="e.g. edge-fw-01">
+    <label>Environment (optional: groups the device list into tabs)</label><input id="env" list="envlist" autocomplete="off" placeholder="e.g. Production, DR, Lab" onfocus="envList()"><datalist id="envlist"></datalist>
     <div class="row" id="f-host"><div><label>Mgmt host / IP</label><input id="host"></div>
     <div style="max-width:90px"><label>Port</label><input id="port" value="443"></div></div>
     <div id="f-user"><label>Username</label><input id="username" autocomplete="off"></div>
@@ -15954,13 +15976,13 @@ function renderProfiles(){const s=$("#profiles");s.innerHTML="";
  if(!profiles.length){const o=document.createElement("option");o.value="";o.textContent="No saved profiles";s.appendChild(o);return}
  profiles.forEach(p=>{const o=document.createElement("option");o.value=p.id;
   o.textContent=p.name+" · "+p.vendor+" · "+p.host+":"+p.port;s.appendChild(o)})}
-async function saveProfile(){const r=await api("/api/profile/save",{name:$("#name").value,vendor:$("#vendor").value,
+async function saveProfile(){const r=await api("/api/profile/save",{name:$("#name").value,env:$("#env").value,vendor:$("#vendor").value,
  host:$("#host").value,port:$("#port").value,insecure:$("#insecure").checked});
  if(!r.ok){$("#perr").textContent=r.error;return}
  $("#perr").textContent="Profile saved locally (credentials were not saved).";
  profiles.push(r.profile);renderProfiles();$("#profiles").value=r.profile.id}
 function useProfile(){const p=profiles.find(x=>x.id===$("#profiles").value);if(!p)return;
- $("#name").value=p.name;$("#vendor").value=p.vendor;fields();$("#host").value=p.host;
+ $("#name").value=p.name;$("#env").value=p.env||"";$("#vendor").value=p.vendor;fields();$("#host").value=p.host;
  $("#port").value=p.port;$("#insecure").checked=p.insecure;
  $("#username").value="";$("#password").value="";$("#apikey").value="";
  $("#perr").textContent="Profile loaded. Enter credentials to connect."}
@@ -16006,7 +16028,7 @@ async function vaultLock(){vault=await api("/api/vault",{action:"lock"});renderV
 async function vaultReset(ev){ev.preventDefault();if(!confirm("Delete all saved logins? You will have to log in to each device again."))return;
  vault=await api("/api/vault",{action:"reset"});renderVault();remUi()}
 async function connect(){$("#cerr").textContent="Connecting…";
- const b={vendor:$("#vendor").value,name:$("#name").value,host:$("#host").value,port:$("#port").value,
+ const b={vendor:$("#vendor").value,name:$("#name").value,env:$("#env").value,host:$("#host").value,port:$("#port").value,
  username:$("#username").value,password:$("#password").value,apikey:$("#apikey").value,insecure:$("#insecure").checked,account:$("#account").value,vdom:$("#vdom").value};
  if($("#remember").checked){b.remember=true;b.vault_pass=$("#vpass").value}
  const r=await api("/api/connect",b);
@@ -16014,7 +16036,7 @@ async function connect(){$("#cerr").textContent="Connecting…";
  $("#cerr").textContent=(r.vendor==="cloudflare"?"Token sees "+r.zones.length+" zone(s) in "+r.accounts+" account(s)."+(r.note?" Note: "+r.note:""):"")+
   (r.remember_error?" Connected, but the login was not saved: "+r.remember_error:r.remembered?" Login saved (encrypted).":"");
  $("#password").value="";$("#apikey").value="";$("#vpass").value="";
- devices.push(r);openDev=r.id;select(r.id);if(r.remembered)vaultLoad()}
+ devices.push(r);if(r.env)envTabSet(r.env);openDev=r.id;select(r.id);if(r.remembered)vaultLoad()}
 async function disconnect(id,ev){ev.stopPropagation();await api("/api/disconnect",{id});
  devices=devices.filter(d=>d.id!==id);if(cur===id)cur=devices.length?devices[0].id:null;renderAll()}
 function select(id){cur=id;try{sessionStorage.setItem("cur",id||"")}catch(e){}renderAll()}
@@ -16297,10 +16319,31 @@ function pickItem(id,item){VIEW[id]=item;if(item==="fwblog"||item==="fwbtraf"){c
  const d=devices.find(x=>x.id===id),s=d&&secOf(d,item);if(s)(openSec[id]=openSec[id]||new Set()).add(s);openDev=id;
  if(cur!==id){select(id);return}renderDevs();applyView(true);const r=$("#rpane");if(r&&r.getBoundingClientRect().top<0)r.scrollIntoView({block:"start"})}
 function devClick(d){if(cur!==d.id){openDev=d.id;select(d.id)}else{openDev=openDev===d.id?"":d.id;renderDevs()}}
+// Environment tabs: devices with the same environment label are listed together under one tab ("All" groups them).
+const ENV_NONE="No environment";
+function envOf(d){return (d&&d.env)||""}
+function envTab(){try{return localStorage.getItem("envtab")||""}catch(e){return ""}}
+function envTabSet(t){try{localStorage.setItem("envtab",t)}catch(e){}}
+function envList(){const dl=$("#envlist");if(!dl)return;dl.innerHTML="";
+ [...new Set(devices.map(envOf).concat((typeof profiles!=="undefined"?profiles:[]).map(p=>p.env||"")).filter(Boolean))].sort().forEach(v=>{const o=document.createElement("option");o.value=v;dl.appendChild(o)})}
 function renderDevs(){const el=$("#devs");el.innerHTML="";el.classList.remove("muted");renderFlow();
  if(!devices.length){el.classList.add("muted");el.textContent="No devices connected.";const a=$("#addbox");if(a)a.open=true;return}
  if(openDev===null)openDev=cur||"";
- devices.forEach(d=>{const col=devCol(d),menu=menuOf(d),open=d.id===openDev,w=mk("div","dgrp"+(d.id===cur?" sel":"")+(open?" open":""));
+ const envs=[...new Set(devices.map(envOf).filter(Boolean))].sort((a,b)=>a.localeCompare(b)),none=devices.some(d=>!envOf(d));
+ let tab=envTab();if(tab&&!(envs.includes(tab)||(tab===ENV_NONE&&none)))tab="";
+ let list=devices;
+ if(envs.length){const bar=mk("div","envtabs");bar.setAttribute("role","tablist");
+  const add=(key,label,n)=>{const b=mk("button","envtab"+(key===tab?" on":""));b.setAttribute("role","tab");b.setAttribute("aria-selected",key===tab?"true":"false");
+   b.appendChild(mk("span",null,label));b.appendChild(mk("b",null,String(n)));b.title=key?"Only the devices of "+label:"All devices, grouped by environment";
+   b.onclick=()=>{envTabSet(key);const inTab=d=>key===""||(key===ENV_NONE?!envOf(d):envOf(d)===key),c=devices.find(x=>x.id===cur);
+    if(c&&inTab(c))renderDevs();else{const f=devices.find(inTab);if(f){openDev=f.id;select(f.id)}else renderDevs()}};bar.appendChild(b)};
+  add("","All",devices.length);envs.forEach(v=>add(v,v,devices.filter(d=>envOf(d)===v).length));
+  if(none)add(ENV_NONE,ENV_NONE,devices.filter(d=>!envOf(d)).length);el.appendChild(bar);
+  const byName=(a,b)=>String(a.name).localeCompare(String(b.name),undefined,{numeric:true});   // stable order within a group
+  list=tab===""?envs.flatMap(v=>devices.filter(d=>envOf(d)===v).sort(byName)).concat(devices.filter(d=>!envOf(d)).sort(byName)):
+   devices.filter(d=>tab===ENV_NONE?!envOf(d):envOf(d)===tab).sort(byName)}
+ let lastEnv=null;
+ list.forEach(d=>{if(envs.length&&tab===""&&envOf(d)!==lastEnv){lastEnv=envOf(d);el.appendChild(mk("div","envhd",lastEnv||ENV_NONE))}const col=devCol(d),menu=menuOf(d),open=d.id===openDev,w=mk("div","dgrp"+(d.id===cur?" sel":"")+(open?" open":""));
   w.style.setProperty("--dc",col.c);w.style.setProperty("--dt",col.t);
   const hd=mk("div","dghead");hd.title=(VSHORT[d.vendor]||d.vendor)+" · "+d.host;hd.tabIndex=0;hd.setAttribute("role","button");hd.setAttribute("aria-expanded",open?"true":"false");
   hd.onclick=()=>devClick(d);hd.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();devClick(d)}};
@@ -20821,7 +20864,7 @@ def devices_public():
     out = []
     for sid, s in items:
         d = {"ok": True, "id": sid, "name": s.get("name") or s.get("host"), "vendor": s.get("vendor"),
-             "host": s.get("host"), "user": s.get("user", "")}
+             "host": s.get("host"), "user": s.get("user", ""), "env": s.get("env", "")}
         if s.get("vendor") == "cloudflare":
             d.update(zones=[z.get("name") for z in s.get("zones") or []], accounts=len(s.get("accounts") or {}))
         out.append(d)
