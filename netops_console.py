@@ -10417,6 +10417,8 @@ def do_fg_logs(b):
 # ---- Admin audit: who logged in to the device and what did they do -------------
 ADMIN_NAME_RE = re.compile(r'^[A-Za-z0-9_.@\\\- ]{1,64}$')
 
+ADMIN_WORD_RE = re.compile(r'^[A-Za-z0-9_.@:/\- ]{1,80}$')   # "contains word" filter: also IPs and object paths
+
 
 def pan_log_rows(sess, lt, query, n, skip=0):
     params = {"type": "log", "log-type": lt, "query": query, "nlogs": str(n), "dir": "backward"}
@@ -10887,6 +10889,12 @@ def f5_audit_row(line, user):
                    src, st.group(1) if st else "")
 
 
+def f5_line_user(line):
+    """The admin named in a /var/log/audit line ('user admin -' or 'user=admin(admin)'), or ''."""
+    m = re.search(r"\buser[= ]([A-Za-z0-9_.@-]+)", line.partition("AUDIT - ")[2] or line)
+    return m.group(1) if m else ""
+
+
 def fmt_adm_row(r):
     parts = [r["time"], r["user"], r["action"], r["object"]]
     if r["change"]:
@@ -10905,13 +10913,18 @@ def do_admin_audit(b):
     t0 = time.time()
     notes, rows = [], []
     try:
-        user = (b.get("user") or "").strip()
-        if not ADMIN_NAME_RE.match(user):
-            raise ValueError("enter the admin user name (letters, digits and _ . @ \\ - only)")
+        user = (b.get("user") or "").strip()   # optional: empty = every admin
+        if user and not ADMIN_NAME_RE.match(user):
+            raise ValueError("invalid admin user name (letters, digits and _ . @ \\ - only)")
         kw = (b.get("action") or "").strip()
         if kw and not ADMIN_NAME_RE.match(kw):
             raise ValueError("invalid characters in the action filter")
+        word = " ".join(str(b.get("word") or "").split())   # any column: time, admin, action, object, change, source
+        if word and not ADMIN_WORD_RE.match(word):
+            raise ValueError("invalid characters in the word filter (letters, digits, spaces and _ . @ : / - only)")
         n = num(b.get("count"), 1, 500, 100, "max rows")
+        # the action / word filters are applied here after reading: read more entries then, so they have enough to search
+        fetch = n if not (kw or word) else min(2000, max(500, n * 10))
         cutoff = cutoff_epoch(b) if sess["vendor"] != "paloalto" else None
         audit(sess, "admin audit search user=%s action=%s" % (user, kw or "*"))
         v = sess["vendor"]
@@ -10919,15 +10932,19 @@ def do_admin_audit(b):
             period = b.get("period") or "last-24-hrs"
             if period not in PAN_LOG_PERIODS:
                 raise ValueError("invalid time range")
-            for e in pan_log_rows(sess, "config", "(admin eq '%s') and (receive_time in %s)" % (user, period), n):
+            q = "%s(receive_time in %s)" % ("(admin eq '%s') and " % user if user else "", period)
+            for e in pan_log_rows(sess, "config", q, fetch):
                 chg = e.get("after-change-detail") or e.get("before-change-detail") or ""
                 rows.append(adm_row(first(e, "receive_time", "time_generated"), e.get("admin", user), "config",
                                     str(e.get("cmd", "")).capitalize(), pan_obj(e.get("path")),
                                     re.sub(r"\s+", " ", str(chg)), e.get("host", ""), e.get("result", "")))
             try:
-                q = "(subtype eq auth) and (description contains '%s') and (receive_time in %s)" % (user, period)
-                for e in pan_log_rows(sess, "system", q, n):
-                    rows.append(adm_row(first(e, "receive_time", "time_generated"), user, "login",
+                q = "(subtype eq auth) and %s(receive_time in %s)" % (
+                    "(description contains '%s') and " % user if user else "", period)
+                for e in pan_log_rows(sess, "system", q, fetch):
+                    m = None if user else re.search(r"user '([^']+)'", str(e.get("opaque") or e.get("description") or ""))
+                    who = user or (m.group(1) if m else "")
+                    rows.append(adm_row(first(e, "receive_time", "time_generated"), who or "", "login",
                                         first(e, "eventid", "subtype").replace("-", " ").capitalize(),
                                         "Management login", e.get("opaque") or e.get("description", "")))
             except ValueError as e:
@@ -10936,7 +10953,9 @@ def do_admin_audit(b):
             src = b.get("log_source") or "disk"
             if src not in FG_LOG_SOURCES:
                 raise ValueError("invalid log source")
-            q = {"rows": str(n), "filter": "user==%s" % user}
+            q = {"rows": str(min(1000, fetch))}
+            if user:
+                q["filter"] = "user==%s" % user
             vdom = pstr(b.get("vdom"), "VDOM")
             if vdom:
                 q["vdom"] = vdom
@@ -10969,10 +10988,12 @@ def do_admin_audit(b):
             # No REST collection exposes the audit log, so run one fixed, read-only grep through util/bash
             # (POST, needs an admin-role account). The user name is validated; backslashes are refused so nothing
             # can escape the shell quoting.
-            if "\\" in user:
-                raise ValueError("F5 user names cannot contain a backslash here; use the plain account name")
-            audit(sess, "F5 util/bash read-only grep of /var/log/audit for user " + user)
-            cmd = "cat /var/log/audit.1 /var/log/audit 2>/dev/null | grep -F -i -- '%s' | tail -n 5000" % user
+            if "\\" in user or "\\" in kw:
+                raise ValueError("F5 searches cannot contain a backslash here; use the plain account name / word")
+            what = user or (word.split()[0] if word else "") or kw   # grep on the device: user, else a word, else action
+            audit(sess, "F5 util/bash read-only read of /var/log/audit%s" % (" for " + what if what else ""))
+            cmd = "cat /var/log/audit.1 /var/log/audit 2>/dev/null%s | tail -n 5000" % (
+                " | grep -F -i -- '%s'" % what if what else "")
             body = json.dumps({"command": "run", "utilCmdArgs": '-c "%s"' % cmd}).encode()
             hdr = dict(sess["hdr"])
             hdr["Content-Type"] = "application/json"
@@ -10986,10 +11007,12 @@ def do_admin_audit(b):
                                  "Administrator role; otherwise check the log on the device or in your SIEM. %s"
                                  % (st, raw.decode("utf-8", "replace")[:200]))
             texts = str(res.get("commandResult") or "").splitlines()
-            pat = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(user), re.I)
+            pat = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(user), re.I) if user else None
             for line in texts:
-                if pat.search(line):
-                    rows.append(f5_audit_row(line, user))
+                if "AUDIT" not in line and not user:
+                    continue
+                if pat is None or pat.search(line):
+                    rows.append(f5_audit_row(line, user or f5_line_user(line)))
             rows.reverse()  # the log is oldest first
             if cutoff:
                 rows = [r for r in rows if (log_epoch(r["time"]) or 0) >= cutoff]
@@ -11012,8 +11035,11 @@ def do_admin_audit(b):
         return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
     if sess["vendor"] != "f5":
         rows.sort(key=lambda r: str(r["time"]), reverse=True)
-    if kw:
-        rows = [r for r in rows if kw.lower() in json.dumps(r).lower()]
+    if kw:   # the action column (or the event type, e.g. login)
+        rows = [r for r in rows if kw.lower() in ("%s %s" % (r["action"], r["type"])).lower()]
+    if word:   # every word anywhere in the row
+        ws = word.lower().split()
+        rows = [r for r in rows if all(w in " ".join(str(v) for v in r.values()).lower() for w in ws)]
     rows = rows[:n]
     if cutoff:
         notes.append("Time range: %s." % b.get("within"))
@@ -11023,10 +11049,18 @@ def do_admin_audit(b):
     top = collections.Counter(r["action"].strip() for r in rows if r["action"].strip()).most_common(5)
     if top:
         summary.append("Top actions: " + ", ".join("%s (%d)" % kv for kv in top))
+    if not user:
+        who = collections.Counter(r["user"] for r in rows if r["user"]).most_common(8)
+        if who:
+            summary.append("Admins: " + ", ".join("%s (%d)" % kv for kv in who))
     summary.extend(notes)
     return {"ok": True, "status": 200, "ms": int((time.time() - t0) * 1000),
-            "request": "admin audit user=%s%s" % (user, " action~" + kw if kw else ""),
-            "verdict": {"label": "%d EVENT(S) for %s" % (len(rows), user), "kind": "ok" if rows else "info"},
+            "request": "admin audit user=%s%s%s" % (user or "*", " action~" + kw if kw else "",
+                                                    " word~" + word if word else ""),
+            "verdict": {"label": "%d EVENT(S) for %s%s%s" % (len(rows), user or "all admins",
+                                                           " · action contains '%s'" % kw if kw else "",
+                                                           " · contains '%s'" % word if word else ""),
+                        "kind": "ok" if rows else "info"},
             "summary": summary, "data": {"lines": lines, "events": rows}}
 
 
@@ -16810,8 +16844,8 @@ function renderAppsec(){const box=$("#appsec");box.innerHTML="";const d=dev();if
   (v==="f5"?'<div class="chk"><input type="checkbox" id="bk_ack"><span>I understand this creates a UCS archive on the BIG-IP and copies it through the shell (Administrator role); approved for this device</span></div>':'')+
   (v==="fortigate"?'<div class="row3">'+fld("bk_vdom","VDOM (optional, blank = whole device)","root")+'</div>':'')+
   '<div style="margin-top:8px"><button class="primary" onclick="backup()">Back up &amp; download</button></div></div>';
- h+='<div data-it="audit"><div class="grp">Admin audit · who logged in and what they did</div><div class="row3">'+fld("au_user","Admin user name","admin")+
-  fld("au_act","Action contains (optional)","delete, commit, edit")+fld("au_n","Max rows","100","100")+
+ h+='<div data-it="audit"><div class="grp">Admin audit · who logged in and what they did</div><div class="row3">'+fld("au_user","Admin user name (optional: empty = all admins)","all admins")+
+  fld("au_act","Action contains (optional)","delete, edit, login")+fld("au_word","Contains word (optional, any column)","pool, IP, object")+fld("au_n","Max rows","100","100")+
   (v==="paloalto"?sel("au_period","Time range",["last-15-minutes","last-hour","last-6-hrs","last-12-hrs","last-24-hrs","last-7-days","last-30-days"],"last-24-hrs"):"")+
   (v==="fortigate"?sel("au_src","Log source",["disk","memory","fortianalyzer"],"disk")+fld("au_vdom","VDOM (optional)","root"):"")+
   (v!=="paloalto"?wsel("au_w"):"")+
@@ -16823,7 +16857,7 @@ async function backup(){setBusy("configuration backup (F5 archives can take seve
 async function f5Sync(){setBusy("config sync review");
  const r=await api("/api/f5sync",{id:cur,hours:g("sy_h"),count:g("sy_n")});show(r,"config sync review")}
 async function adminAudit(){setBusy("admin audit (can take up to a minute)");
- const r=await api("/api/adminaudit",{id:cur,user:g("au_user"),action:g("au_act"),count:g("au_n"),period:g("au_period"),within:g("au_w"),log_source:g("au_src"),vdom:g("au_vdom")});show(r,"admin audit")}
+ const r=await api("/api/adminaudit",{id:cur,user:g("au_user"),action:g("au_act"),word:g("au_word"),count:g("au_n"),period:g("au_period"),within:g("au_w"),log_source:g("au_src"),vdom:g("au_vdom")});show(r,"admin audit")}
 async function appsec(c){const names={waf:"coverage",ssl:"SSL posture"};setBusy(names[c]);
  const r=await api("/api/appsec",{id:cur,check:c,vsys:g("as_vsys"),vdom:g("as_vdom"),days:g("as_days")});show(r,names[c])}
 async function asmLookup(m){
