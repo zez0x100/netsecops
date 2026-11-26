@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ITSec Ops - read-only troubleshooting for F5 BIG-IP, Palo Alto PAN-OS, FortiGate.
+NetSecOps - read-only troubleshooting for F5 BIG-IP, Palo Alto PAN-OS, FortiGate.
 
 Run:   python3 netops_console.py            (Python 3.8+, standard library only)
 Then open the URL printed in the terminal.
@@ -14229,7 +14229,7 @@ LLM_ASSIGN_SECRET = re.compile(r'(?i)(\b[\w.]*(?:passw|secret|token|api_?key|api
 LLM_HDR_SECRET = re.compile(r'(?i)(\b(?:header|cookie)\s+(?:insert|replace)\s+"?[\w-]*(?:auth|token|api-?key|secret|passw)'
                             r'[\w-]*"?\s+)("[^"\n]*"|\{[^}\n]*\}|[^\s;\]]+)')
 LLM_SYSTEM = (
-    "You are a network-security troubleshooting assistant inside ITSec Ops, a read-only console for F5 BIG-IP, "
+    "You are a network-security troubleshooting assistant inside NetSecOps, a read-only console for F5 BIG-IP, "
     "Palo Alto PAN-OS, FortiGate, FortiWeb (WAF), FortiADC (ADC / load balancer), Cloudflare and SolarWinds "
     "monitoring. Answer only from the data you are given or that tools return, and quote "
     "the values that matter (IPs, rule / policy names, times, percentages, counts). If the data does not show something, "
@@ -15122,7 +15122,7 @@ def llm_wrap(fn):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ITSecOps"
+    server_version = "NetSecOps"
 
     def log_message(self, *a):
         pass
@@ -15293,7 +15293,7 @@ class Handler(BaseHTTPRequestHandler):
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ITSec Ops</title>
+<title>NetSecOps</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%232EE6C5'/%3E%3Cstop offset='.6' stop-color='%237C6CFF'/%3E%3Cstop offset='1' stop-color='%23FF7A59'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z' fill='%2314132a' stroke='url(%23g)' stroke-width='2.2' stroke-linejoin='round'/%3E%3Cpath d='m12 13 6 5-6 5' fill='none' stroke='%232EE6C5' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M20.5 24h5' stroke='%23FF7A59' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#0B0A17;--panel:#14132a;--panel2:#1b1a38;--line:#2a2850;--text:#e9e8ff;--dim:#8f8cb8;
@@ -15814,7 +15814,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 </style>
 <script>try{document.documentElement.dataset.theme=localStorage.getItem("theme")||"light"}catch(e){document.documentElement.dataset.theme="light"}</script>
 </head><body>
-<header><img class="brand" src="/brand-logo?t=__TOKEN__" alt="" onload="this.nextElementSibling.hidden=false" onerror="this.remove()"><span class="bsep" hidden></span><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="ITSec Ops logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>ITSec Ops</h1><button class="themebtn" id="dashbtn" onclick="dashToggle()" title="Operations dashboard: resources, interfaces and HA of all firewalls and F5s" aria-label="Operations dashboard" hidden>▦</button><button class="themebtn" id="flowbtn" onclick="ftToggle()" title="Flow trace: one flow on every connected device" aria-label="Flow trace" hidden>⇄</button><button class="themebtn" id="monbtn" onclick="monPanel()" title="Device monitor" aria-label="Device monitor" hidden>🔔<span id="monbadge" hidden></span></button><button class="themebtn" onclick="themeToggle()" title="Switch light / dark theme" aria-label="Switch light / dark theme">◐</button></header>
+<header><img class="brand" src="/brand-logo?t=__TOKEN__" alt="" onload="this.nextElementSibling.hidden=false" onerror="this.remove()"><span class="bsep" hidden></span><svg class="logo" viewBox="0 0 36 36" role="img" aria-label="NetSecOps logo"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2EE6C5"/><stop offset=".6" stop-color="#7C6CFF"/><stop offset="1" stop-color="#FF7A59"/></linearGradient></defs><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#lg)" stroke-width="2.2" stroke-linejoin="round"/><path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2.6" stroke-linecap="round"/></svg><h1>NetSecOps</h1><button class="themebtn" id="dashbtn" onclick="dashToggle()" title="Operations dashboard: resources, interfaces and HA of all firewalls and F5s" aria-label="Operations dashboard" hidden>▦</button><button class="themebtn" id="flowbtn" onclick="ftToggle()" title="Flow trace: one flow on every connected device" aria-label="Flow trace" hidden>⇄</button><button class="themebtn" id="monbtn" onclick="monPanel()" title="Device monitor" aria-label="Device monitor" hidden>🔔<span id="monbadge" hidden></span></button><button class="themebtn" onclick="themeToggle()" title="Switch light / dark theme" aria-label="Switch light / dark theme">◐</button></header>
 <div id="advbar" hidden></div><div id="advpanel" hidden></div>
 <div id="dash" hidden><div class="dbar"><h2>▦ Operations dashboard</h2><span class="dmeta" id="dash_meta"></span>
 <label class="dlbl">Refresh every <select id="dash_iv" onchange="dashSet({interval:+this.value})"><option value="300">5 min</option><option value="600">10 min</option><option value="1200">20 min</option><option value="1800">30 min</option><option value="3600">60 min</option></select></label>
@@ -15881,7 +15881,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
       <g transform="translate(38 209)"><rect x="-6" y="-5.5" width="12" height="8" rx="1"/><path d="M-8.5 5h17"/></g></g>
     <g transform="translate(82.4 92.4) scale(3.2)"><path d="M18 2.5 31.5 7.5v9.5c0 8-5.6 13.6-13.5 16.5C10.1 30.6 4.5 25 4.5 17V7.5Z" fill="#14132a" stroke="url(#bgl-g)" stroke-width="1.4" stroke-linejoin="round"/>
     <path d="m12 13 6 5-6 5" fill="none" stroke="#2EE6C5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5 24h5" stroke="#FF7A59" stroke-width="2" stroke-linecap="round"/></g>
-    <text x="140" y="318" text-anchor="middle" font-size="22" font-weight="700" fill="url(#bgl-g)">ITSec Ops</text>
+    <text x="140" y="318" text-anchor="middle" font-size="22" font-weight="700" fill="url(#bgl-g)">NetSecOps</text>
     <text x="140" y="340" text-anchor="middle" font-size="10" fill="#8f8cb8" letter-spacing=".25em">OBSERVE · TRACE · VERIFY</text>
   </svg></div>
 </div>
@@ -15907,7 +15907,7 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
 </div>
   <div id="aicard" role="dialog" aria-label="AI assistant" hidden>
     <div class="aihead"><span class="aiav big off" id="ai_av">✦</span>
-      <div class="aititle"><b>ITSec Assistant</b><small id="ai_sub">local LLM · no model set</small></div>
+      <div class="aititle"><b>NetSecOps Assistant</b><small id="ai_sub">local LLM · no model set</small></div>
       <button onclick="aiCfg()" title="Model settings" aria-label="Model settings">⚙</button>
       <button onclick="aiClear()" title="New conversation" aria-label="New conversation">↻</button>
       <button id="ai_full" onclick="aiFull()" title="Full screen" aria-label="Full screen">⤢</button>
@@ -17179,7 +17179,7 @@ function aiRoute(r){if(r&&r.route)$("#ai_route").textContent="Data goes to: "+r.
 function aiStatus(m){$("#ai_sub").textContent=m?"online · "+m:"local LLM · no model set";$("#ai_by").textContent=m||"local LLM";$("#ai_av").classList.toggle("off",!m)}
 function aiCfg(){const c=$("#ai_cfg");c.open=!c.open;if(c.open)$("#aicard .aibody").scrollTop=0}
 function aiWelcome(){if($("#ai_log").children.length)return;
- aiAdd("bot","Welcome to the ITSec assistant 👋 How can I help?\n\nI can explain the output on screen, answer questions about it, or run **read-only** checks on all the connected devices (firewalls, F5, Cloudflare) to answer any question. Just type it and press Enter.",{welcome:true})}
+ aiAdd("bot","Welcome to the NetSecOps assistant 👋 How can I help?\n\nI can explain the output on screen, answer questions about it, or run **read-only** checks on all the connected devices (firewalls, F5, Cloudflare) to answer any question. Just type it and press Enter.",{welcome:true})}
 // Enter / Send: run read-only checks on all connected devices whenever one is connected (the output on screen is still sent as context);
 // without a device it can only talk about the output.
 function aiSend(){aiAsk(devices.length?"agent":"chat")}
@@ -17376,7 +17376,7 @@ function exportHtml(){if(!last||last.error||!last.data){alert("Run a check first
  'body{font:14px system-ui,sans-serif;margin:24px;color:#111}table{border-collapse:collapse;width:100%;margin:8px 0 20px}'+
  'th,td{border:1px solid #ccc;padding:5px 8px;text-align:left;vertical-align:top;font-size:13px;word-break:break-word}th{background:#f2f2f2}'+
  'pre{white-space:pre-wrap;background:#f7f7f7;padding:8px;border:1px solid #ddd}td.high{color:#b00020;font-weight:700}td.medium{color:#a35200;font-weight:700}td.low{color:#555}</style></head><body>'+
- '<h1>'+esc(lastCtx.label)+'</h1><p>Device: '+esc(lastCtx.device||"n/a")+' · Generated: '+esc(lastCtx.time)+' · ITSec Ops</p>'+
+ '<h1>'+esc(lastCtx.label)+'</h1><p>Device: '+esc(lastCtx.device||"n/a")+' · Generated: '+esc(lastCtx.time)+' · NetSecOps</p>'+
  '<h2>Result: '+esc(v.label||"")+'</h2>'+(last.request?'<p>Scope: '+esc(last.request)+'</p>':'')+
  (last.summary&&last.summary.length?"<ul>"+last.summary.map(x=>"<li>"+esc(x)+"</li>").join("")+"</ul>":"")+
  (f?'<h2>Findings</h2>'+table(f)+'<h2>Inventory</h2>'+table(d.inventory)+
@@ -20855,7 +20855,7 @@ def main():
         threading.Thread(target=hot_watch, args=(srv,), daemon=True).start()
     srv.allowed_hosts = {"127.0.0.1:%d" % a.port, "localhost:%d" % a.port}
     url = "http://127.0.0.1:%d/?t=%s" % (a.port, TOKEN)
-    print("ITSec Ops (read-only). Open:\n  " + url + "\nCtrl+C to stop; credentials are cleared on exit.")
+    print("NetSecOps (read-only). Open:\n  " + url + "\nCtrl+C to stop; credentials are cleared on exit.")
     if not a.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

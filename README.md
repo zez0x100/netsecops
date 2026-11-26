@@ -1,4 +1,4 @@
-# ITSec Ops (netsecops)
+# NetSecOps (netsecops)
 
 A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto PAN-OS**, **FortiGate**,
 **FortiWeb** and **FortiADC** devices, **Cloudflare** accounts and **SolarWinds Orion** monitoring, from one place. Python 3.8+, standard library only, no dependencies, built with Claude Code.
