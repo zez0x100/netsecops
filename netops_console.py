@@ -14216,8 +14216,10 @@ def llm_url_ok(url):
     host = u.hostname.lower().rstrip(".")
     if host not in LLM_LOCAL and host not in LLM_APPROVED:
         raise ValueError("%s is not an approved model server, so device data will not be sent to it. Approved: %s "
-                         "(or this PC: 127.0.0.1 / localhost). Approved hosts are listed in llm_approved.txt next to netops_console.py."
-                         % (u.hostname, ", ".join(LLM_APPROVED) or "none"))
+                         "(or this machine: 127.0.0.1 / localhost). Add the host name, one per line, to %s and restart %s."
+                         % (u.hostname, ", ".join(LLM_APPROVED) or "none",
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_approved.txt"),
+                            "the gateway (systemctl restart netops-gateway)" if os.environ.get("NETOPS_HOME") else "the console"))
     # The full endpoint pasted from API docs (…/v1/chat/completions) is cut back to the API base (…/v1).
     return re.sub(r"/(chat/completions|completions|models)$", "", str(url).strip().rstrip("/"))
 
