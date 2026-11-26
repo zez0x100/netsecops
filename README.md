@@ -449,6 +449,10 @@ python flow_portal.py serve --bind 10.0.0.5 --port 8443 --allow 10.10.0.0/16,10.
   should be 32k tokens or more; each check result the agent runs gets a quarter of it, all results together at most
   twice it). The model can only call read-only lookups; active tools are never offered
   to it, and nothing it writes is run. Model settings and the optional API key live in memory only.
+  Reasoning effort (gear menu: server default / low / medium / high) is sent as `reasoning_effort` (Ollama: `think`
+  for gpt-oss); a server that refuses it gets requests without it from then on. gpt-oss "harmony" markers that an
+  unparsing server leaves in the answer are removed. A launcher may give start-up settings in `NETOPS_LLM_DEFAULT`
+  (JSON url / model / effort / budget) and `NETOPS_LLM_KEY`; the URL must still be approved.
 - Vendor advisories: the console downloads public lists only (security.paloaltonetworks.com, services.nvd.nist.gov,
   cveawg.mitre.org, cisa.gov) directly over HTTPS, without a proxy. Requests ask for whole product lists and every
   CVE of a product at the chosen severity, never for a version, so nothing about the devices leaves the PC.

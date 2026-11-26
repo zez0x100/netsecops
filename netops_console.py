@@ -14144,7 +14144,8 @@ def do_cf(b):
 # ---- Local LLM assistant: explain the current output, chat about it, or let the model run read-only checks --------
 # Talks to an OpenAI-compatible chat API (Ollama, LM Studio, llama.cpp server, vLLM). Settings live in memory only.
 # Sent only to this PC or an approved host (LLM_APPROVED); secrets are masked and large output trimmed before sending.
-LLM_CFG = {"url": "http://127.0.0.1:11434/v1", "model": "", "key": "", "budget": 60000}
+LLM_CFG = {"url": "http://127.0.0.1:11434/v1", "model": "", "key": "", "budget": 60000, "effort": ""}
+LLM_EFFORTS = ("", "low", "medium", "high")   # reasoning effort for models that have one (gpt-oss, o-series); "" = server default
 LLM_LOCAL = ("127.0.0.1", "localhost", "::1")
 # The only model servers device data may be sent to, besides this PC: exact host names, no wildcards, one per line in
 # llm_approved.txt next to this script (not in git: lines starting with # are comments). Any other address is refused,
@@ -14159,6 +14160,27 @@ def llm_load_approved():
 
 
 LLM_APPROVED = llm_load_approved()
+
+
+def llm_env_default():
+    """Optional start-up model settings from a launcher (one console per user on a server): NETOPS_LLM_DEFAULT =
+    JSON {url, model, effort, budget}, NETOPS_LLM_KEY = API key. The URL must still be an approved server."""
+    raw, key = os.environ.pop("NETOPS_LLM_DEFAULT", ""), os.environ.pop("NETOPS_LLM_KEY", "")
+    try:
+        d = json.loads(raw) if raw else {}
+        url = llm_url_ok(d["url"]) if d.get("url") else None
+    except (ValueError, TypeError, KeyError):
+        return
+    if url:
+        LLM_CFG["url"] = url
+    if re.match(r"^[\w.:/@+-]{1,128}$", str(d.get("model") or "")):
+        LLM_CFG["model"] = str(d["model"])
+    if d.get("effort") in LLM_EFFORTS:
+        LLM_CFG["effort"] = d["effort"]
+    if isinstance(d.get("budget"), int) and 4000 <= d["budget"] <= 400000:
+        LLM_CFG["budget"] = d["budget"]
+    if key:
+        LLM_CFG["key"] = key.strip()
 LLM_SECRET_KEY = re.compile(r"(passw|passphrase|secret|token|api[_-]?key|apikey|private[_-]?key|\bpsk\b|pre-?shared|"
                             r"community|cookie|authorization|auth[_-]?hash|x-api-key|session[_-]?id)", re.I)
 LLM_PEM = re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?(-----END [A-Z0-9 ]+-----|$)", re.S)
@@ -14200,6 +14222,8 @@ def llm_url_ok(url):
     return re.sub(r"/(chat/completions|completions|models)$", "", str(url).strip().rstrip("/"))
 
 
+if not globals().get("_HOT_RELOADING"):
+    llm_env_default()
 LLM_WAIT = 600   # seconds the model may stay silent (loading, reading the prompt) before we give up
 
 
@@ -14418,6 +14442,8 @@ def llm_chat_ollama(messages, tools, est):
         nm.append(m)
     body = {"model": LLM_CFG["model"], "messages": nm, "stream": True, "keep_alive": "30m",
             "options": {"num_ctx": ctx, "temperature": 0.2}}
+    if LLM_CFG.get("effort") and "gpt-oss" in str(LLM_CFG["model"]).lower():
+        body["think"] = LLM_CFG["effort"]   # Ollama: gpt-oss takes low / medium / high here
     if tools:
         body["tools"] = tools
     st, d = llm_http("POST", "/api/chat", body, root=True, stream=True)
@@ -14445,6 +14471,10 @@ def llm_text(msg):
     if isinstance(c, list):
         c = "".join(str(p.get("text") or "") for p in c if isinstance(p, dict))
     c = re.sub(r"(?s)<think>.*?</think>", "", str(c or ""))
+    if "<|channel|>" in c or "<|message|>" in c:   # gpt-oss "harmony" text from a server that did not parse it
+        parts = re.split(r"<\|channel\|>\s*final\s*(?:<\|constrain\|>\w+)?\s*<\|message\|>", c)
+        c = parts[-1] if len(parts) > 1 else re.sub(r"(?s)<\|channel\|>\s*analysis.*?(<\|end\|>|$)", "", c)
+        c = re.sub(r"<\|[a-z_]+\|>", "", c)
     return re.sub(r"(?s)^\s*<think>.*", "", c).strip()
 
 
@@ -14515,10 +14545,17 @@ def llm_chat(messages, tools=None, max_tokens=None):
     extra = "qwen3" in str(LLM_CFG["model"]).lower() and LLM_CFG.get("_no_extra") != who
     if extra:
         body["chat_template_kwargs"] = {"enable_thinking": False}
+    eff = LLM_CFG.get("effort") and LLM_CFG.get("_no_effort") != who
+    if eff:
+        body["reasoning_effort"] = LLM_CFG["effort"]
     st, d = llm_http("POST", "/chat/completions", body, timeout=LLM_WAIT)
-    if extra and st in (400, 422):
-        LLM_CFG["_no_extra"] = who
+    if (extra or eff) and st in (400, 422):
+        if extra:
+            LLM_CFG["_no_extra"] = who
+        if eff:
+            LLM_CFG["_no_effort"] = who   # this server / model has no reasoning effort: send without it from now on
         body.pop("chat_template_kwargs", None)
+        body.pop("reasoning_effort", None)
         st, d = llm_http("POST", "/chat/completions", body, timeout=LLM_WAIT)
     if st >= 300 or not isinstance(d, dict) or not d.get("choices"):
         err = (d or {}).get("error") if isinstance(d, dict) else d
@@ -14784,14 +14821,17 @@ def do_llm_config(b):
         model = str(b.get("model") or "").strip()
         if model and not re.match(r"^[\w.:/@+-]{1,128}$", model):
             raise ValueError("invalid model name")
-        LLM_CFG.update(url=url, model=model,
+        eff = str(b.get("effort") or "")
+        if eff not in LLM_EFFORTS:
+            raise ValueError("reasoning effort must be low, medium, high or empty")
+        LLM_CFG.update(url=url, model=model, effort=eff,
                        budget=num(b.get("budget"), 4000, 400000, 60000, "context budget"))
         if b.get("key") is not None and str(b.get("key")) != "":
             LLM_CFG["key"] = str(b["key"]).strip()
         if b.get("clear_key"):
             LLM_CFG["key"] = ""
     return {"ok": True, "url": LLM_CFG["url"], "model": LLM_CFG["model"], "route": llm_route(), "approved": list(LLM_APPROVED),
-            "budget": LLM_CFG["budget"], "has_key": bool(LLM_CFG["key"])}
+            "budget": LLM_CFG["budget"], "has_key": bool(LLM_CFG["key"]), "effort": LLM_CFG.get("effort", "")}
 
 
 def do_llm_models(b):
@@ -15842,6 +15882,8 @@ background:linear-gradient(90deg,#0b6fd0 0 58%,#f26b38 58% 76%,#6c3fc4 76%)}
         <div><label>Model server (OpenAI-compatible API)</label><input id="ai_url" placeholder="http://127.0.0.1:11434/v1"></div>
         <div><label>Model</label><input id="ai_model" list="ai_models" placeholder="qwen2.5:7b"><datalist id="ai_models"></datalist></div>
         <div><label>API key (optional, kept in memory only)</label><input id="ai_key" type="password" placeholder="(none)" autocomplete="off"></div>
+        <div><label>Reasoning effort (gpt-oss and other reasoning models)</label><select id="ai_effort" title="Low answers fastest, high thinks longest. Server default: nothing is sent. Models without it ignore the setting.">
+          <option value="">server default</option><option value="low">low (fastest)</option><option value="medium">medium</option><option value="high">high (slowest)</option></select></div>
         <div><label>Context budget (characters sent per output)</label><input id="ai_budget" value="60000" title="About 3-4 characters per token: 60000 needs a model context of at least 32k tokens. The output on screen gets this much; in Ask &amp; run checks it gets half, and all check results together get at most twice this."></div>
       </div>
       <div id="ai_route" class="muted" style="font-size:12.5px;margin-top:6px"></div>
@@ -17095,7 +17137,7 @@ function aiSrcSet(s){s=s||null;if(JSON.stringify(s)===JSON.stringify(aiSrc))retu
  const x=mk("button",null,"✕");x.title="Stop: talk about the console output again";x.setAttribute("aria-label",x.title);x.onclick=()=>aiSrcSet(null);b.appendChild(x)}
 function dashAsk(){aiSrcSet({kind:"dashboard"});aiToggle(true);aiAsk("chat","Using the dashboard data: what needs attention right now, most urgent first? For each item give the device, the values and the likely cause, then the next check to run. Also say if anything looks wrong in the trends.","What needs attention on the dashboard right now?")}
 async function aiInit(){const r=await api("/api/llm/config",{});if(!r.ok)return;
- $("#ai_url").value=r.url;$("#ai_model").value=r.model||"";aiRoute(r);$("#ai_budget").value=r.budget;
+ $("#ai_url").value=r.url;$("#ai_model").value=r.model||"";aiRoute(r);$("#ai_budget").value=r.budget;$("#ai_effort").value=r.effort||"";
  $("#ai_key").placeholder=r.has_key?"(set · type to replace)":"(none)";if(!r.model)$("#ai_cfg").open=true;aiStatus(r.model);aiRestore();aiWelcome()}
 function aiRoute(r){if(r&&r.route)$("#ai_route").textContent="Data goes to: "+r.route+" · approved servers: "+(r.approved||[]).join(", ")+" or this PC"}
 function aiStatus(m){$("#ai_sub").textContent=m?"online · "+m:"local LLM · no model set";$("#ai_by").textContent=m||"local LLM";$("#ai_av").classList.toggle("off",!m)}
@@ -17106,7 +17148,7 @@ function aiWelcome(){if($("#ai_log").children.length)return;
 // without a device it can only talk about the output.
 function aiSend(){aiAsk(devices.length?"agent":"chat")}
 async function aiSave(loud){const r=await api("/api/llm/config",{set:true,url:g("ai_url"),model:g("ai_model"),key:g("ai_key"),
-  budget:g("ai_budget")});const m=$("#ai_cfgmsg");
+  budget:g("ai_budget"),effort:$("#ai_effort").value});const m=$("#ai_cfgmsg");
  if(r.ok){aiStatus(r.model);aiRoute(r);$("#ai_key").value="";$("#ai_key").placeholder=r.has_key?"(set · type to replace)":"(none)";if(loud){m.className="ok";m.textContent="saved · "+(r.model||"no model picked yet")}}
  else{m.className="bad";m.textContent="error: "+r.error;$("#ai_cfg").open=true}return r.ok}
 async function aiModels(){if(!await aiSave(false))return;const m=$("#ai_cfgmsg");m.className="muted";m.textContent="asking the model server…";
