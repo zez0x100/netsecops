@@ -17403,7 +17403,8 @@ function monToast(e){const bad=e.kind==="offline"||e.kind==="pooldown"||e.kind==
  if(e.kind!=="error")monBeep(bad)}
 async function monPoll(){dashBtn();if(!devices.some(d=>["f5","paloalto","fortigate"].includes(d.vendor))){$("#monbtn").hidden=true;$("#monpanel").hidden=true;monOpen=false;return}
  $("#monbtn").hidden=false;let r;try{r=await api("/api/monitor"+(monSeq>=0?"?since="+monSeq:""))}catch(e){return}if(!r||!r.ok)return;
- if(monSeq>=0)r.events.forEach(monToast);monSeq=r.seq;
+ // pop-ups only while monitoring is on (and change pop-ups only while those are on)
+ if(monSeq>=0&&r.on)r.events.filter(e=>e.kind!=="change"||r.changes!==false).forEach(monToast);monSeq=r.seq;
  if(!monLast)monLast={events:[]};monLast.on=r.on;monLast.interval=r.interval;monLast.changes=r.changes;monLast.status=r.status;
  monLast.events=monLast.events.concat(r.events).slice(-40);
  const off=r.status.reduce((n,s)=>n+(s.offline||0),0),b=$("#monbadge");
@@ -17898,6 +17899,35 @@ api("/api/catalog").then(c=>{catalog=c;devicesRestore()});loadProfiles();vaultLo
 MON = {"on": True, "interval": 30, "seq": 0, "events": collections.deque(maxlen=300), "state": {}, "vips": {},
        "status": {}, "busy": False, "next": 0.0, "lock": threading.Lock()}
 MON_INTERVALS = (15, 30, 60, 120, 300)
+# The user's choices survive a console restart (a launcher restarts idle consoles). Default: on for a console on this
+# PC; off when a launcher runs one console per user on a server (not every colleague polls every device by default).
+MON_PREF_FILE = os.path.join(DATA_DIR, "monitor_settings.json")
+
+
+def mon_prefs_load():
+    try:
+        with open(MON_PREF_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    MON["on"] = bool(d.get("on", not os.environ.get("NETOPS_HOME")))
+    MON["changes"] = bool(d.get("changes", True))
+    if d.get("interval") in MON_INTERVALS:
+        MON["interval"] = d["interval"]
+
+
+def mon_prefs_save():
+    try:
+        tmp = MON_PREF_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"on": MON["on"], "changes": MON.get("changes", True), "interval": MON["interval"]}, f)
+        os.replace(tmp, MON_PREF_FILE)
+    except OSError:
+        pass
+
+
+if not globals().get("_HOT_RELOADING"):
+    mon_prefs_load()
 
 
 def mon_member_state(m):
@@ -17914,6 +17944,9 @@ def mon_member_state(m):
 
 
 def mon_event(kind, sess, text, **kw):
+    # A check that was already running when monitoring (or change pop-ups) was switched off must not pop anything up.
+    if not MON["on"] or (kind == "change" and not MON.get("changes", True)):
+        return
     with MON["lock"]:
         MON["seq"] += 1
         e = dict(kw, seq=MON["seq"], kind=kind, t=time.strftime("%H:%M:%S"), ts=time.time(),
@@ -18368,6 +18401,8 @@ def do_monitor_set(b):
         MON["interval"] = iv
     if b.get("now") or "interval" in b or b.get("on"):
         MON["next"] = 0.0
+    if "on" in b or "changes" in b or "interval" in b:
+        mon_prefs_save()
     return {"ok": True, "on": MON["on"], "interval": MON["interval"], "changes": MON.get("changes", True)}
 
 

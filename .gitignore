@@ -1,4 +1,6 @@
 device_profiles.json
+monitor_settings.json
+monitor_settings.json.tmp
 captures
 __pycache__/
 llm_approved.txt
