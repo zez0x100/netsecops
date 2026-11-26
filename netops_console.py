@@ -15252,7 +15252,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code, body, ctype="application/json"):
         if isinstance(body, (dict, list)):
-            body = json.dumps(body)
+            try:
+                body = json.dumps(body)
+            except (TypeError, ValueError, RecursionError):   # odd values in a device reply: never drop the connection
+                try:
+                    body = json.dumps(body, default=str)
+                except (TypeError, ValueError, RecursionError) as e:
+                    sys.stderr.write("reply not sent as JSON: %s: %s\n" % (type(e).__name__, e))
+                    body = json.dumps({"ok": False, "error": "internal error: the result could not be sent (%s: %s)"
+                                       % (type(e).__name__, e)})
         body = body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
