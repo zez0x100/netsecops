@@ -153,8 +153,11 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
   - Ask about current output: follow-up questions on the same output, with the conversation kept
   - Ask & run checks: the model answers any question by choosing and running up to 8 of the console's read-only
     lookups on ALL connected devices, whichever one is selected (tools named per device type: pa_, fg_, f5_, cf_;
-    catalog checks, IP / policy lookup, log search, ACC, F5 hostname / WAF log search, Cloudflare lookups; a device
-    field picks one when several of a type are connected), and combines them across devices; plus a policy check
+    catalog checks, IP / policy lookup, log search, ACC, F5 hostname / WAF log search, Cloudflare lookups). When
+    several devices of a type are connected, each lookup runs on ALL of them at once (in parallel, results per
+    device: where it was found, then the devices with nothing and the ones that failed or did not answer within
+    150 s) unless the question names a device; such a lookup counts as one of the 8. Lookups are combined across
+    device types; plus a policy check
     (every connected Palo Alto / FortiGate: which rule allows or blocks IP A -> IP B:port) and the flow trace for
     internet clients and published hostnames. Each call is in the audit log of the device it read and its result can
     be opened in Output. Needs a model with tool calling (e.g. qwen2.5 / qwen3, llama3.1+, mistral-nemo)

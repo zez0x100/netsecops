@@ -14732,7 +14732,8 @@ def llm_tools():
         if not labels:
             continue
         p, vn = LLM_PFX[v], LLM_VNAME[v]
-        D = {"device": S("which %s (default: %s)" % (vn, labels[0]), enum=labels)}
+        D = {"device": S("only this %s, and only when the user names it; leave empty to run on every connected %s at "
+                         "once (results per device)" % (vn, vn) if len(labels) > 1 else "which %s" % vn, enum=labels)}
 
         def vt(name, desc, props, req=()):
             tool(p + "_" + name, "%s (%s): %s" % (vn, ", ".join(labels), desc), dict(D, **props), req)
@@ -14819,6 +14820,8 @@ def llm_run_tool(name, a):
     if not mine:
         return {"ok": False, "error": "tool %s_%s: no such device type is connected" % (pfx, name)}
     want = s("device")
+    if not want and len(mine) > 1:
+        return llm_fanout(pfx + "_" + name, a, mine)
     pick = ([ks for l, ks in mine if l == want] or [ks for l, ks in mine if want.lower() in l.lower()]) if want else [mine[0][1]]
     if not pick:
         return {"ok": False, "error": "no connected %s named '%s'; connected: %s" % (LLM_VNAME[v], want,
@@ -14858,6 +14861,58 @@ def llm_run_tool(name, a):
         args = a.get("args") if isinstance(a.get("args"), dict) else {}
         return do_cf(dict({k: str(x) for k, x in args.items()}, id=sid, mode=s("mode")))
     return {"ok": False, "error": "tool %s_%s is not available" % (pfx, name)}
+
+
+LLM_FANOUT_WAIT = 150   # seconds for all devices of a type together; a slower one is reported, the others answer
+
+
+def llm_has_hits(r):
+    """Did a device find something? Empty tables (no log rows, no references) = nothing; a result without tables is
+    kept (e.g. iRule code, a single object)."""
+    v = llm_view(r)
+    if any(v.get(k) for k in ("verdict", "tiles", "top_lists", "acc", "dashboard", "charts", "per_core_load")):
+        return True
+    d = v.get("data")
+    if d in (None, "", {}, []):
+        return "data" not in v and bool(v.get("summary") or v.get("output"))   # empty data = nothing; text only = keep
+    lists = llm_lists(d)
+    return not lists or any(len(x[2]) for x in lists)
+
+
+def llm_fanout(name, a, mine):
+    """No device named and several of this type connected: the same tool on all of them at once, one result per device.
+    Devices with nothing are listed in one line; errors / timeouts one line each; the others never wait on them."""
+    def one(label):
+        try:
+            return llm_run_tool(name, dict(a, device=label))
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        except (urllib.error.URLError, OSError) as e:
+            return {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
+        except Exception as e:
+            return {"ok": False, "error": "unexpected reply: %s: %s" % (type(e).__name__, e)}
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(mine)))
+    futs = [(l, ex.submit(one, l)) for l, _ in mine]
+    concurrent.futures.wait([f for _, f in futs], timeout=LLM_FANOUT_WAIT)
+    ex.shutdown(wait=False)
+    runs = [(l, f.result() if f.done() else {"ok": False, "error": "no answer within %d s" % LLM_FANOUT_WAIT}) for l, f in futs]
+    runs = [(l, r if isinstance(r, dict) else {"ok": True, "output": r}) for l, r in runs]
+    bad = [(l, str(r.get("error") or "failed")) for l, r in runs if r.get("ok") is False or (r.get("error") and not r.get("data"))]
+    good = [(l, r) for l, r in runs if l not in dict(bad)]
+    hits = [(l, r) for l, r in good if llm_has_hits(r)]
+    none = [l for l, r in good if (l, r) not in hits]
+    vn = LLM_VNAME[mine[0][1][1]["vendor"]]
+    summary = ["Ran on all %d connected %s devices at once." % (len(runs), vn)]
+    if hits:
+        summary.append("Found something on: %s" % ", ".join(l for l, _ in hits))
+    if none:
+        summary.append("Nothing found on: %s" % ", ".join(none))
+    for l, e in bad:
+        summary.append("Failed on %s: %s" % (l, e[:200]))
+    per = collections.OrderedDict((l, llm_view(r)) for l, r in hits)   # a dict: trimming shortens tables, never drops a device
+    return {"ok": bool(good), "request": "%s on every connected %s" % (llm_label(name, a), vn), "summary": summary,
+            "data": {"per_device": per, "nothing_found_on": none, "failed_on": [{"device": l, "error": e[:300]} for l, e in bad]},
+            "error": "" if good else "failed on every %s" % vn, "_runs": runs, "_fanout": True}
 
 
 def do_policy_check_all(b):
@@ -15076,13 +15131,15 @@ def do_llm_chat(b):
     else:
         if not alldev:
             raise ValueError("connect a device first: the model runs its checks on the connected devices")
-        tools, answer, seen = llm_tools(), "", set()
+        tools, answer, seen, ncalls = llm_tools(), "", set(), 0
         msgs[0]["content"] += ("\nYou can run read-only checks on ALL the connected devices listed above with the tools, "
                                "whichever device is selected. Tool names start with the device type: pa_ = Palo Alto, "
                                "fg_ = FortiGate, f5_ = F5 BIG-IP, cf_ = Cloudflare, sw_ = SolarWinds, fwb_ = FortiWeb (WAF), "
                                "fad_ = FortiADC (load balancer); the 'dashboard' "
-                               "tool gives the latest overall health of everything at once. Pick the device with the 'device' "
-                               "field when several of a type are connected. Decide which devices and checks the question "
+                               "tool gives the latest overall health of everything at once. Leave the 'device' field "
+                               "empty: the check then runs on EVERY connected device of that type at once and returns one "
+                               "result per device. Fill 'device' only when the user names a device; the device selected "
+                               "in the console does not count as naming it. Decide which checks the question "
                                "needs, combine them across devices when needed (e.g. Cloudflare event -> F5 WAF log -> "
                                "firewall log for the same IP), and run only what you need (at most 8 calls; several "
                                "independent calls may be made at once). Never repeat a call with the same arguments. "
@@ -15095,7 +15152,10 @@ def do_llm_chat(b):
                                "result holds what was asked, say so. The console output shown above may be about "
                                "something else: if it does not answer the question, run checks instead of saying the "
                                "data is missing. Answer from the results, per device with the rule / object names, and "
-                               "say which checks you ran. Nothing can be changed on any device.")
+                               "say which checks you ran. When a check ran on several devices, start with where it was "
+                               "found (device by device, with the numbers), then name in one line the devices where "
+                               "nothing was found and the ones that failed; never call something 'not found' when a device "
+                               "failed. Nothing can be changed on any device.")
         for rnd in range(9):
             msg, usage = llm_chat(msgs, tools if rnd < 8 else None)
             calls = msg.get("tool_calls") or []
@@ -15114,24 +15174,29 @@ def do_llm_chat(b):
                 except ValueError:
                     args = {}
                 key = name + json.dumps(args, sort_keys=True, default=str)
-                if key in seen or len(steps) >= 8:
+                if key in seen or ncalls >= 8:
                     res = {"ok": False, "error": "not run: repeated call or the 8-check limit was reached"}
                 else:
                     seen.add(key)
+                    ncalls += 1   # one call, however many devices it ran on
                     try:
                         res = llm_run_tool(name, args)
                     except ValueError as e:
                         res = {"ok": False, "error": str(e)}
                     except (urllib.error.URLError, OSError) as e:
                         res = {"ok": False, "error": "request failed: %s" % getattr(e, "reason", e)}
-                    steps.append({"call": llm_label(name, args), "ok": bool(res.get("ok")),
-                                  "verdict": (res.get("verdict") or {}).get("label", "") if isinstance(res.get("verdict"), dict) else "",
-                                  "error": res.get("error", ""),
-                                  "result": res if len(json.dumps(res, default=str)) < 3000000 else None})
-                # each result gets a quarter of the budget, and all results together at most twice the budget, so
-                # 8 large results cannot overflow the model's context window
+                    # a check run on every device of a type: one line per device, each with its own result to show
+                    for dv, r in res.pop("_runs", None) or [(None, res)]:
+                        hit = dv is None or llm_has_hits(r)
+                        steps.append({"call": llm_label(name, dict(args, device=dv) if dv else args), "ok": bool(r.get("ok", True)),
+                                      "verdict": (r.get("verdict") or {}).get("label", "") if isinstance(r.get("verdict"), dict)
+                                      else ("" if hit or r.get("error") else "nothing found"),
+                                      "error": r.get("error", ""),
+                                      "result": r if len(json.dumps(r, default=str)) < 3000000 else None})
+                # each result gets a quarter of the budget (a check on every device of a type: half), and all results
+                # together at most twice the budget, so 8 large results cannot overflow the model's context window
                 room = budget * 2 - sum(len(x) for x in seen_txt)
-                txt, tr = llm_pack(res, max(3000, min(budget // 4, room)))
+                txt, tr = llm_pack(res, max(3000, min(budget // (2 if res.pop("_fanout", False) else 4), room)))
                 seen_txt.append(txt)
                 trimmed = trimmed or tr
                 msgs.append({"role": "tool", "tool_call_id": c.get("id") or name, "name": name, "content": txt})
