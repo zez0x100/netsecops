@@ -9657,8 +9657,19 @@ def do_f5_asm(b):
             vs_name = vs_name.get("name") or vs_name.get("fullPath")
         if vs_name:
             vip = ("%s (%s)" % (vip, vs_name)) if vip else str(vs_name)
+        try:   # attack types and signature names (also used by the end-user portal)
+            ainf = asm_attack(sess, it, cache) if it.get("violations") else ([], [], [], set())
+        except (ValueError, KeyError, TypeError, urllib.error.URLError, OSError):
+            ainf = ([], [], [], set())
+        try:
+            arow = asm_row(it)
+        except (ValueError, KeyError, TypeError):
+            arow = {}
         data = {"support_id": sid,
                 "status": status,
+                "attack_type": ", ".join(dict.fromkeys(ainf[0])),
+                "signatures": list(dict.fromkeys(ainf[1]))[:12],
+                "rating": arow.get("rating", ""), "response_code": arow.get("response_code", ""),
                 "time": utc3(first(it, "requestDatetime", "occurrenceTime", "dateTime", "time")) or "",
                 "method": str(it.get("method") or (hlines[0].split(" ")[0] if hlines else "")).upper(),
                 "cf_ray": hdrs.get("cf-ray", ""),
