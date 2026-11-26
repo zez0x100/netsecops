@@ -513,8 +513,9 @@ def load_profiles():
                 isinstance(p.get("port"), bool) or not isinstance(p.get("port"), int) or
                 not 1 <= p["port"] <= 65535 or not isinstance(p.get("insecure"), bool)):
             raise ValueError("saved device profiles have an invalid entry")
+        env = p.get("env") if isinstance(p.get("env"), str) and ENV_RE.match(p.get("env") or "") else ""
         clean.append({"id": p["id"], "name": p["name"], "vendor": p["vendor"],
-                      "host": p["host"], "port": p["port"], "insecure": p["insecure"]})
+                      "host": p["host"], "port": p["port"], "insecure": p["insecure"], "env": env})
     if len(clean) > 100:
         raise ValueError("saved device profiles exceed the 100-profile limit")
     return clean
@@ -1133,6 +1134,47 @@ def vault_remember(b):
             x["host"] = CF_HOST
         VAULT["logins"] = [y for y in VAULT["logins"] if vault_id(y) != vault_id(x)] + [x]
         vault_write(VAULT["key"][0], VAULT["key"][1], VAULT["logins"])
+
+
+def do_dev_env(b):
+    """Environment label of a connected device; also written to its saved login (when unlocked) and saved profile."""
+    sess = SESSIONS.get(b.get("id"))
+    if not sess:
+        return {"ok": False, "error": "select a connected device"}
+    try:
+        env = env_clean(b.get("env"))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    sess["env"] = env
+    kept, key = [], vault_id(sess)
+    with VAULT_LOCK:
+        hit = [x for x in VAULT["logins"] or [] if vault_id(x) == key] if VAULT["key"] is not None else []
+        for x in hit:
+            if env:
+                x["env"] = env
+            else:
+                x.pop("env", None)
+        if hit:
+            try:
+                vault_write(VAULT["key"][0], VAULT["key"][1], VAULT["logins"])
+                kept.append("saved login")
+            except (OSError, ValueError):
+                pass
+    locked = os.path.exists(VAULT_FILE) and VAULT["key"] is None
+    try:
+        with LOCK:
+            profs = load_profiles()
+            ph = [x for x in profs if x["vendor"] == sess["vendor"] and x["host"].lower() == str(sess["host"]).lower()
+                  and x["port"] == sess.get("port", 443)]
+            for x in ph:
+                x["env"] = env
+            if ph:
+                save_profiles(profs)
+                kept.append("saved profile")
+    except (OSError, ValueError):
+        pass
+    audit(sess, "environment set to %s" % (env or "(none)"))
+    return {"ok": True, "env": env, "kept": kept, "vault_locked": locked and not hit}
 
 
 def vault_connect_all():
@@ -15287,7 +15329,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "behind the confirmation tick-box are for operators"})
         routes = {"/api/connect": do_connect, "/api/run": do_run, "/api/ssh": do_ssh, "/api/term/open": do_term_open, "/api/term/read": do_term_read,
                   "/api/term/write": do_term_write, "/api/term/resize": do_term_resize, "/api/term/close": do_term_close,
-                  "/api/raw": do_raw, "/api/disconnect": do_disconnect, "/api/vault": do_vault,
+                  "/api/raw": do_raw, "/api/disconnect": do_disconnect, "/api/vault": do_vault, "/api/devenv": do_dev_env,
                   "/api/ipcheck": do_ipcheck, "/api/flowtrace": do_flow_trace_api, "/api/secdash": do_secdash, "/api/natmap": do_nat_map, "/api/vipmap": do_vip_map, "/api/f5host": do_f5_host, "/api/f5irule": do_f5_irule, "/api/fwbstats": do_fwb_stats, "/api/fwbml": do_fwb_ml, "/api/f5logs": do_f5_logs,
                   "/api/f5capture": do_f5_capture, "/api/f5file": do_f5_file, "/api/policy": do_policy_search, "/api/profile/save": do_profile_save,
                   "/api/profile/delete": do_profile_delete, 
@@ -15393,6 +15435,8 @@ border:1px solid transparent;cursor:pointer}
 #devs .envtab{display:inline-flex;align-items:center;gap:6px;width:auto;padding:4px 10px;border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--dim);font-size:12px;cursor:pointer}
 #devs .envtab b{font-weight:600;font-size:11px;padding:0 6px;border-radius:999px;background:var(--panel2);color:var(--text)}
 #devs .envtab:hover{color:var(--text);border-color:var(--mint);box-shadow:none}#devs .envtab.on{background:var(--mint);border-color:var(--mint);color:var(--bg);font-weight:600}#devs .envtab.on b{background:rgba(127,127,127,.25);color:inherit}
+#devs .dgenv{display:flex;align-items:center;gap:8px;padding:4px 8px 2px;font-size:12px;color:var(--dim)}
+#devs .dgenv input{flex:1;min-width:0;width:auto;padding:3px 8px;font-size:12px;border-radius:6px}
 .envhd{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin:6px 2px 0}
 .dgrp{border-radius:10px;overflow:hidden;background:var(--panel2);border:1px solid var(--line)}
 .dghead{display:flex;align-items:center;gap:8px;padding:5px 10px 5px 12px;font-size:13.5px;background:var(--dc);color:var(--dt);cursor:pointer;font-weight:700;user-select:none}
@@ -16303,6 +16347,10 @@ function devCol(d){const m=devColMap(),k=devKey(d);let i=m[k];
  if(i==null||!DCOL[i]){const used=new Set(devices.filter(x=>x!==d).map(x=>m[devKey(x)]));i=DCOL.findIndex((_,j)=>!used.has(j));
   if(i<0)i=devices.indexOf(d)%DCOL.length;m[k]=i;try{localStorage.setItem("devcol",JSON.stringify(m))}catch(e){}}
  return {c:DCOL[i][0],t:DCOL[i][1],i}}
+async function devSetEnv(d,v){let r;try{r=await api("/api/devenv",{id:d.id,env:v})}catch(e){r={ok:false,error:String(e)}}
+ if(!r.ok){alert("Environment not changed: "+r.error);renderDevs();return}
+ d.env=r.env;envTabSet(r.env||"");renderDevs();
+ if(r.vault_locked)alert("Environment set for this session. Unlock the saved logins (Add device \u00b7 saved profiles \u00b7 session) and set it again to keep it with the saved login.")}
 function devSetCol(d,i){const m=devColMap();m[devKey(d)]=i;try{localStorage.setItem("devcol",JSON.stringify(m))}catch(e){}renderDevs();applyView(true)}
 // The menu of a device with the catalog applied: items for checks it does not have are dropped, checks the menu does not
 // name are listed under "More", so nothing disappears.
@@ -16359,7 +16407,11 @@ function renderDevs(){const el=$("#devs");el.innerHTML="";el.classList.remove("m
    else body.appendChild(mk("div","dgnote","All tools for this device are on the right."));
    const cr=mk("div","dgcol");cr.appendChild(mk("span",null,"Colour"));
    DCOL.forEach(([c],i)=>{const s=mk("button","sw"+(i===col.i?" on":""));s.style.background=c;s.title="Use this colour";s.setAttribute("aria-label","Colour "+(i+1));s.onclick=()=>devSetCol(d,i);cr.appendChild(s)});
-   body.appendChild(cr);w.appendChild(body)}
+   body.appendChild(cr);
+   const er=mk("div","dgenv"),ei=mk("input");er.appendChild(mk("span",null,"Environment"));ei.value=envOf(d);ei.setAttribute("list","envlist");
+   ei.placeholder="none · e.g. Production";ei.maxLength=40;ei.title="Groups the device list into tabs; kept in this device's saved login and profile";
+   ei.onfocus=envList;ei.onkeydown=e=>{if(e.key==="Enter")ei.blur()};ei.onchange=()=>devSetEnv(d,ei.value);er.appendChild(ei);body.appendChild(er);
+   w.appendChild(body)}
   el.appendChild(w)});devBadges()}
 // Out-of-service count of each device on its bar (from the device monitor).
 function devBadges(){const st=(monLast&&monLast.status)||[];document.querySelectorAll("#devs .dgbad").forEach(b=>{const s=st.find(x=>x.device===b.dataset.dev),n=s&&s.offline||0;

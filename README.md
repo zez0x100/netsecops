@@ -90,6 +90,8 @@ A local, single-file web console for troubleshooting **F5 BIG-IP**, **Palo Alto 
 - Environments: an optional **Environment** label per device (Add device form, saved profiles and saved logins).
   With labels, the device list shows tabs: All (grouped under environment headings), one per environment with its
   count, and No environment; the chosen tab is remembered in this browser.
+  A connected device's environment can be changed in its panel (Environment, under Colour); it is also written to
+  its saved login (when the saved logins are unlocked) and its saved profile.
 - SSH to F5, FortiGate and Palo Alto from the "SSH" card of the selected device, with this PC's OpenSSH client
   (`ssh -p <port> -l <user> <device>`; user name prefilled from the login when known):
   - "Open SSH in this page": a terminal inside the console (Windows 10 1809+, Linux or macOS; several at once). Click it to type;
